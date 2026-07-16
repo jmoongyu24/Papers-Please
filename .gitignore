@@ -1,0 +1,23 @@
+# 파이썬
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 환경 변수 (API 키 등) — 절대 커밋 금지
+.env
+
+# 큰 데이터: 논문 원본 코퍼스, 임베딩, 검색 결과 캐시
+# (평가셋 data/eval/ 과 샘플 data/sample/ 은 커밋해서 재현 가능하게 둔다)
+data/corpus/
+data/embeddings/
+data/API_KEY.env
+
+runs/
+*.faiss
+
+# OS / 에디터
+.DS_Store
+.idea/
+.vscode/

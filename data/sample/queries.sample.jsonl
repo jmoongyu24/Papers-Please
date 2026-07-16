@@ -1,0 +1,10 @@
+{"query_id": "q00001", "gold_id": "2101.00001", "text": "사진 보고 글로 설명해주는 AI 어떻게 만들어?", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00002", "gold_id": "2101.00002", "text": "외국어 번역해주는 모델 논문 찾아줘", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00003", "gold_id": "2101.00003", "text": "사람 음성을 글로 바꾸는 기술 연구", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00004", "gold_id": "2101.00004", "text": "영화 추천 시스템 관련 연구", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00005", "gold_id": "2101.00005", "text": "가짜 뉴스 걸러내는 방법", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00006", "gold_id": "2101.00006", "text": "그래프 데이터를 학습하는 신경망", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00007", "gold_id": "2101.00007", "text": "강화학습으로 로봇 제어하는 논문", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00008", "gold_id": "2101.00008", "text": "사진에서 물체 찾기 하는 기술", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00009", "gold_id": "2101.00009", "text": "긴 글 요약해주는 모델", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00010", "gold_id": "2101.00010", "text": "대화하는 챗봇 만들기", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}

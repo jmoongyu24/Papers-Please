@@ -1,0 +1,5 @@
+{"query_id": "q00003", "gold_id": "2101.00003", "text": "사람 음성을 글로 바꾸는 기술 연구", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00004", "gold_id": "2101.00004", "text": "영화 추천 시스템 관련 연구", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00006", "gold_id": "2101.00006", "text": "그래프 데이터를 학습하는 신경망", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00008", "gold_id": "2101.00008", "text": "사진에서 물체 찾기 하는 기술", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
+{"query_id": "q00009", "gold_id": "2101.00009", "text": "긴 글 요약해주는 모델", "difficulty": "easy", "lang": "ko", "source": "sample", "gen_model": "hand"}
