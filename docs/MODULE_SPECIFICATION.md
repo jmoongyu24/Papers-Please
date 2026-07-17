@@ -202,17 +202,20 @@ def search(queries, k: int) -> list[ScoredPaper]
 
 ### 구현해야 할 것
 
-- [ ] `corpus.py` — Kaggle 논문 파일을 불러와 원하는 분야만 거르고, 우리 형식으로 정리.
-- [ ] `sparse.py` — Elasticsearch 색인 만들고 검색. 가벼운 대체품(`bm25s`)도.
-- [ ] `dense.py` — bge-m3로 모든 논문을 숫자로 바꿔 저장하고, FAISS로 검색.
-- [ ] `hybrid.py` — 두 결과를 순위 합치기로 합침.
-- [ ] `arxiv_live.py` — 기존 검색 코드 이전 + 위 주의사항 반영 + 결과 저장(캐싱).
+- [x] `corpus.py` — Kaggle 논문 파일을 불러와 원하는 분야만 거르고 정리 (분야 균형 추출 포함).
+- [x] 단어 일치 검색 `bm25_simple.py` — 순수 파이썬 BM25 (추가 설치 없이 동작).
+- [x] `dense.py` — bge-m3로 모든 논문을 벡터로 바꿔 저장(캐싱)하고, FAISS로 검색.
+- [x] `hybrid.py` — 두 결과를 순위 합치기(RRF)로 합침.
+- [ ] `sparse.py` — Elasticsearch 색인(운영용). 지금은 순수 파이썬 BM25로 대체 중.
+- [ ] `arxiv_live.py` — 기존 검색 코드 이전 + 주의사항 반영 + 결과 저장(캐싱).
 
 ### 지금까지 진행
 
-- 실시간 arXiv 검색 동작 확인 완료 (제목·초록·논문번호를 받아옴).
-- arXiv 검색 도구의 동작 방식을 코드로 분석해 주의사항 5가지 정리 완료.
-- 고정 코퍼스 기반 세 가지 검색은 아직 미착수.
+- 고정 코퍼스(3만 편) 위 **세 가지 검색 모두 동작**: 단어 일치(BM25) / 의미 기반(bge-m3+FAISS) /
+  혼합(RRF). 임베딩은 1회 계산 후 디스크 캐싱.
+- **첫 실제 비교표**(train 300, 변환 전 기준): Recall@10 = BM25 0.41 / dense 0.74 / hybrid 0.72.
+  한국어 질문에서 BM25 0.03 vs dense 0.62 — 의미 검색이 언어 격차를 메움을 확인.
+- 실시간 arXiv 검색 동작 확인 + 주의사항 5가지 정리(기존). Elasticsearch·arxiv_live는 다음 순위.
 
 ---
 

@@ -29,20 +29,31 @@ from src.rewriter.base import build_rewriter
 from src.schemas import EvalQuery, Paper
 from src.utils import read_jsonl, write_json
 
-# 검색 방식 이름 -> (검색기 만드는 법, 변환 결과에서 꺼내 쓸 검색어 종류)
-# 지금은 BM25(단어 일치)만. dense/hybrid 는 모듈 ②가 준비되면 여기에 추가한다.
-BACKEND_QUERY_FAMILY = {"bm25": "sparse"}
+# 검색 방식 이름 -> 변환 결과에서 꺼내 쓸 검색어 종류
+# (hybrid는 sparse·dense 두 검색어를 함께 쓰므로 여기 목록에 없이 따로 처리한다)
+BACKEND_QUERY_FAMILY = {"bm25": "sparse", "dense": "dense"}
 
 
-def build_retrievers(papers: list[Paper], backends: list[str]) -> dict:
-    retrievers = {}
-    for name in backends:
-        if name == "bm25":
-            retrievers[name] = BM25Retriever(papers)
-        else:
-            raise ValueError(
-                f"아직 준비 안 된 검색 방식: {name} (모듈 ②에서 구현 예정)"
-            )
+def build_retrievers(corpus_path: str, backends: list[str]) -> dict:
+    """필요한 검색기들을 만든다. hybrid는 bm25·dense를 재사용한다."""
+    papers = load_corpus(corpus_path)
+    need_bm25 = "bm25" in backends or "hybrid" in backends
+    need_dense = "dense" in backends or "hybrid" in backends
+
+    bm25 = BM25Retriever(papers) if need_bm25 else None
+    dense = None
+    if need_dense:
+        from src.retrieval.dense import DenseRetriever
+        dense = DenseRetriever.build(corpus_path)
+
+    retrievers: dict = {}
+    if "bm25" in backends:
+        retrievers["bm25"] = bm25
+    if "dense" in backends:
+        retrievers["dense"] = dense
+    if "hybrid" in backends:
+        from src.retrieval.hybrid import HybridRetriever
+        retrievers["hybrid"] = HybridRetriever(bm25, dense, rrf_k=config.RRF_K)
     return retrievers
 
 
@@ -55,12 +66,17 @@ def run_condition(
 ) -> dict[str, list[str]]:
     """한 조합(변환 × 검색)으로 모든 질문을 검색해, 질문별 논문 순위를 만든다."""
     rewriter = build_rewriter(rewriter_name)
-    family = BACKEND_QUERY_FAMILY[backend_name]
     run: dict[str, list[str]] = {}
     for q in queries:
         rewritten = rewriter.rewrite(q.text)
-        search_query = rewritten.query_for(family)
-        results = retriever.search(search_query, k=k)
+        if backend_name == "hybrid":
+            # 혼합 검색은 단어 일치용·의미 검색용 검색어를 따로 받는다
+            results = retriever.search(
+                rewritten.query_for("sparse"), rewritten.query_for("dense"), k=k
+            )
+        else:
+            family = BACKEND_QUERY_FAMILY[backend_name]
+            results = retriever.search(rewritten.query_for(family), k=k)
         run[q.query_id] = [r.paper_id for r in results]
     return run
 
@@ -79,9 +95,8 @@ def run_all(
     k: int = config.TOP_K,
 ) -> dict[str, dict[str, list[str]]]:
     """지정한 모든 조합을 실행하고 결과를 저장한다. {조합이름: run} 을 돌려준다."""
-    papers = load_corpus(corpus_path)
     queries = [EvalQuery.from_dict(r) for r in read_jsonl(queries_path)]
-    retrievers = build_retrievers(papers, backends)
+    retrievers = build_retrievers(corpus_path, backends)
     queryset = Path(queries_path).stem
 
     all_runs: dict[str, dict[str, list[str]]] = {}

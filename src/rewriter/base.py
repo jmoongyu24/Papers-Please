@@ -101,10 +101,20 @@ class MockExpanderRewriter:
 
 
 # 이름 -> 변환기 인스턴스를 만들어주는 등록소.
-# 진짜 계층적 변환기가 준비되면 여기에 "hierarchical" 을 추가한다.
+# 언어 모델을 쓰는 변환기(hierarchical/single_step/hyde)는 import 시 ollama가 필요하므로,
+# 그 이름을 부를 때만 늦게(lazy) import 한다. passthrough/mock_expander는 의존성이 없다.
 def build_rewriter(name: str) -> Rewriter:
     if name == "passthrough":
         return PassthroughRewriter()
     if name == "mock_expander":
         return MockExpanderRewriter()
+    if name == "hierarchical":
+        from src.rewriter.hierarchical import HierarchicalRewriter
+        return HierarchicalRewriter()
+    if name == "single_step":
+        from src.rewriter.baselines import SingleStepRewriter
+        return SingleStepRewriter()
+    if name == "hyde":
+        from src.rewriter.baselines import HydeRewriter
+        return HydeRewriter()
     raise ValueError(f"알 수 없는 변환기 이름: {name}")
