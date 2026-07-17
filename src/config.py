@@ -32,8 +32,27 @@ REWRITER_MODEL = "qwen3:4b"                       # Ollama에서 쓸 쿼리 변�
 EMBED_MODEL = "BAAI/bge-m3"                        # 의미 기반 검색용 임베딩 모델
 QUERY_GEN_MODEL = "gpt-4o-mini"                    # 평가셋 질문 생성용 (오프라인 단계 전용)
 
-# ── 환경 변수 ────────────────────────────────────────────────────────────
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+# ── 환경 변수 (OpenAI API 키) ─────────────────────────────────────────────
+# 우선순위: 환경변수 OPENAI_API_KEY > data/API_KEY.env 파일.
+# data/API_KEY.env 는 "KEY=VALUE" 형식이 아니라 키 값 한 줄만 담긴 파일도 허용한다.
+# 이 파일은 .gitignore 에 등록되어 있어 절대 커밋되지 않는다.
+_API_KEY_FILE = DATA_DIR / "API_KEY.env"
+
+
+def _load_openai_key() -> str:
+    env_key = os.environ.get("OPENAI_API_KEY", "")
+    if env_key:
+        return env_key
+    if _API_KEY_FILE.exists():
+        raw = _API_KEY_FILE.read_text(encoding="utf-8").strip()
+        # "OPENAI_API_KEY=sk-..." 형식이면 값만 뽑고, 아니면 파일 전체를 키로 본다.
+        if raw.startswith("OPENAI_API_KEY="):
+            raw = raw.split("=", 1)[1].strip()
+        return raw
+    return ""
+
+
+OPENAI_API_KEY = _load_openai_key()
 
 
 def ensure_dirs() -> None:

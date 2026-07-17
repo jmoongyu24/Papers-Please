@@ -40,6 +40,72 @@ def filter_by_category(
     return out
 
 
+def primary_bucket(paper: Paper, categories: list[str]) -> str:
+    """논문의 '대표 분야'를 정한다.
+
+    categories(우리가 다루는 분야 목록) 중, 그 논문의 categories에 실제로 있는 첫 번째
+    것을 대표 분야로 삼는다. 하나도 없으면 "other"로 묶는다.
+    """
+    for c in categories:
+        if c in paper.categories:
+            return c
+    return "other"
+
+
+def stratified_sample(
+    papers: list[Paper],
+    n: int,
+    categories: Iterable[str],
+    seed: int = 42,
+    prior_counts: Optional[dict[str, int]] = None,
+) -> list[Paper]:
+    """분야별로 최대한 고르게 논문을 뽑는다 ('물 채우기' 방식).
+
+    그냥 무작위로 뽑으면 코퍼스에 원래 많은 분야(예: cs.LG)가 결과에도 많이 뽑히고,
+    적은 분야(예: cs.IR)는 거의 안 뽑힌다. 이 함수는 매 순간 "지금까지 가장 적게 뽑힌
+    분야"에서 하나씩 뽑기를 반복해서, 최종적으로 분야별 개수가 최대한 비슷해지게 한다.
+    (양동이에 물을 부을 때 가장 낮은 곳부터 채워져 수평을 이루는 것과 같은 원리다.)
+
+    Args:
+        papers: 뽑을 후보 논문들 (이미 사용한 논문은 미리 제외하고 넣는다).
+        n: 뽑을 논문 수.
+        categories: 균형을 맞출 분야 목록.
+        prior_counts: 이전에 이미 뽑아 둔 분야별 개수. 배치를 나눠 이어서 뽑을 때,
+            "이 분야는 이미 이만큼 뽑았다"고 알려주면 이번 배치에서 그 분야를
+            상대적으로 덜 뽑아 전체 균형을 맞춘다.
+    """
+    cats = list(categories)
+    rng = random.Random(seed)
+
+    pool: dict[str, list[Paper]] = {c: [] for c in cats}
+    pool["other"] = []
+    for p in papers:
+        pool[primary_bucket(p, cats)].append(p)
+    for bucket in pool.values():
+        rng.shuffle(bucket)
+
+    counts: dict[str, int] = {c: 0 for c in pool}
+    if prior_counts:
+        for c, v in prior_counts.items():
+            if c in counts:
+                counts[c] = v
+
+    idx = {c: 0 for c in pool}
+    selected: list[Paper] = []
+    bucket_names = list(pool.keys())
+    while len(selected) < n:
+        # 아직 후보가 남은 분야 중, 지금까지 가장 적게 뽑힌 분야를 고른다.
+        available = [c for c in bucket_names if idx[c] < len(pool[c])]
+        if not available:
+            break  # 모든 분야의 후보를 다 썼다
+        available.sort(key=lambda c: counts[c])
+        chosen_bucket = available[0]
+        selected.append(pool[chosen_bucket][idx[chosen_bucket]])
+        idx[chosen_bucket] += 1
+        counts[chosen_bucket] += 1
+    return selected
+
+
 def _iter_kaggle_matches(
     kaggle_jsonl: str | Path,
     keep: set[str],
