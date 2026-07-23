@@ -38,6 +38,10 @@ def main() -> None:
             "query_id": q["query_id"], "raw": q["text"],
             "lang": q["lang"], "difficulty": q["difficulty"],
             "parse_ok": r.parse_ok,
+            # 계단식 평가용 단계별 산출물 (계층 변환기만 채움, 기준선은 비어 있음)
+            "intent": r.intent,
+            "concepts": r.concepts,
+            "academic_terms": r.academic_terms,
             "sparse": r.queries.get("sparse", ""),
             "dense": r.queries.get("dense", ""),
             "arxiv": r.queries.get("arxiv", ""),

@@ -132,3 +132,86 @@ def paired_bootstrap(
         "ci_high": float(np.percentile(boot_deltas, 97.5)),
         "n": n,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 만족도 평가용 지표 — '등급 정답지'(관련 여러 편 + 0~3 등급)에서만 의미를 가진다.
+#   qrels_graded : {질문id: {논문id: 등급}}  등급 0(무관)~3(정답급)
+#   run          : {질문id: [1등 논문id, 2등, ...]}  (앞의 것들과 동일 형식)
+# 정답이 1편뿐이면 이 지표들은 Recall/MRR로 붕괴하므로, 정답지를 확장한 뒤 써야 한다.
+# ══════════════════════════════════════════════════════════════════════════
+
+GradedQrels = Dict[str, Dict[str, int]]
+
+
+def _relevant_set(gold_map: Dict[str, int], threshold: int) -> set[str]:
+    """등급이 threshold 이상인 논문을 '관련 있음'으로 본다."""
+    return {d for d, g in gold_map.items() if g >= threshold}
+
+
+def precision_at_k_single(ranked: List[str], relevant: set[str], k: int) -> float:
+    """상위 k개 중 관련 논문의 비율."""
+    if k == 0:
+        return 0.0
+    topk = ranked[:k]
+    return sum(1 for d in topk if d in relevant) / k
+
+
+def dcg(gains: List[float]) -> float:
+    """할인 누적 이득. 순위가 낮을수록(뒤로 갈수록) 이득을 log로 깎는다."""
+    return float(sum(g / np.log2(i + 2) for i, g in enumerate(gains)))
+
+
+def ndcg_at_k_single(ranked: List[str], gold_map: Dict[str, int], k: int) -> float:
+    """NDCG@k — 관련도 등급과 순위를 함께 반영(만족도 대표 지표).
+
+    등급을 이득으로 쓰되 2^등급-1 로 변환(높은 등급을 더 크게 보상). 이상적 정렬(등급
+    내림차순) 대비 비율로 정규화하므로 0~1.
+    """
+    gains = [(2 ** gold_map.get(d, 0) - 1) for d in ranked[:k]]
+    ideal = sorted((2 ** g - 1 for g in gold_map.values()), reverse=True)[:k]
+    idcg = dcg([float(x) for x in ideal])
+    return dcg([float(x) for x in gains]) / idcg if idcg > 0 else 0.0
+
+
+def average_precision_single(ranked: List[str], relevant: set[str], k: int) -> float:
+    """AP — 관련 논문이 나올 때마다의 정밀도 평균(MAP의 질문 단위 값)."""
+    if not relevant:
+        return 0.0
+    hits, score = 0, 0.0
+    for i, d in enumerate(ranked[:k], start=1):
+        if d in relevant:
+            hits += 1
+            score += hits / i
+    return score / min(len(relevant), k)
+
+
+def evaluate_graded(qrels: GradedQrels, run: Run, k: int = 10,
+                    rel_threshold: int = 1) -> Dict[str, float]:
+    """등급 정답지로 만족도 지표 묶음을 계산한다.
+
+    rel_threshold: 몇 등급 이상을 '관련'으로 볼지 (1이면 1·2·3 관련, 2면 2·3만 관련).
+    Returns: NDCG@k, Precision@k, Recall@k, F1@k, MAP, MRR@k (모두 질문 평균).
+    """
+    ndcgs, precs, recs, aps, rrs = [], [], [], [], []
+    for qid, gold_map in qrels.items():
+        ranked = run.get(qid, [])
+        relevant = _relevant_set(gold_map, rel_threshold)
+        ndcgs.append(ndcg_at_k_single(ranked, gold_map, k))
+        p = precision_at_k_single(ranked, relevant, k)
+        r = _recall_at_k_single(ranked, relevant, k)
+        precs.append(p)
+        recs.append(r)
+        aps.append(average_precision_single(ranked, relevant, k))
+        rrs.append(_reciprocal_rank_single(ranked, relevant, k))
+    mean = lambda xs: float(np.mean(xs)) if xs else 0.0
+    P, R = mean(precs), mean(recs)
+    f1 = (2 * P * R / (P + R)) if (P + R) > 0 else 0.0
+    return {
+        f"NDCG@{k}": mean(ndcgs),
+        f"Precision@{k}": P,
+        f"Recall@{k}": R,
+        f"F1@{k}": f1,
+        "MAP": mean(aps),
+        f"MRR@{k}": mean(rrs),
+    }
