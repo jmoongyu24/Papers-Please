@@ -52,9 +52,21 @@ def arxiv_url(paper_id: str) -> str:
     return f"https://arxiv.org/abs/{paper_id}"
 
 
-def render_results(results) -> None:
+def safe_search(query: str, k: int):
+    """arXiv 검색. (결과, 오류메시지) 튜플. 오류를 '결과 없음'과 구분한다."""
+    try:
+        return arxiv.search(query, k=k), None
+    except Exception as e:
+        return None, (f"arXiv 검색 중 오류가 발생했습니다 (일시적일 수 있어요, "
+                      f"잠시 후 다시 시도해 주세요). [{type(e).__name__}]")
+
+
+def render_results(results, error: str | None = None) -> None:
+    if error:
+        st.warning(error)
+        return
     if not results:
-        st.info("검색 결과가 없습니다.")
+        st.info("검색 결과가 없습니다. (변환된 검색어에 맞는 논문이 arXiv에 없을 수 있어요)")
         return
     for r in results:
         st.markdown(f"**{r.rank}. [{r.title}]({arxiv_url(r.paper_id)})**")
@@ -70,10 +82,13 @@ arxiv = load_arxiv()
 
 TOP_K = 10   # 검색 결과 10개 고정 (에이전트가 이 10개를 분석)
 
+# arXiv 호출을 아끼기 위해, 한 번의 검색에서 arXiv를 최대 1~2회만 부른다.
+# (변환 전/후 비교 검색은 호출이 2배가 되므로 기본으로 끄고, 개발용 옵션으로만 남긴다)
 with st.sidebar:
     st.header("설정")
-    compare = st.checkbox("변환 전/후 비교", value=True)
     st.caption("검색 대상: arXiv 실시간 · 결과 10개 고정")
+    st.caption("arXiv 요청 제한을 지키기 위해 한 검색당 호출을 최소화합니다.")
+    compare = st.checkbox("변환 전/후 비교 (개발용, arXiv 호출 2배)", value=False)
 
 if "query" not in st.session_state:
     st.session_state.query = ""
@@ -91,7 +106,10 @@ if st.button("🔍 검색", type="primary") and query.strip():
     # 방안 A: 특정 유명 논문을 '설명'으로 찾는 질문이면, 그 논문을 짚어서 먼저 보여준다
     # (LLM 지식으로 제목 추정 → arXiv에서 검증된 경우에만)
     with st.spinner("특정 논문을 가리키는 질문인지 확인 중…"):
-        resolved_paper, _ = resolve_and_verify(query, load_resolver(), arxiv)
+        try:
+            resolved_paper, _ = resolve_and_verify(query, load_resolver(), arxiv)
+        except Exception:
+            resolved_paper = None   # arXiv 오류 등은 배너 생략(치명적 아님)
     if resolved_paper:
         st.success("🎯 이 논문을 찾으시는 것 같습니다")
         st.markdown(f"### [{resolved_paper.title}]({arxiv_url(resolved_paper.paper_id)})")
@@ -120,26 +138,28 @@ if st.button("🔍 검색", type="primary") and query.strip():
     st.subheader("🔍 검색된 논문 (arXiv 실시간, 10개)")
     transformed_query = rw.query_for("arxiv")   # arXiv 전용 쿼리(코드 구성: 원본 phrase OR 학술용어)
     with st.spinner("arXiv 검색 중…"):
-        after_results = arxiv.search(transformed_query, k=TOP_K)
-        before_results = arxiv.search(query, k=TOP_K) if compare else None
+        after_results, after_err = safe_search(transformed_query, k=TOP_K)
+        before_results, before_err = safe_search(query, k=TOP_K) if compare else (None, None)
     if compare:
         before_col, after_col = st.columns(2)
         with before_col:
             st.markdown("**변환 전** (원본 그대로)")
             st.caption(f"검색어: `{query}`")
-            render_results(before_results)
+            render_results(before_results, before_err)
         with after_col:
             st.markdown("**변환 후** (학술 용어)")
             st.caption(f"검색어: `{transformed_query}`")
-            render_results(after_results)
+            render_results(after_results, after_err)
     else:
         st.caption(f"검색어: `{transformed_query}`")
-        render_results(after_results)
+        render_results(after_results, after_err)
 
     # 3) 에이전트: 검색된 10개를 사용자 의도와 대조해 추천 + 이유
     st.divider()
     st.subheader("🤖 에이전트 추천 (의도에 맞는 논문 선별)")
-    if after_results:
+    if after_err:
+        st.warning("검색 오류로 추천을 생성할 수 없습니다.")
+    elif after_results:
         with st.spinner("에이전트(Qwen3-4B)가 의도에 맞는 논문을 고르는 중…"):
             rec = load_recommender().recommend(query, after_results)
         if rec["summary"]:
