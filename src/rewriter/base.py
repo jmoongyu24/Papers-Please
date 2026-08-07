@@ -117,4 +117,12 @@ def build_rewriter(name: str) -> Rewriter:
     if name == "hyde":
         from src.rewriter.baselines import HydeRewriter
         return HydeRewriter()
+    if name == "finetuned":
+        # SFT(지도 미세조정)로 학습한 모델. 학습 전/후 비교용
+        from src.rewriter.finetuned import FinetunedRewriter
+        return FinetunedRewriter()
+    if name == "dpo":
+        # SFT 위에 DPO(선호 학습)까지 얹은 모델
+        from src.rewriter.finetuned import FinetunedRewriter
+        return FinetunedRewriter(adapter_path="models/qwen3-4b-query-dpo")
     raise ValueError(f"알 수 없는 변환기 이름: {name}")

@@ -21,3 +21,9 @@ runs/
 .DS_Store
 .idea/
 .vscode/
+# 학습된 모델 가중치 — git이 아니라 HuggingFace Hub로 배포한다
+# (LoRA 어댑터 264MB + optimizer 528MB × 체크포인트 수 = 저장소가 GB 단위로 불어난다)
+models/
+
+# arXiv 검색 결과 캐시 — 재생성 가능하고 계속 커진다
+data/cache/

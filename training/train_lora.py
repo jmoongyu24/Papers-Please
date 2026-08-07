@@ -59,14 +59,24 @@ def main() -> None:
     ap.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507",
                     help="허깅페이스 기본 모델 이름")
     ap.add_argument("--output-dir", default="models/qwen3-4b-query-lora")
-    ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--batch-size", type=int, default=2)
-    ap.add_argument("--grad-accum", type=int, default=8,
-                    help="배치를 쪼개 누적(실질 배치 = batch_size × grad_accum)")
-    ap.add_argument("--lr", type=float, default=2e-4, help="LoRA는 보통 1e-4~3e-4")
-    ap.add_argument("--lora-r", type=int, default=16, help="LoRA 보조 행렬 크기")
-    ap.add_argument("--max-seq-len", type=int, default=1024)
-    ap.add_argument("--no-4bit", action="store_true", help="4비트 양자화 끄기(메모리 여유 시)")
+    ap.add_argument("--epochs", type=int, default=8,
+                    help="데이터가 84건으로 적어, 에폭을 늘려 학습 스텝 수를 확보한다")
+    ap.add_argument("--batch-size", type=int, default=4,
+                    help="양자화를 안 쓰면 메모리 여유가 있어 4까지 가능")
+    ap.add_argument("--grad-accum", type=int, default=1,
+                    help="배치 누적(실질 배치 = batch_size × grad_accum). 데이터가 적을 때 "
+                         "누적을 크게 하면 스텝이 너무 적어져 학습이 거의 안 되므로 1로 둔다")
+    ap.add_argument("--lr", type=float, default=1e-4,
+                    help="데이터가 적을 때는 낮게(과적합 억제). LoRA 통상 1e-4~3e-4")
+    ap.add_argument("--lora-r", type=int, default=32,
+                    help="LoRA 보조 행렬 크기. 메모리 여유가 있으니 32로 표현력 확보")
+    ap.add_argument("--max-seq-len", type=int, default=512,
+                    help="실제 데이터가 최대 424글자라 512로 충분(길면 메모리만 낭비)")
+    ap.add_argument("--val-ratio", type=float, default=0.15,
+                    help="검증용으로 떼어둘 비율(과적합 감시용)")
+    ap.add_argument("--use-4bit", action="store_true",
+                    help="4비트 양자화 켜기. **기본은 끔** — 16GB VRAM에서 bf16(약 9.7GB)이 "
+                         "충분히 들어가고, 양자화는 성능을 깎기 때문. 메모리가 부족할 때만 사용")
     args = ap.parse_args()
 
     import torch
@@ -77,15 +87,21 @@ def main() -> None:
     print(f"기본 모델: {args.base_model}")
     print(f"학습 데이터: {args.data}")
 
+    # 기본은 양자화 없이 bf16으로 학습한다.
+    # 이유: Qwen3-4B를 bf16으로 올리면 가중치 약 8GB + 옵티마이저·활성화 약 1.7GB = 약 9.7GB로,
+    # 16GB 그래픽카드에 충분히 들어간다. 4비트 양자화는 메모리가 모자랄 때 쓰는 타협책이며
+    # 가중치를 압축하는 만큼 품질이 떨어지므로, 여유가 있으면 쓰지 않는 것이 성능에 유리하다.
     quant_config = None
-    if not args.no_4bit:
-        # 4비트 양자화: 메모리를 줄여 16기가바이트 그래픽카드에서 4B 모델 학습을 가능하게 함
+    if args.use_4bit:
         quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
+        print("4비트 양자화 사용 (메모리 절약, 품질 손실 감수)")
+    else:
+        print("양자화 없음 — bf16 전체 정밀도로 학습 (품질 우선)")
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     model = AutoModelForCausalLM.from_pretrained(
@@ -107,7 +123,11 @@ def main() -> None:
     )
 
     dataset = load_dataset_from_jsonl(args.data)
-    print(f"학습 예시 수: {len(dataset)}")
+    # 데이터가 적으므로 일부를 검증용으로 떼어 과적합(외워버리기)을 감시한다.
+    # 학습 손실만 계속 떨어지고 검증 손실이 오르기 시작하면 과적합 신호다.
+    split = dataset.train_test_split(test_size=args.val_ratio, seed=42)
+    train_ds, eval_ds = split["train"], split["test"]
+    print(f"학습 예시 {len(train_ds)}개 · 검증 예시 {len(eval_ds)}개")
 
     sft_config = SFTConfig(
         output_dir=args.output_dir,
@@ -118,6 +138,10 @@ def main() -> None:
         max_length=args.max_seq_len,
         logging_steps=5,
         save_strategy="epoch",
+        eval_strategy="epoch",          # 에폭마다 검증 손실 확인
+        warmup_ratio=0.1,               # 초반에 학습률을 서서히 올려 안정화
+        lr_scheduler_type="cosine",     # 후반에 학습률을 낮춰 과적합 억제
+        weight_decay=0.01,              # 가중치가 과하게 커지지 않도록
         bf16=True,
         report_to="none",
     )
@@ -125,7 +149,8 @@ def main() -> None:
     trainer = SFTTrainer(
         model=model,
         args=sft_config,
-        train_dataset=dataset,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
         peft_config=peft_config,
         processing_class=tokenizer,
     )

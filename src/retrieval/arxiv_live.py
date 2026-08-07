@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 from pathlib import Path
 
@@ -28,16 +29,18 @@ class ArxivLiveRetriever:
     name = "arxiv_live"
 
     def __init__(self, delay_seconds: float = 3.0, num_retries: int = 0,
-                 max_attempts: int = 3, backoff_base: float = 5.0,
+                 max_attempts: int = 5, backoff_base: float = 15.0,
                  cache_path: str | Path | None = None):
         """
         Args:
             delay_seconds: 요청 사이 최소 간격(arXiv 권장 3초). arxiv 패키지가 자동으로 지킨다.
             num_retries: arxiv 패키지 자체 재시도. **0으로 끈다** — 이 패키지는 간격을 늘리지 않고
                 같은 속도로 계속 두드려서, 오히려 arXiv 차단을 길게 만든다. 대신 아래 백오프를 쓴다.
-            max_attempts: 우리 쪽 최대 시도 횟수(첫 시도 포함).
-            backoff_base: 실패 시 대기 시간의 시작값(초). 실패할수록 2배씩 늘린다(5→10→20).
-                arXiv에 회복할 시간을 줘야 차단이 풀리기 때문이다.
+            max_attempts: 우리 쪽 최대 시도 횟수(첫 시도 포함). 429/503은 기다리면 대개 풀리므로
+                넉넉히 5회로 둔다.
+            backoff_base: 실패 시 대기 시간의 시작값(초). 실패할수록 2배씩 늘리고(15→30→60→120),
+                429·503이면 다시 2배로 더 기다린다. arXiv가 요청 과다로 막았을 때는 짧게 여러 번
+                두드리는 것보다 충분히 쉬는 편이 훨씬 잘 풀린다.
             cache_path: 검색 결과를 저장할 파일 경로. 주면 **디스크 캐싱**을 켠다.
                 평가·학습 데이터 생성처럼 같은 검색을 반복하는 작업에서, 프로그램을 껐다 켜도
                 이미 한 검색은 arXiv를 다시 부르지 않아 중단 지점부터 이어서 할 수 있다.
@@ -95,8 +98,13 @@ class ArxivLiveRetriever:
         if key in self._cache:
             return self._cache[key]
 
-        # 지수 백오프로 재시도: 실패할 때마다 대기 시간을 2배로 늘려(5→10→20초) arXiv에
-        # 회복할 여유를 준다. 짧은 간격으로 계속 두드리면 차단이 오히려 길어지기 때문이다.
+        # 지수 백오프로 재시도. 실패할수록 대기를 2배로 늘려(15→30→60→120초) arXiv에 회복할
+        # 시간을 준다. 짧은 간격으로 계속 두드리면 차단이 오히려 길어진다.
+        #
+        # 실제로 겪은 오류 두 가지(둘 다 '요청이 너무 잦다'는 신호이며 쿼리 내용과 무관):
+        #   - HTTP 429 Too Many Requests : 속도 제한에 걸림
+        #   - HTTP 503 Service Unavailable : 서버가 일시적으로 처리 불가(과부하)
+        # 이 둘은 기다리면 대개 풀리므로, 다른 오류보다 더 오래 기다린다.
         last_error: Exception | None = None
         for attempt in range(self._max_attempts):
             try:
@@ -107,8 +115,15 @@ class ArxivLiveRetriever:
                 return results
             except Exception as e:
                 last_error = e
-                if attempt < self._max_attempts - 1:
-                    time.sleep(self._backoff_base * (2 ** attempt))
+                if attempt >= self._max_attempts - 1:
+                    break
+                wait = self._backoff_base * (2 ** attempt)
+                msg = str(e)
+                if "429" in msg or "503" in msg:
+                    wait *= 2          # 속도 제한/과부하는 더 오래 쉰다
+                # 여러 요청이 동시에 같은 시점에 재시도하지 않도록 무작위 지연을 섞는다
+                wait += random.uniform(0, self._backoff_base * 0.5)
+                time.sleep(wait)
         raise last_error       # 모두 실패하면 호출자에게 오류를 알린다
 
     def _fetch(self, query: str, k: int) -> list[ScoredPaper]:
