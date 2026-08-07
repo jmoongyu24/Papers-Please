@@ -14,6 +14,8 @@ data/corpus/
 data/embeddings/
 data/API_KEY.env
 
+# runs/ = 굴러가며 나오는 임시 실험 결과 (버려도 됨)
+# results/ = 보고서에 인용하는 확정 결과 → 커밋해서 재현·검증 가능하게 둔다
 runs/
 *.faiss
 
