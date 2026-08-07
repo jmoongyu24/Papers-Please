@@ -21,7 +21,7 @@ from pathlib import Path
 from src.utils import read_json, read_jsonl, write_jsonl
 
 # 임시 대역(mock)이나 placeholder 변환기는 풀에서 제외 (진짜 시스템만)
-EXCLUDE = ("mock_expander",)
+EXCLUDE: tuple[str, ...] = ()
 
 
 def build_pool(queries: list[dict], run_paths: list[str], depth: int) -> list[dict]:

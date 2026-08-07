@@ -14,7 +14,7 @@
   python -m evaluation.run_experiments --demo
   # 실제: 특정 코퍼스/평가셋으로 지정한 조합 실행
   python -m evaluation.run_experiments --corpus data/corpus/corpus-v1.jsonl \
-      --queries data/eval/dev.jsonl --rewriters passthrough mock_expander --backends bm25
+      --queries data/eval/dev.jsonl --rewriters passthrough hierarchical --backends bm25
 """
 
 from __future__ import annotations
@@ -118,7 +118,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="변환×검색 조합 실험 실행")
     ap.add_argument("--corpus", default=str(config.SAMPLE_DIR / "corpus.sample.jsonl"))
     ap.add_argument("--queries", default=str(config.SAMPLE_DIR / "queries.sample.jsonl"))
-    ap.add_argument("--rewriters", nargs="+", default=["passthrough", "mock_expander"])
+    ap.add_argument("--rewriters", nargs="+", default=["passthrough", "hierarchical"])
     ap.add_argument("--backends", nargs="+", default=["bm25"])
     ap.add_argument("--out-dir", default=str(config.RUNS_DIR))
     ap.add_argument("--k", type=int, default=config.TOP_K)
