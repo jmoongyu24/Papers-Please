@@ -83,6 +83,30 @@ def evaluate(qrels: Qrels, run: Run, k_values=(1, 5, 10, 20), mrr_k: int = 10) -
 
 # ── '변환 전 vs 변환 후' 짝지어 비교 + 통계 검정 ──────────────────────────
 
+def bootstrap_ci(scores: List[float], n_boot: int = 10000, seed: int = 42,
+                 alpha: float = 0.05) -> tuple[float, float, float]:
+    """한 시스템의 점수 평균과 그 95% 신뢰구간을 구한다.
+
+    왜 필요한가: "Recall@10 = 0.35" 라는 숫자 하나만 보면 그게 얼마나 믿을 만한지 알 수 없다.
+    질문 40개로 잰 0.35와 300개로 잰 0.35는 전혀 다른 무게를 가진다. 신뢰구간은 그 차이를
+    눈에 보이게 만든다 (표본이 작으면 구간이 넓게 나온다).
+
+    방법: 질문 목록에서 중복을 허용해 같은 개수만큼 다시 뽑기를 n_boot번 반복하고,
+    그때마다의 평균이 어느 범위에 흩어지는지 본다. 분포를 가정하지 않아 비율 지표에도 안전하다.
+
+    Returns: (평균, 신뢰구간 하한, 신뢰구간 상한)
+    """
+    if not scores:
+        return 0.0, 0.0, 0.0
+    arr = np.asarray(scores, dtype=np.float64)
+    n = len(arr)
+    rng = np.random.default_rng(seed)
+    boot = arr[rng.integers(0, n, size=(n_boot, n))].mean(axis=1)
+    return (float(arr.mean()),
+            float(np.percentile(boot, 100 * alpha / 2)),
+            float(np.percentile(boot, 100 * (1 - alpha / 2))))
+
+
 def paired_bootstrap(
     before: Dict[str, float],
     after: Dict[str, float],
