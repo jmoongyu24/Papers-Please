@@ -66,4 +66,10 @@ def build_rewriter(name: str) -> Rewriter:
         # SFT 위에 DPO(선호 학습)까지 얹은 모델
         from src.rewriter.finetuned import FinetunedRewriter
         return FinetunedRewriter(adapter_path="models/qwen3-4b-query-dpo")
+    if name.startswith("grounded"):
+        # 어휘 조회를 얹은 변환기. "grounded:<바탕변환기>" 형태로 바탕을 고를 수 있다.
+        # 예) grounded:dpo (기본) · grounded:hierarchical · grounded:passthrough
+        from src.rewriter.grounded import GroundedRewriter
+        base = name.split(":", 1)[1] if ":" in name else "dpo"
+        return GroundedRewriter(base=base)
     raise ValueError(f"알 수 없는 변환기 이름: {name}")

@@ -53,6 +53,37 @@ def load_dataset_from_jsonl(path: str):
     return Dataset.from_list([format_example(r) for r in rows])
 
 
+def split_by_paper(path: str, val_ratio: float, seed: int = 42):
+    """**논문 단위**로 학습/검증을 나눈다.
+
+    왜 질문 단위로 나누면 안 되는가:
+    학습 데이터 300개는 논문 100편 × 난이도 3개로 만들어졌고, **같은 논문에서 나온 세
+    질문은 정답 라벨이 거의 같다**(라벨을 그 논문에서 뽑았으므로). 질문 단위로 무작위
+    분할하면 같은 논문이 학습과 검증 양쪽에 들어가, 검증 손실이 실제보다 좋게 나온다.
+    그러면 과적합이 시작되는 지점을 놓쳐 잘못된 체크포인트를 고르게 된다.
+    (평가셋을 논문 단위로 나눈 것과 같은 이유다.)
+
+    Returns: (학습용 Dataset, 검증용 Dataset)
+    """
+    import random
+
+    from datasets import Dataset
+
+    rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    papers = sorted({r.get("gold_id", r["input"]) for r in rows})
+    rng = random.Random(seed)
+    rng.shuffle(papers)
+    n_val = max(1, int(len(papers) * val_ratio))
+    val_papers = set(papers[:n_val])
+
+    train_rows = [r for r in rows if r.get("gold_id", r["input"]) not in val_papers]
+    val_rows = [r for r in rows if r.get("gold_id", r["input"]) in val_papers]
+    print(f"논문 단위 분할: 학습 논문 {len(papers)-n_val}편 / 검증 논문 {n_val}편 "
+          f"(겹침 0)")
+    return (Dataset.from_list([format_example(r) for r in train_rows]),
+            Dataset.from_list([format_example(r) for r in val_rows]))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="쿼리 변환기 LoRA 미세조정")
     ap.add_argument("--data", default="data/training/sft_pairs.jsonl")
@@ -122,11 +153,10 @@ def main() -> None:
                         "gate_proj", "up_proj", "down_proj"],
     )
 
-    dataset = load_dataset_from_jsonl(args.data)
     # 데이터가 적으므로 일부를 검증용으로 떼어 과적합(외워버리기)을 감시한다.
     # 학습 손실만 계속 떨어지고 검증 손실이 오르기 시작하면 과적합 신호다.
-    split = dataset.train_test_split(test_size=args.val_ratio, seed=42)
-    train_ds, eval_ds = split["train"], split["test"]
+    # 분할은 반드시 **논문 단위**로 한다 (같은 논문의 질문들은 라벨이 거의 같으므로).
+    train_ds, eval_ds = split_by_paper(args.data, args.val_ratio)
     print(f"학습 예시 {len(train_ds)}개 · 검증 예시 {len(eval_ds)}개")
 
     sft_config = SFTConfig(

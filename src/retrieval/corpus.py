@@ -110,16 +110,25 @@ def _iter_kaggle_matches(
     kaggle_jsonl: str | Path,
     keep: set[str],
     min_year: Optional[int],
+    prefixes: Optional[tuple[str, ...]] = None,
 ) -> Iterator[Paper]:
     """캐글 원본을 한 줄씩 읽어, 분야·연도 조건에 맞는 논문만 Paper로 내보낸다.
 
     캐글 원본 한 줄의 주요 필드: id, title, abstract, categories(공백으로 이은 문자열),
     update_date("YYYY-MM-DD").
+
+    분야를 고르는 방법 세 가지:
+    - `keep`에 정확한 분야명을 넣으면 그것만 (예: {"cs.CL", "cs.CV"})
+    - `prefixes`에 앞글자를 넣으면 그 계열 전체 (예: ("cs.", "stat.") → cs 하위 40여 개 전부)
+    - 둘 다 비우면 **분야 제한 없이 전부**. arXiv 검색은 물리·수학까지 전 분야를 대상으로
+      하므로, 어떤 표현이 얼마나 흔한지(문서 빈도)를 arXiv와 비슷하게 재려면 전체가 필요하다.
     """
     for row in read_jsonl(kaggle_jsonl):
         cats = row.get("categories", "")
         cat_list = cats.split() if isinstance(cats, str) else list(cats)
-        if not keep.intersection(cat_list):
+        if keep and not keep.intersection(cat_list):
+            continue
+        if prefixes and not any(c.startswith(prefixes) for c in cat_list):
             continue
         updated = row.get("update_date", row.get("updated", ""))
         if min_year and updated:
@@ -145,6 +154,7 @@ def build_corpus_from_kaggle(
     min_year: Optional[int] = None,
     sample_size: Optional[int] = None,
     seed: int = 42,
+    prefixes: Optional[tuple[str, ...]] = None,
 ) -> int:
     """캐글 arXiv 스냅샷(원본)에서 원하는 분야만 걸러 우리 코퍼스 파일로 저장한다.
 
@@ -166,7 +176,7 @@ def build_corpus_from_kaggle(
         저장한 논문 수.
     """
     keep = set(categories)
-    matches = _iter_kaggle_matches(kaggle_jsonl, keep, min_year)
+    matches = _iter_kaggle_matches(kaggle_jsonl, keep, min_year, prefixes)
 
     if sample_size:
         rng = random.Random(seed)
