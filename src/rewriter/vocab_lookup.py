@@ -72,12 +72,15 @@ class VocabularyLookup:
                  top_papers: int = 20,
                  df_lo: int = 20,
                  df_hi: int = 1000,
+                 sim_threshold: float = 0.0,
                  device: str | None = None):
         """
         Args:
             top_papers: 어휘를 캐올 논문 수. 많을수록 후보가 늘지만 주제가 흐려진다.
             df_lo/df_hi: 쓸 만한 용어의 문서 빈도 구간. 아래로는 그 논문만의 지문이라
                 일반화가 안 되고, 위로는 너무 흔해 정답을 가려내지 못한다.
+            sim_threshold: 질문과의 의미 유사도가 이 값 미만인 구를 버린다(상용구 제거).
+                0 이면 끈다. 왜 필요한지는 아래 `_drop_boilerplate` 참고.
         """
         corpus_path = corpus_path or (config.CORPUS_DIR / "corpus-v1.jsonl")
         embeddings_path = embeddings_path or (
@@ -87,10 +90,12 @@ class VocabularyLookup:
         self.papers: list[Paper] = load_corpus(corpus_path)
         self._by_id = {p.id: p for p in self.papers}
         embeddings = np.load(embeddings_path)
-        self.retriever = DenseRetriever(self.papers, embeddings, Embedder(device=device))
+        self.embedder = Embedder(device=device)
+        self.retriever = DenseRetriever(self.papers, embeddings, self.embedder)
         self.stats = PhraseFrequency(df_corpus)
         self.top_papers = top_papers
         self.df_lo, self.df_hi = df_lo, df_hi
+        self.sim_threshold = sim_threshold
         self._cache: dict[str, list[tuple[str, int]]] = {}
 
     def lookup(self, question: str, k: int = 6,
@@ -120,17 +125,64 @@ class VocabularyLookup:
                     counts[phrase] += 1
 
         # 공통 등장 횟수 우선, 같으면 좁은(문서 빈도가 낮은) 것 우선
-        ranked = sorted(counts.items(),
-                        key=lambda x: (-x[1], self.stats.df(x[0]) or 10 ** 9))
+        ranked = [p for p, _ in sorted(counts.items(),
+                                       key=lambda x: (-x[1], self.stats.df(x[0]) or 10 ** 9))]
+
+        # 먼저 상위 k개를 고른 뒤, 그중에서 상용구를 뺀다 (개수를 다시 채우지 않는다).
+        # 순서를 반대로 하면(먼저 걸러내고 k개를 채우면) 제거한 자리에 더 아래 순위의
+        # **더 넓고 주제가 다른** 용어가 들어와 오히려 나빠진다. 실제로 그렇게 만들었더니
+        # "로봇이 물건 찾아오기" 질문에서 rich semantic information 을 빼는 대신
+        # robot manipulation(843편)이 들어와, 조작 논문이 내비게이션 논문을 밀어냈다.
         picked: list[tuple[str, int]] = []
-        for phrase, _ in ranked:
+        for phrase in ranked:
             if any(phrase in q or q in phrase for q, _ in picked):   # 겹치는 구는 하나만
                 continue
             picked.append((phrase, self.stats.df(phrase) or 0))
             if len(picked) >= k:
                 break
+
+        if self.sim_threshold > 0 and picked:
+            kept = self._drop_boilerplate(question, [p for p, _ in picked], keep_at_least=1)
+            keep = set(kept)
+            picked = [(p, d) for p, d in picked if p in keep]
+
         picked.sort(key=lambda x: x[1])       # 좁은 것부터 (검색어 앞자리에 놓기 위함)
 
         if exclude_ids is None:
             self._cache[key] = picked
         return picked
+
+    def _drop_boilerplate(self, question: str, phrases: list[str],
+                          keep_at_least: int = 0) -> list[str]:
+        """질문과 의미가 먼 구를 버린다 — 학술 논문의 상용구를 걸러내기 위함.
+
+        무엇이 문제였나 (스모크 테스트에서 실제로 관찰):
+        "여러 논문에서 공통으로 쓰이는 구를 우선"하는 규칙은 그 주제의 관용 표현을 잘 찾지만,
+        **학술 논문이 주제와 무관하게 습관적으로 쓰는 표현**도 똑같이 여러 논문에 나온다.
+        실제로 "로봇이 물건을 찾아오게 하는 방법" 질문에서 다음이 뽑혔다.
+
+            substantial challenges(509편) · real-world performance(298편)
+            rich semantic information(193편)
+
+        문서 빈도만으로는 못 거른다. 이것들은 20~1,000편 구간을 그대로 통과한다.
+
+        무엇으로 거르나:
+        상용구는 **주제와 상관없이 쓰이므로 질문과 의미가 멀다.** 실제 사례 12개로 재보니
+        두 무리가 갈렸다 — 관련 용어는 유사도 최소 0.463, 상용구·무관 용어는 최대 0.462.
+        (표본이 작으므로 문턱은 여유를 두고 정하고, 최종 판단은 검색 성능으로 한다.)
+
+        임베딩 모델은 의미 검색에 쓰는 것을 그대로 재사용하므로 추가 비용이 거의 없고,
+        다국어라 **한국어 질문과 영어 용어**를 같은 공간에서 비교할 수 있다.
+
+        keep_at_least: 전부 걸러지면 검색어가 비어 버리므로, 최소 이만큼은 유사도 순으로 남긴다.
+        """
+        if not phrases:
+            return phrases
+        q_emb = self.embedder.encode([question])[0]
+        p_emb = self.embedder.encode(phrases)
+        sims = p_emb @ q_emb
+        kept = [p for p, s in zip(phrases, sims) if s >= self.sim_threshold]
+        if len(kept) < keep_at_least:
+            order = np.argsort(-sims)[:keep_at_least]
+            kept = [phrases[int(i)] for i in order]
+        return kept

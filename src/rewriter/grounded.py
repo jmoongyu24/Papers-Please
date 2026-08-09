@@ -72,7 +72,7 @@ class GroundedRewriter:
     name = "grounded"
 
     def __init__(self, base: str = "dpo", n_lookup: int = 6,
-                 lookup=None, **lookup_kwargs):
+                 lookup=None, sim_threshold: float = 0.0, **lookup_kwargs):
         """
         Args:
             base: 바탕이 될 변환기 이름 (passthrough / hierarchical / dpo 등).
@@ -83,7 +83,7 @@ class GroundedRewriter:
         self.n_lookup = n_lookup
         if lookup is None:
             from src.rewriter.vocab_lookup import VocabularyLookup
-            lookup = VocabularyLookup(**lookup_kwargs)
+            lookup = VocabularyLookup(sim_threshold=sim_threshold, **lookup_kwargs)
         self.lookup = lookup
 
     def rewrite(self, raw_query: str) -> RewriteResult:

@@ -46,4 +46,22 @@ python -m evaluation.arxiv_eval --queries data/eval/test.jsonl \
 | finetuned (SFT) | 0.273 [0.223, 0.323] | 0.293 | 0.255 |
 | **dpo (SFT+DPO)** | **0.343** [0.290, 0.397] | 0.354 | 0.333 |
 
-자세한 해석은 [../docs/ISSUE.md](../docs/ISSUE.md) #13, #7 참고.
+## test300_groundedf_k200.jsonl · test150_unbiased.jsonl (2026-08-10)
+
+| 파일 | 조건 | 용도 |
+|---|---|---|
+| `test300_groundedf_k200.jsonl` | 어휘조회+상용구필터, 후보 깊이 **200** | 깊이 실험(100/150/200)의 원자료. 논문 번호 200개가 저장돼 있어 어떤 깊이로든 재계산 가능 |
+| `test150_unbiased.jsonl` | 위와 같되 **어휘 조회에서 정답 논문 제외** | 평가 편향의 크기를 잰 원자료(ISSUE #22) |
+
+**중요:** 두 파일을 비교하면 어휘 조회 평가의 편향(R@10 −0.073, p=0.001)을 재현할 수 있다.
+`test300_groundedf_*` 계열의 수치는 **정답 논문이 조회에 포함된 낙관적 조건**임에 주의할 것.
+
+```bash
+# 깊이별 재계산 (arXiv 호출 0회)
+python -m evaluation.arxiv_eval --report-only results/test300_groundedf_k200.jsonl \
+    --k-values 10 30 50 100 150 200
+# 재정렬 적용 (arXiv 호출 0회)
+python -m evaluation.rerank_eval --run results/test150_unbiased.jsonl --depth 200
+```
+
+자세한 해석은 [../docs/ISSUE.md](../docs/ISSUE.md) #13, #21, #22, #23 참고.

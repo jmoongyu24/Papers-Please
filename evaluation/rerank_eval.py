@@ -75,8 +75,10 @@ def main() -> None:
     queries, cand_lists, kept = [], [], []
     missing = 0
     for r in rows:
-        cands = cache.get((r.get("search_query", ""), 100)) or \
-                cache.get((r.get("search_query", ""), 30))
+        sq = r.get("search_query", "")
+        # 같은 검색어라도 실행할 때 쓴 깊이(k)가 다르면 캐시 키가 다르다.
+        # 깊은 것부터 찾아 가장 많은 후보를 확보한다.
+        cands = next((cache[(sq, kk)] for kk in (300, 200, 100, 30) if (sq, kk) in cache), None)
         if not cands:
             missing += 1
             continue

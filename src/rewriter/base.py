@@ -69,7 +69,9 @@ def build_rewriter(name: str) -> Rewriter:
     if name.startswith("grounded"):
         # 어휘 조회를 얹은 변환기. "grounded:<바탕변환기>" 형태로 바탕을 고를 수 있다.
         # 예) grounded:dpo (기본) · grounded:hierarchical · grounded:passthrough
+        # "grounded:<바탕>" · "groundedf:<바탕>" (f = 상용구 필터 켬)
         from src.rewriter.grounded import GroundedRewriter
         base = name.split(":", 1)[1] if ":" in name else "dpo"
-        return GroundedRewriter(base=base)
+        thr = 0.45 if name.startswith("groundedf") else 0.0
+        return GroundedRewriter(base=base, sim_threshold=thr)
     raise ValueError(f"알 수 없는 변환기 이름: {name}")
