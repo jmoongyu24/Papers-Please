@@ -1,5 +1,8 @@
 # 진행 상황 (PROGRESS)
 
+> **날짜별 요약과 현재 상태는 [PROGRESS_REPORT.md](PROGRESS_REPORT.md) 를 보라.**
+> 이 문서에는 모듈별 세부 항목을 계속 남긴다.
+
 계획 문서: [PLAN.md](PLAN.md) · 모듈 상세: [MODULE_SPECIFICATION.md](MODULE_SPECIFICATION.md)
 · 이슈 기록: [ISSUE.md](ISSUE.md) · 평가 사용법: [../evaluation/README.md](../evaluation/README.md)
 · 마지막 갱신: **2026-08-10**
