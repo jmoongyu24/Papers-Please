@@ -29,3 +29,5 @@ models/
 
 # arXiv 검색 결과 캐시 — 재생성 가능하고 계속 커진다
 data/cache/
+
+logs/

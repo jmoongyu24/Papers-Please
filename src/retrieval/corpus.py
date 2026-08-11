@@ -209,9 +209,12 @@ def main() -> None:
     ap.add_argument("--kaggle", required=True, help="캐글 원본 JSON 경로")
     ap.add_argument("--out", required=True, help="만들 코퍼스 저장 경로")
     ap.add_argument("--categories", nargs="+", default=list(config.CORPUS_CATEGORIES))
+    ap.add_argument("--prefixes", nargs="+", default=None,
+                    help="분야 앞글자로 고르기 (예: cs. stat.ML eess.). 주면 --categories 대신 "
+                         "이 조건을 쓴다. 계열 전체를 담을 때 사용")
     ap.add_argument("--min-year", type=int, default=2021)
     ap.add_argument("--sample", type=int, default=30000,
-                    help="무작위로 뽑을 논문 수 (0이면 앞에서부터 --max-papers개)")
+                    help="무작위로 뽑을 논문 수 (0이면 조건에 맞는 논문 전부)")
     ap.add_argument("--max-papers", type=int, default=None)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -219,11 +222,12 @@ def main() -> None:
     n = build_corpus_from_kaggle(
         kaggle_jsonl=args.kaggle,
         out_path=args.out,
-        categories=args.categories,
+        categories=[] if args.prefixes else args.categories,
         max_papers=args.max_papers,
         min_year=args.min_year,
         sample_size=(args.sample or None),
         seed=args.seed,
+        prefixes=tuple(args.prefixes) if args.prefixes else None,
     )
     print(f"코퍼스 {n}편 저장 → {args.out}")
     print(f"  분야: {args.categories}")

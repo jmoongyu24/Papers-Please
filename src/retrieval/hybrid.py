@@ -11,10 +11,15 @@
 여러 검색에서 받은 점수를 합해 다시 정렬한다. k는 완충 상수(관례상 60).
 - 상위권일수록 큰 점수(1등=1/61, 2등=1/62 ...), 하위권 차이는 작아진다.
 - 점수 정규화가 필요 없고 파라미터가 k 하나뿐이라 다루기 쉽고 강건하다.
+
+구현은 `src/retrieval/fusion.py` 한 곳에만 둔다. 여기 있던 코드는 채널 이름·가중치·논문
+번호 표기 통일이 없는 옛 버전이었는데, 같은 계산을 두 벌 두면 한쪽만 고쳐져 결과가 갈린다.
+그래서 이 함수는 이름과 인자 모양만 유지하는 **얇은 껍데기**로 남기고 계산은 넘긴다.
 """
 
 from __future__ import annotations
 
+from src.retrieval.fusion import rrf_fuse
 from src.schemas import ScoredPaper
 
 
@@ -28,22 +33,9 @@ def reciprocal_rank_fusion(
         k: RRF 완충 상수.
         top_k: 최종으로 돌려줄 개수.
     """
-    fused: dict[str, float] = {}
-    meta: dict[str, ScoredPaper] = {}
-    for results in result_lists:
-        for r in results:
-            fused[r.paper_id] = fused.get(r.paper_id, 0.0) + 1.0 / (k + r.rank)
-            # 제목·초록 등 표시용 정보는 처음 본 것을 보관
-            if r.paper_id not in meta:
-                meta[r.paper_id] = r
-
-    ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
-    out: list[ScoredPaper] = []
-    for rank, (pid, score) in enumerate(ordered, start=1):
-        m = meta[pid]
-        out.append(ScoredPaper(paper_id=pid, score=score, rank=rank,
-                               title=m.title, abstract=m.abstract))
-    return out
+    # 이름 없는 목록이 들어오므로 순서대로 임시 채널 이름을 붙여 넘긴다.
+    channels = {f"ch{i}": results for i, results in enumerate(result_lists)}
+    return list(rrf_fuse(channels, k=k, top_n=top_k))
 
 
 class HybridRetriever:
