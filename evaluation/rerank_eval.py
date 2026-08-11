@@ -24,6 +24,7 @@ from pathlib import Path
 
 from evaluation.metrics import bootstrap_ci, paired_bootstrap
 from src import config
+from src.retrieval.fusion import normalize_paper_id
 from src.schemas import ScoredPaper
 from src.utils import read_jsonl
 
@@ -48,7 +49,8 @@ def load_cache(path: Path) -> dict[tuple[str, int], list[ScoredPaper]]:
 
 
 def norm(pid: str) -> str:
-    return pid.split("v")[0]
+    """버전 표기를 뗀다. `split("v")[0]` 은 옛 형식 번호를 잘랐다(ISSUE #27)."""
+    return normalize_paper_id(pid)
 
 
 def recall_at(ranks: dict[str, int | None], k: int) -> dict[str, float]:

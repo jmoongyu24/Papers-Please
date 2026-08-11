@@ -53,6 +53,7 @@ import numpy as np
 
 from src import config
 from src.retrieval.arxiv_live import ArxivLiveRetriever
+from src.retrieval.fusion import normalize_paper_id
 from src.rewriter.base import build_rewriter
 from src.utils import read_jsonl, write_jsonl
 
@@ -64,8 +65,12 @@ DEFAULT_K_VALUES = (1, 5, 10, 30, 50, 100)
 
 
 def normalize_id(paper_id: str) -> str:
-    """arXiv 번호에서 버전 표기를 뗀다. '1706.03762v7' -> '1706.03762'."""
-    return paper_id.split("v")[0]
+    """arXiv 번호에서 버전 표기를 뗀다. '1706.03762v7' -> '1706.03762'.
+
+    구현은 `fusion.normalize_paper_id` 하나만 쓴다. 예전의 `split("v")[0]` 은
+    `solv-int/9611001v1` 을 `sol` 로 잘랐다(ISSUE #27).
+    """
+    return normalize_paper_id(paper_id)
 
 
 def git_commit() -> str:
