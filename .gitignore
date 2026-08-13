@@ -19,10 +19,11 @@ data/API_KEY.env
 runs/
 *.faiss
 
-# OS / 에디터
+# OS / 에디터 / 개발 도구 설정
 .DS_Store
 .idea/
 .vscode/
+.pytest_cache/
 # 학습된 모델 가중치 — git이 아니라 HuggingFace Hub로 배포한다
 # (LoRA 어댑터 264MB + optimizer 528MB × 체크포인트 수 = 저장소가 GB 단위로 불어난다)
 models/
