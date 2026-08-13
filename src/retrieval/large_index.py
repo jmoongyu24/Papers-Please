@@ -38,13 +38,89 @@ def index_paths(out_prefix: str | Path) -> dict[str, Path]:
     }
 
 
+# ── 색인과 코퍼스가 짝이 맞는지 확인 ──────────────────────────────────────
+#
+# 줄 위치표는 **그 코퍼스 파일 전용**이다. 다른 파일(또는 같은 이름으로 다시 만든 파일)에
+# 갖다 쓰면 `seek` 이 엉뚱한 줄에 떨어지는데, 그래도 JSON 파싱은 성공한다. 즉 **오류가 안 나고
+# 결과도 그럴듯해 보이는 채로 다른 논문의 제목과 초록을 돌려준다.** 서비스에서 이게 나면
+# 사용자에게 존재하지 않는 조합의 논문 정보를 보여주게 된다.
+#
+# 파일 이름 비교만으로는 부족하다. 실제 사고 시나리오가 "코퍼스를 같은 이름으로 다시 만드는
+# 것"이기 때문이다. 그래서 크기·수정시각까지 지문으로 남기고, 마지막에 표본까지 확인한다.
+
+def corpus_fingerprint(corpus_path: str | Path) -> dict:
+    """코퍼스 파일의 지문. stat() 한 번이라 비용이 없다."""
+    p = Path(corpus_path)
+    st = p.stat()
+    return {"corpus": str(p), "corpus_name": p.name,
+            "corpus_size": int(st.st_size), "corpus_mtime": int(st.st_mtime)}
+
+
+def read_meta(out_prefix: str | Path) -> dict:
+    paths = index_paths(out_prefix)
+    return json.loads(paths["meta"].read_text()) if paths["meta"].exists() else {}
+
+
+def write_meta(out_prefix: str | Path, meta: dict) -> None:
+    paths = index_paths(out_prefix)
+    paths["meta"].parent.mkdir(parents=True, exist_ok=True)
+    paths["meta"].write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+
+def sample_matches(corpus_path: str | Path, ids: list[str], offsets: np.ndarray,
+                   n: int = 5) -> bool:
+    """위치표대로 몇 편 꺼내 읽어, 정말 그 논문이 나오는지 본다 (디스크 이동 n번)."""
+    if not len(ids):
+        return False
+    picks = np.linspace(0, len(ids) - 1, num=min(n, len(ids)), dtype=int)
+    try:
+        with open(corpus_path, "rb") as f:
+            for i in picks:
+                f.seek(int(offsets[i]))
+                if str(json.loads(f.readline())["id"]) != ids[int(i)]:
+                    return False
+    except Exception:
+        return False
+    return True
+
+
+def check_pairing(corpus_path: str | Path, out_prefix: str | Path,
+                  ids: list[str], offsets: np.ndarray) -> tuple[bool, str]:
+    """짝이 맞는가. (맞음 여부, 사람이 읽을 이유) 를 돌려준다."""
+    fp = corpus_fingerprint(corpus_path)
+    meta = read_meta(out_prefix)
+
+    if len(ids) != len(offsets):
+        return False, f"논문 번호 {len(ids):,}개와 줄 위치 {len(offsets):,}개의 수가 다르다"
+
+    if "corpus_size" in meta:                      # 지문이 있으면 그것으로 판정한다
+        if meta["corpus_size"] != fp["corpus_size"]:
+            return False, (f"코퍼스 크기가 다르다: 색인을 만들 때 {meta['corpus_size']:,}바이트, "
+                           f"지금 {fp['corpus_size']:,}바이트")
+        if meta.get("corpus_name") not in (None, fp["corpus_name"]):
+            return False, f"색인은 '{meta['corpus_name']}' 용인데 '{fp['corpus_name']}' 를 받았다"
+        return True, "지문 일치"
+
+    # 지문이 없는 옛 색인. 다시 만들면 세 시간이 걸리므로, 표본을 읽어 확인하고 통과하면
+    # 지문을 채워 넣는다(다음부터는 즉시 판정된다).
+    if not sample_matches(corpus_path, ids, offsets):
+        return False, "표본 확인 실패 — 위치표가 가리키는 논문이 번호 목록과 다르다"
+    write_meta(out_prefix, {**meta, **fp})
+    return True, "표본 확인 통과 (지문을 새로 기록했다)"
+
+
 # ── 1단계: 논문 번호와 줄 위치 기록 ────────────────────────────────────────
 def scan_corpus(corpus_path: str | Path, out_prefix: str | Path) -> tuple[list[str], np.ndarray]:
     """논문 번호와 각 줄의 시작 위치를 기록한다 (seek 한 번으로 특정 논문만 읽기 위함)."""
     paths = index_paths(out_prefix)
     if paths["ids"].exists() and paths["offsets"].exists():
         ids = paths["ids"].read_text(encoding="utf-8").splitlines()
-        return ids, np.load(paths["offsets"])
+        offsets = np.load(paths["offsets"])
+        ok, why = check_pairing(corpus_path, out_prefix, ids, offsets)
+        if ok:
+            return ids, offsets
+        # 저장해 둔 것이 이 코퍼스 것이 아니다. 그대로 쓰면 임베딩과 본문이 어긋난다.
+        print(f"경고: 저장된 줄 위치 색인이 지금 코퍼스와 짝이 맞지 않는다 ({why}). 다시 훑는다.")
 
     ids: list[str] = []
     offsets: list[int] = []
@@ -60,6 +136,7 @@ def scan_corpus(corpus_path: str | Path, out_prefix: str | Path) -> tuple[list[s
     paths["ids"].write_text("\n".join(ids), encoding="utf-8")
     off = np.asarray(offsets, dtype=np.int64)
     np.save(paths["offsets"], off)
+    write_meta(out_prefix, {**read_meta(out_prefix), **corpus_fingerprint(corpus_path)})
     print(f"논문 번호·줄 위치 기록 완료: {len(ids):,}편 → {paths['ids'].name}")
     return ids, off
 
@@ -122,10 +199,10 @@ def build_embeddings(corpus_path: str | Path, out_prefix: str | Path,
             i += len(texts)
 
             emb.flush()
-            paths["meta"].write_text(json.dumps(
-                {"count": n, "dim": int(dim), "model": model_name, "done": i,
-                 "corpus": str(corpus_path), "max_seq_length": max_seq_length},
-                ensure_ascii=False), encoding="utf-8")
+            # 지문을 함께 남긴다. 이게 없으면 나중에 이 색인이 어느 코퍼스 것인지 알 수 없다.
+            write_meta(out_prefix,
+                       {"count": n, "dim": int(dim), "model": model_name, "done": i,
+                        "max_seq_length": max_seq_length, **corpus_fingerprint(corpus_path)})
 
             elapsed = time.time() - t0
             speed = (i - done) / max(elapsed, 1e-6)
@@ -156,7 +233,26 @@ class LargeDenseRetriever:
             raise RuntimeError(
                 f"임베딩이 아직 다 안 됐다: {meta['done']:,}/{meta['count']:,}편. "
                 f"build_embeddings 를 마저 돌릴 것.")
+
+        # 짝이 안 맞으면 **경고가 아니라 여기서 멈춘다.** 조용히 다른 논문의 제목과 초록을
+        # 사용자에게 보여주는 것보다, 검색이 아예 안 뜨는 편이 낫다.
+        ok, why = check_pairing(self.corpus_path, out_prefix, self.ids, self.offsets)
+        if not ok:
+            raise RuntimeError(
+                f"색인과 코퍼스가 짝이 맞지 않는다: {why}\n"
+                f"  색인: {out_prefix}\n  코퍼스: {self.corpus_path}\n"
+                f"이대로 쓰면 오류 없이 엉뚱한 논문의 제목·초록을 돌려준다. "
+                f"코퍼스를 원래 파일로 되돌리거나 색인을 다시 만들 것.")
+        if not sample_matches(self.corpus_path, self.ids, self.offsets):
+            raise RuntimeError(
+                f"지문은 맞는데 표본 확인에 실패했다 — 위치표가 가리키는 논문이 번호 목록과 "
+                f"다르다. 색인({out_prefix})을 다시 만들 것.")
+
         self.emb = np.load(paths["emb"], mmap_mode="r" if mmap else None)
+        if len(self.emb) != len(self.ids):
+            raise RuntimeError(
+                f"임베딩 {len(self.emb):,}개와 논문 번호 {len(self.ids):,}개의 수가 다르다. "
+                f"색인({out_prefix})을 다시 만들 것.")
 
         if embedder is None:
             from sentence_transformers import SentenceTransformer

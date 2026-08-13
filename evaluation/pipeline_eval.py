@@ -336,6 +336,11 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
 
     for r, papers in zip(rows, ranked):
         r["reranked_ids"] = [p.paper_id for p in papers]
+        # 어느 깊이로 재정렬했는지 문항에 새겨 둔다. 이게 없으면 나중에 이 파일을 다시
+        # 집계할 때 명령줄 기본값(fuse_top_n)으로 상한을 계산해 버린다 — ISSUE #26 과
+        # 똑같은 어긋남이 재집계 단계에서 되살아나는 자리다.
+        r["rerank_depth"] = depth
+        r["rerank_method"] = method
     print(f"재정렬 완료: {len(rows)}문항 · 방식 {method} · 깊이 {depth}")
 
 
@@ -343,6 +348,26 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
 def pool_depth_of(args) -> int:
     """상한을 계산할 후보 깊이. 재정렬을 켰으면 재정렬에 넣은 깊이가 곧 상한의 기준이다."""
     return args.rerank_depth if args.rerank != "none" else args.fuse_top_n
+
+
+def rerank_pool_rank(row: dict, rrf_k: int, depth: int, weights: dict[str, float]) -> int | None:
+    """**재정렬에 실제로 들어간 후보** 안에 정답이 있는가 (1 또는 None).
+
+    `union_rank` 와 헷갈리면 안 된다. 둘은 다른 집합이다.
+
+        union_rank      = 채널마다 상위 depth 편을 모은 합집합
+        rerank_pool_rank = 그것을 RRF 로 합쳐 상위 depth 편만 남긴 것  ← 재정렬이 보는 것
+
+    융합은 후보를 줄이므로 두 번째가 더 작다. 첫 번째를 '재정렬의 상한'이라 부르면
+    **융합이 흘린 몫까지 재정렬 탓으로 넘어간다.** 실측에서 시험용 300문항 기준
+    합집합 0.823 대 실제 재정렬 입력 0.797 로 0.026(정답 8편)이 그렇게 넘어가 있었다.
+    회수율이 82.6% 로 보였지만 실제로는 85.4% 였다.
+
+    ISSUE #26 에서 고친 것과 같은 종류의 어긋남이다. 그때는 '깊이'를 맞췄고, 이번에는
+    '집합을 만드는 방식'을 맞춘다. 두 곳 다 같은 함수를 부르게 해서 다시 어긋나지 않게 한다.
+    """
+    return 1 if row["gold_id"] in fused_ids_of(row, rrf_k, top_n=depth,
+                                               weights=weights) else None
 
 def print_report(rows: list[dict], title: str, k_values=DEFAULT_K_VALUES,
                  rrf_k: int = 60, weights: dict[str, float] | None = None,
@@ -352,6 +377,18 @@ def print_report(rows: list[dict], title: str, k_values=DEFAULT_K_VALUES,
     n = len(rows)
     names = channel_names_of(rows)
     ks = list(k_values)
+
+    # 파일에 새겨진 재정렬 깊이가 있으면 그것을 쓴다. 재집계할 때 명령줄 기본값으로
+    # 상한을 재면 깊이가 어긋나 회수율이 부풀려진다(ISSUE #26).
+    stamped = {r["rerank_depth"] for r in rows if r.get("rerank_depth")}
+    if len(stamped) == 1:
+        depth_from_file = stamped.pop()
+        if depth_from_file != pool_depth:
+            print(f"\n(참고: 이 파일은 깊이 {depth_from_file} 로 재정렬돼 있다. "
+                  f"명령줄 값 {pool_depth} 대신 그 깊이로 상한을 계산한다)")
+        pool_depth = depth_from_file
+    elif len(stamped) > 1:
+        print(f"\n경고: 문항마다 재정렬 깊이가 다르다({sorted(stamped)}). 상한 계산을 믿지 말 것.")
 
     print("\n" + "=" * 78)
     print(f"■ {title}")
@@ -400,32 +437,47 @@ def print_report(rows: list[dict], title: str, k_values=DEFAULT_K_VALUES,
     else:
         print("\n■ 재정렬 후: 아직 재정렬을 돌리지 않았다 (--rerank cross 로 실행)")
 
-    # 상한과 최종값의 차이.
-    # 상한은 **재정렬에 실제로 넣은 깊이**로 재야 한다. 깊이 300으로 재정렬해 놓고 상한을
-    # 깊이 100으로 재면 회수율이 부풀려진다.
-    ceiling_hits = hits_at([union_rank(r, pool_depth) for r in rows], 1)
-    ceiling = float(np.mean(ceiling_hits)) if ceiling_hits else 0.0
+    # 상한과 최종값의 차이 — 손실을 **융합 몫과 재정렬 몫으로 나눠서** 본다.
+    #
+    # 상한을 하나만 적으면 처방을 잘못 고른다. 채널이 후보를 못 물어온 것인지, 융합이
+    # 흘린 것인지, 재정렬이 못 끌어올린 것인지가 전부 다른 문제이기 때문이다.
     final_ranks = rr_ranks if rr_ranks is not None else fused_ranks
     final_name = "재정렬 후" if rr_ranks is not None else "융합 후"
     final = float(np.mean(hits_at(final_ranks, 10))) if rows else 0.0
-    recovered = f"상한의 {final / ceiling:.1%} 회수" if ceiling > 0 else "상한이 0이라 계산 불가"
+
+    union_ceiling = float(np.mean(hits_at([union_rank(r, pool_depth) for r in rows], 1))) if rows else 0.0
+    if has_rr:
+        pool_hits = [rerank_pool_rank(r, rrf_k, pool_depth, weights) for r in rows]
+        pool_ceiling = float(np.mean(hits_at(pool_hits, 1))) if rows else 0.0
+    else:
+        pool_ceiling = union_ceiling      # 재정렬을 안 했으면 융합 결과가 곧 최종 후보다
+
+    recovered = (f"상한의 {final / pool_ceiling:.1%} 회수"
+                 if pool_ceiling > 0 else "상한이 0이라 계산 불가")
     print(f"\n■ 상한과 최종값의 차이")
-    print(f"   후보 상한 (합집합 @{pool_depth})      : {ceiling:.3f}")
-    print(f"   최종 Recall@10 ({final_name})     : {final:.3f}")
-    print(f"   못 회수한 몫                 : {final - ceiling:+.3f}  ({recovered})")
-    print("   해석: 상한이 낮으면 채널을 더 늘려야 하고, 상한은 높은데 최종이 낮으면")
-    print("         융합·재정렬을 고쳐야 한다. 두 문제는 처방이 다르다.")
+    print(f"   ① 채널 합집합 @{pool_depth}            : {union_ceiling:.3f}"
+          f"   (융합을 완벽히 하면 도달 가능한 값)")
+    print(f"   ② 재정렬이 실제로 본 후보        : {pool_ceiling:.3f}"
+          f"   (①을 RRF로 합쳐 상위 {pool_depth}편만 남긴 것)")
+    print(f"   ③ 최종 Recall@10 ({final_name})    : {final:.3f}")
+    print(f"   융합이 흘린 몫  (① → ②)         : {pool_ceiling - union_ceiling:+.3f}")
+    print(f"   재정렬이 못 건진 몫 (② → ③)      : {final - pool_ceiling:+.3f}  ({recovered})")
+    print("   해석: ①이 낮으면 채널을 더 늘린다. ①→② 손실이 크면 융합 방식을 고친다")
+    print("         (재정렬기는 후보의 순서를 안 보므로, 후보를 줄이는 융합은 손해만 된다).")
+    print("         ②→③ 손실이 크면 재정렬을 고친다. 세 처방은 전부 다르다.")
 
     # 언어별·난이도별 (어디서 실패하는지)
     for field in ("lang", "difficulty"):
         groups: dict[str, list[int]] = {}
         for i, r in enumerate(rows):
             groups.setdefault(str(r.get(field)), []).append(i)
-        print(f"\n■ {field}별 Recall@10 (최종={final_name})")
+        print(f"\n■ {field}별 Recall@10 (최종={final_name}, 상한=재정렬이 실제로 본 후보)")
         for key, idxs in sorted(groups.items()):
             sub_final = float(np.mean([hits_at([final_ranks[i]], 10)[0] for i in idxs]))
-            sub_ceiling = float(np.mean(
-                [hits_at([union_rank(rows[i], pool_depth)], 1)[0] for i in idxs]))
+            sub_ceiling = float(np.mean([hits_at([pool_hits[i]], 1)[0] for i in idxs])
+                                if has_rr else
+                                np.mean([hits_at([union_rank(rows[i], pool_depth)], 1)[0]
+                                         for i in idxs]))
             print(f"   {key:<10} n={len(idxs):<4} 최종 {sub_final:.3f} · 상한 {sub_ceiling:.3f}")
 
 

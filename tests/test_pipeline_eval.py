@@ -189,3 +189,45 @@ def test_report_runs_when_nothing_is_found(capsys):
     rows = [row("q1", "A", {"arxiv": [], "local_dense": []}, error="x")]
     pe.print_report(rows, "전부 실패", k_values=(10,), rrf_k=60, weights={})
     assert "상한이 0이라 계산 불가" in capsys.readouterr().out
+
+
+# ── 상한을 어느 집합으로 재는가 (ISSUE #26 이 재발한 자리) ─────────────────
+#
+# 합집합과 '재정렬이 실제로 본 후보' 는 다른 집합이다. 융합이 후보를 줄이기 때문이다.
+# 합집합을 상한이라 부르면 **융합이 흘린 몫까지 재정렬 탓으로 넘어가** 처방이 뒤바뀐다.
+# 실측에서 시험용 300문항 기준 0.823 대 0.797 로 정답 8편이 그렇게 넘어가 있었다.
+
+FUSION_DROPS_GOLD = row(
+    "q9", "GOLD",
+    # 정답은 의미 검색 3등이라 합집합@3 에는 들어온다.
+    # 그러나 arXiv 가 올린 P·Q 가 RRF 점수에서 앞서, 융합 상위 3편에서는 밀려난다.
+    {"local_dense": ["X", "Y", "GOLD"], "arxiv": ["P", "Q", "R"]},
+)
+
+
+def test_합집합에는_있지만_융합_상위에서는_밀려난다():
+    assert pe.union_rank(FUSION_DROPS_GOLD, depth=3) == 1
+    assert pe.rerank_pool_rank(FUSION_DROPS_GOLD, rrf_k=60, depth=3, weights={}) is None
+
+
+def test_융합이_흘린_몫과_재정렬이_못_건진_몫을_따로_보고한다(capsys):
+    rows = [dict(FUSION_DROPS_GOLD, reranked_ids=["X", "P", "Y"], rerank_depth=3)]
+    pe.print_report(rows, "융합 손실", k_values=(10,), rrf_k=60, weights={}, pool_depth=3)
+    text = capsys.readouterr().out
+
+    assert "채널 합집합" in text
+    assert "재정렬이 실제로 본 후보" in text
+    assert "융합이 흘린 몫" in text
+    # 합집합 1.000 → 융합 후 0.000 이므로 손실 전부가 융합 몫으로 잡혀야 한다
+    assert "융합이 흘린 몫  (① → ②)         : -1.000" in text
+    assert "재정렬이 못 건진 몫 (② → ③)      : +0.000" in text
+
+
+def test_파일에_새겨진_재정렬_깊이를_명령줄보다_우선한다(capsys):
+    """재집계할 때 기본값으로 상한을 재면 ISSUE #26 이 되살아난다."""
+    rows = [dict(FUSION_DROPS_GOLD, reranked_ids=["GOLD"], rerank_depth=3)]
+    pe.print_report(rows, "깊이 새김", k_values=(10,), rrf_k=60, weights={}, pool_depth=200)
+    text = capsys.readouterr().out
+
+    assert "깊이 3 로 재정렬돼 있다" in text
+    assert "채널 합집합 @3" in text

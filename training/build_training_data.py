@@ -32,6 +32,7 @@ from pathlib import Path
 
 from src import config
 from src.retrieval.arxiv_live import ArxivLiveRetriever
+from src.retrieval.fusion import normalize_paper_id as normalize_id
 from src.rewriter.hierarchical import HierarchicalRewriter, build_arxiv_query
 from src.rewriter.llm_client import OllamaClient
 from src.rewriter.prompts import OUTPUT_SCHEMA, SYSTEM, build_messages
@@ -40,9 +41,10 @@ from src.utils import read_jsonl, write_jsonl
 OUT_DIR = config.DATA_DIR / "training"
 CACHE_PATH = config.DATA_DIR / "cache" / "arxiv_search_cache.jsonl"
 
-
-def normalize_id(paper_id: str) -> str:
-    return paper_id.split("v")[0]
+# 논문 번호 표기 통일은 fusion.normalize_paper_id 한 곳에서만 한다.
+# 예전에 여기 있던 `paper_id.split("v")[0]` 은 옛 형식 번호 `solv-int/9611001v1` 을
+# `sol` 로 잘랐다. 잘린 번호는 정답과 절대 안 맞으므로, 그 후보 검색어는 실제로 정답을
+# 찾았더라도 **오류 없이 0점**을 받는다 — 학습 라벨이 조용히 오염되는 자리였다 (ISSUE #27).
 
 
 def score_query(query: str, gold_id: str, retriever, k: int = 30) -> tuple[float, int | None]:
