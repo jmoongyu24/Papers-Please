@@ -16,7 +16,7 @@
 
 ## 실제 변환기들이 있는 곳
 
-    baselines.py  - hierarchical(계층 변환), single_step, hyde  <- 비교 대상
+    baselines.py  - hierarchical, single_step, hyde (비교 대상) + translate (한국어->영어)
     finetuned.py  - 학습한 모델(sft/dpo)                        <- 지금 서비스가 쓰는 것
 """
 
@@ -78,6 +78,10 @@ def build_rewriter(name: str) -> Rewriter:
     if name == "hyde":
         from src.rewriter.baselines import HydeRewriter
         return HydeRewriter()
+    if name == "translate":
+        # 한국어를 영어로 옮기기만 함. 로컬 의미 검색 채널용
+        from src.rewriter.baselines import TranslateRewriter
+        return TranslateRewriter()
     if name == "finetuned":
         # SFT(지도 미세조정)로 학습한 모델. 학습 전/후 비교용
         from src.rewriter.finetuned import FinetunedRewriter
@@ -88,7 +92,7 @@ def build_rewriter(name: str) -> Rewriter:
         return FinetunedRewriter(adapter_path="models/qwen3-4b-query-dpo")
     raise ValueError(
         f"알 수 없는 변환기 이름: {name} "
-        f"(쓸 수 있는 것: passthrough, hierarchical, single_step, hyde, finetuned, dpo)")
+        f"(쓸 수 있는 것: passthrough, translate, hierarchical, single_step, hyde, finetuned, dpo)")
 
 
 # ==========================================================================

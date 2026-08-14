@@ -270,6 +270,88 @@ class SingleStepRewriter:
             )
 
 
+class TranslateRewriter:
+    """한국어 질문을 영어로 옮기기만 함. 다른 것은 아무것도 하지 않음.
+
+    ## 왜 이것이 따로 필요한가
+
+    arXiv 논문은 제목도 초록도 영어임. 그런데 2026-08-14 실측에서 한국어 질문의 Recall@10 이
+    0.503, 영어가 0.637 로 0.134 벌어졌음. 로컬 색인이 다국어 임베딩(bge-m3)을 쓰는데도
+    그렇고, 재정렬 점수도 한국어가 눌림(만족 등급 중앙값 0.07 대 영어 0.17).
+
+    그 격차가 **번역이 안 돼서 생긴 것인지** 확인하려면, 번역만 하고 다른 것은 건드리지 않는
+    변환기가 있어야 함. 학습한 변환기(dpo)는 arXiv 문법 문자열을 만들기 때문에 이 질문에
+    답할 수 없음 - 두 가지(번역, 문법 생성)를 한꺼번에 하므로 원인을 못 가림.
+
+    ## 무엇을 기대하는가
+
+    이 변환기가 한국어를 영어 수준까지 끌어올리면, 변환기의 방향을 'arXiv 문법 생성기' 에서
+    '의미 검색용 영어 검색어 생성기' 로 바꾸는 것이 정당해짐. 안 오르면 다국어 임베딩이 이미
+    언어 격차를 메우고 있다는 뜻이고, 격차의 원인은 다른 데 있음.
+
+    ## 주의
+
+    영어 문장 하나를 세 backend 에 그대로 넣음. **arXiv 채널에는 좋은 입력이 아님** -
+    arXiv 는 따옴표 구와 필드 지정을 요구하는 키워드 검색이기 때문임. 이 변환기는
+    로컬 의미 검색 채널을 위한 것임.
+    """
+
+    name = "translate"
+
+    # 감사 도구(evaluation/dataset.py) 가 쓰는 것과 같은 지시문. 번역 품질이 아니라
+    # '뜻이 그대로 넘어가는가' 가 목적이라 짧고 곧이곧대로 시킴.
+    SYSTEM = (
+        "You translate Korean academic search queries into English.\n"
+        "Translate literally and completely. Keep every technical noun. Do not add, remove, "
+        "or generalize any term. Do not explain. Output only the English sentence."
+    )
+    SCHEMA = {
+        "type": "object",
+        "properties": {"english": {"type": "string"}},
+        "required": ["english"],
+    }
+
+    def __init__(self, client: OllamaClient | None = None):
+        self.client = client or OllamaClient()
+        self._cache: dict[str, str] = {}      # 같은 질문을 두 번 번역하지 않음
+
+    @staticmethod
+    def has_hangul(text: str) -> bool:
+        return any("가" <= ch <= "힣" for ch in text)
+
+    def rewrite(self, raw_query: str) -> RewriteResult:
+        # 이미 영어면 손대지 않음. 번역기를 통과시키면 뜻이 미묘하게 바뀌어 손해만 봄.
+        if not self.has_hangul(raw_query):
+            return RewriteResult(
+                raw_query=raw_query,
+                queries={b: raw_query for b in BACKENDS},
+                intent=raw_query, parse_ok=True,
+            )
+
+        if raw_query in self._cache:
+            english = self._cache[raw_query]
+        else:
+            try:
+                data = self.client.generate_json(raw_query, self.SCHEMA,
+                                                 system=self.SYSTEM, temperature=0.0)
+                english = str(data.get("english", "")).strip()
+                if not english:
+                    raise ValueError("빈 출력")
+            except Exception as e:
+                return RewriteResult(
+                    raw_query=raw_query,
+                    queries={b: raw_query for b in BACKENDS},
+                    intent=f"(번역 실패, 원본 사용) {e}", parse_ok=False,
+                )
+            self._cache[raw_query] = english
+
+        return RewriteResult(
+            raw_query=raw_query,
+            queries={b: english for b in BACKENDS},
+            intent=english, parse_ok=True,
+        )
+
+
 class HydeRewriter:
     """HyDE: 가상 초록을 생성해 의미(dense) 검색어로 씀.
 

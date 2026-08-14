@@ -36,12 +36,20 @@ p=0.889). 그런데도 arXiv 채널을 남기는 이유는, 평가셋의 정답 
     3. 결과는 목록 하나임. 추천 에이전트의 판단을 그 목록 카드 안에 녹임
     4. 진행 중에는 지금 어느 단계인지 보여줌 (한 번 검색에 10초 넘게 걸리므로)
 
-## 로컬 의미 검색에 원본 질문을 넣는 이유
+## 한국어 질문을 먼저 영어로 옮기는 이유 (2026-08-14 실측)
 
-이 채널은 글자가 아니라 뜻으로 찾으므로 변환이 필요 없음. 게다가 학습한 변환기(dpo)가
-내놓는 것은 arXiv 문법 문자열(all:"..." OR abs:"...")이라, 문장을 통째로 임베딩하는
-의미 검색에는 오히려 불리함. 평가도 같은 조건으로 맞춰 두었음
-(pipeline_eval 의 --local-query 기본값).
+arXiv 논문은 제목도 초록도 영어임. 로컬 색인이 다국어 임베딩(bge-m3)을 쓰는데도 한국어
+질문이 영어보다 크게 뒤졌음. 번역해서 넣으니 시험용 342문항에서 한국어 Recall@10 이
+0.456 -> 0.567 (+0.111, p=0.001), nDCG 가 0.400 -> 0.455 (+0.055, p<0.001) 로 올랐음.
+영어 질문은 손대지 않으므로 대조군으로 +0.000 이 나왔음. 언어 격차가 58% 줄었음.
+
+학습한 변환기(dpo)가 내놓는 arXiv 문법 문자열(all:"..." OR abs:"...")은 여기 쓰지 않음.
+문장을 통째로 임베딩하는 의미 검색에 검색 문법을 넣으면 불리하기 때문임. 그 문자열은
+arXiv 채널 전용임.
+
+재정렬에는 번역문이 아니라 원본 질문을 씀. 번역문으로도 재봤는데 이득이 없었고
+(Recall +0.006 p=0.678, nDCG -0.007 p=0.226), 재정렬의 목적이 '사용자 의도와 맞는가' 를
+보는 것이라 사용자가 실제로 쓴 말을 쓰는 것이 원칙에 맞음.
 
 실행:
   streamlit run app.py
@@ -181,6 +189,31 @@ def load_reranker():
     return CrossEncoderReranker()
 
 
+@st.cache_resource
+def load_translator():
+    """한국어 질문을 영어로 옮기는 변환기.
+
+    ## 왜 번역하는가 (2026-08-14 실측)
+
+    arXiv 논문은 제목도 초록도 영어임. 로컬 색인이 다국어 임베딩(bge-m3)을 쓰는데도
+    한국어 질문이 영어보다 크게 뒤졌음. 번역해서 넣으니 시험용 342문항에서:
+
+        한국어 Recall@10   0.456 -> 0.567  (+0.111, p=0.001)
+        한국어 nDCG@10     0.400 -> 0.455  (+0.055, p<0.001)
+        영어 (대조군)       0.649 -> 0.649  (+0.000, 손대지 않았으므로)
+
+    언어 격차가 0.193 에서 0.082 로 58% 줄었음. 학습은 한 번도 하지 않았고 프롬프트 한 줄임.
+    같은 날 잰 학습한 변환기(dpo)는 Recall +0.018(판정 불가)에 nDCG -0.016(나쁨)이었음.
+
+    ## 왜 Ollama 인가
+
+    앱이 이미 `PaperResolver` 때문에 Ollama 의 qwen3:4b 를 올려 두고 있어서 VRAM 이 더
+    들지 않음. 그리고 평가도 같은 경로로 쟀으므로 평가와 서비스가 어긋나지 않음.
+    """
+    from src.rewriter.baselines import TranslateRewriter
+    return TranslateRewriter()
+
+
 # ==========================================================================
 # 검색 파이프라인 (화면 그리기와 분리해 둠)
 # ==========================================================================
@@ -249,6 +282,20 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
             out["resolved"] = None      # arXiv 오류 등은 배너 생략(치명적 아님)
         out["timing"]["논문 지목 확인"] = time.time() - t0
 
+    # 한국어면 영어로 옮겨 로컬 의미 검색에 넣음. arXiv 논문이 영어라서임.
+    # 영어 질문은 건드리지 않음 (번역기를 통과시키면 뜻이 미묘하게 바뀌어 손해만 봄).
+    from src.rewriter.baselines import TranslateRewriter
+    out["search_text"] = query
+    if use_local and TranslateRewriter.has_hangul(query):
+        status.write("한국어 질문을 영어로 옮기는 중...")
+        t0 = time.time()
+        tr = load_translator().rewrite(query)
+        if tr.parse_ok:
+            out["search_text"] = tr.query_for("dense")
+        else:
+            out["translate_error"] = tr.intent
+        out["timing"]["한국어를 영어로"] = time.time() - t0
+
     status.write("검색어를 학술 용어로 바꾸는 중...")
     t0 = time.time()
     out["rewrite"] = load_rewriter().rewrite(query)
@@ -258,8 +305,7 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
         status.write(f"논문 71만 편에서 뜻으로 찾는 중... (후보 {DEPTH_LOCAL}편)")
         t0 = time.time()
         try:
-            # 원본 질문을 그대로 넣음 (파일 위 설명 참고)
-            out["local_hits"] = load_local_index().search(query, k=DEPTH_LOCAL)
+            out["local_hits"] = load_local_index().search(out["search_text"], k=DEPTH_LOCAL)
         except Exception as e:
             out["local_error"] = str(e)
         out["timing"]["로컬 의미 검색"] = time.time() - t0
@@ -281,8 +327,10 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
     if candidates:
         status.write(f"질문 의도와 대조해 순위를 다시 매기는 중... (후보 {len(candidates)}편)")
         t0 = time.time()
-        # 변환된 검색어가 아니라 원본 질문으로 재정렬함. 재정렬의 목적이
-        # 사용자 의도와 맞는가를 보는 것이기 때문임.
+        # 번역문이 아니라 원본 질문으로 재정렬함.
+        # 재정렬의 목적이 '사용자 의도와 맞는가' 를 보는 것이라 사용자가 실제로 쓴 말을 씀.
+        # 번역문으로도 재봤는데 이득이 없었음 - 시험용 342문항에서 Recall +0.006(p=0.678),
+        # nDCG -0.007(p=0.226) 으로 둘 다 잡음과 구분되지 않았음 (2026-08-14).
         out["results"] = load_reranker().rerank(query, candidates, top_k=TOP_K)
         out["timing"]["재정렬"] = time.time() - t0
 
@@ -319,41 +367,56 @@ def confident_results(results, min_score: float | None):
 # 화면 조각
 # ==========================================================================
 
-def render_understanding(query: str, rw) -> None:
+def render_understanding(query: str, state: dict) -> None:
     """무엇을 어떻게 알아들었는지 보여줌 (ISSUE 11).
 
-    이 화면이 검색 성능을 올리지는 않음. 사용자가 "내 말이 이런 전문 용어로 바뀌었구나"
-    를 이해하게 하는 설명 기능이고, 그 점을 감추지 않음 (PLAN 0절).
+    이 화면이 검색 성능을 올리지는 않음. 사용자가 "내 말이 이렇게 바뀌어 검색됐구나" 를
+    이해하게 하는 설명 기능이고, 그 점을 감추지 않음 (PLAN 0절).
 
-    변환기가 실제로 낸 것만 보여줄 것 (실측으로 확인한 함정):
-    서비스가 쓰는 학습 모델(dpo)은 arXiv 문법 문자열 하나만 내놓음. 의도, 개념, 학술 용어를
-    따로 만들지 않아서 intent 자리에 원본 질문이 그대로 들어 있음. 그런데도 3단을 고정으로
-    그리면 "내가 쓴 말 / 내가 쓴 말 / (원본을 그대로 썼습니다)" 가 되어, 아무 내용도 없는 칸을
-    세 개 늘어놓게 됨. 계층 변환기(hierarchical)를 쓸 때만 3단이 채워짐.
+    실제로 일어난 것만 보여줄 것 (실측으로 확인한 함정):
+    학습 모델(dpo)은 arXiv 문법 문자열 하나만 내놓음. 의도, 개념, 학술 용어를 따로 만들지
+    않아서 intent 자리에 원본 질문이 그대로 들어 있음. 그런데도 칸을 고정으로 그리면
+    "내가 쓴 말 / 내가 쓴 말 / (원본을 그대로 썼습니다)" 가 되어 빈 칸만 늘어놓게 됨.
     """
-    # 변환기가 원본과 다른 것을 실제로 만들었는가
+    rw = state["rewrite"]
+    translated = state.get("search_text")
+    has_translation = bool(translated) and translated.strip() != query.strip()
+
     intent = (rw.intent or "").strip()
     has_intent = bool(intent) and intent != query.strip()
     terms = academic_terms_of(rw, query)
 
-    if not (has_intent or terms):
+    if not (has_translation or has_intent or terms):
         st.caption("입력하신 말을 그대로 뜻으로 검색했습니다.")
         return
 
     st.markdown("#### 이렇게 알아들었습니다")
-    cols = st.columns(3 if has_intent else 2)
-    with cols[0]:
+    n = 1 + int(has_translation) + int(has_intent) + int(bool(terms))
+    cols = st.columns(n)
+    i = 0
+    with cols[i]:
         st.caption("내가 쓴 말")
         st.info(query)
+    if has_translation:
+        i += 1
+        with cols[i]:
+            st.caption("영어로 이렇게 옮겨 찾았습니다")
+            st.success(translated)
+            st.caption("arXiv 논문이 영어라, 한국어로 물으시면 먼저 영어로 옮깁니다.")
     if has_intent:
-        with cols[1]:
+        i += 1
+        with cols[i]:
             st.caption("찾으시는 것")
             st.info(intent)
             if rw.concepts:
                 st.caption("핵심 개념: " + ", ".join(rw.concepts))
-    with cols[-1]:
-        st.caption("이런 영어 학술 용어로 바꿔서 찾았습니다")
-        st.success(", ".join(terms))
+    if terms:
+        i += 1
+        with cols[i]:
+            st.caption("arXiv 에는 이 용어로 물었습니다")
+            st.info(", ".join(terms))
+    if state.get("translate_error"):
+        st.caption(f"번역에 실패해 원본으로 검색했습니다. {state['translate_error']}")
     if not rw.parse_ok:
         st.caption("변환에 실패해 원본 검색어로 검색했습니다.")
 
@@ -429,6 +492,8 @@ def render_sources(state: dict, use_local: bool, use_arxiv: bool) -> None:
             src.append(f"arXiv {len(state.get('arxiv_hits') or [])}편")
         st.caption(f"후보: {' + '.join(src)} -> 중복 제거 {state.get('n_candidates', 0)}편 "
                    f"-> 재정렬해 상위 {TOP_K}편")
+        if use_local and state.get("search_text") != state["rewrite"].raw_query:
+            st.caption(f"로컬 의미 검색어(영어로 옮김): `{state['search_text']}`")
         if use_arxiv:
             st.caption(f"arXiv 검색어: `{state['rewrite'].query_for('arxiv')}`")
         if state.get("local_error"):
@@ -498,7 +563,7 @@ if go and query.strip():
             st.write(p.abstract)
         st.divider()
 
-    render_understanding(query, state["rewrite"])
+    render_understanding(query, state)
     st.divider()
 
     st.markdown("#### 찾은 논문")

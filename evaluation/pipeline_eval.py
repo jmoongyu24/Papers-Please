@@ -344,8 +344,25 @@ class TextLookup:
         return out
 
 
+def rerank_query_of(row: dict, mode: str) -> str:
+    """재정렬기에 넣을 질문을 고름.
+
+    raw       (기본) 사용자가 실제로 입력한 말. 재정렬의 목적이 '사용자 의도와 맞는가' 를
+              보는 것이므로 원본이 원칙임.
+    rewritten 변환기가 만든 검색어. 한국어를 영어로 옮기는 변환기(translate)를 쓸 때만
+              의미가 있음. 재정렬 모델이 한국어 질문과 영어 초록을 맞댈 때 점수가 눌리기
+              때문임 - 만족 등급 논문의 점수 중앙값이 한국어 0.07, 영어 0.17 이었음
+              (2026-08-14 실측). 그 눌림이 순위에도 영향을 주는지 가려 보려는 것임.
+    """
+    if mode != "rewritten":
+        return row["text"]
+    sq = row.get("search_queries") or {}
+    return sq.get("local_dense") or next(iter(sq.values()), row["text"]) or row["text"]
+
+
 def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
-                rrf_k: int, weights: dict[str, float], batch_size: int = 32) -> None:
+                rrf_k: int, weights: dict[str, float], batch_size: int = 32,
+                query_mode: str = "raw") -> None:
     """저장된 결과를 융합한 뒤 상위 `depth` 편을 재정렬해 `reranked_ids` 로 채움.
 
     검색은 한 번도 하지 않음. 후보 본문을 못 찾은 논문은 후보에서 빠지는데, 그 논문이
@@ -370,7 +387,7 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
         cand_lists.append([ScoredPaper(paper_id=pid, score=0.0, rank=i,
                                        title=texts[pid][0], abstract=texts[pid][1])
                            for i, pid in enumerate(kept, start=1)])
-        queries.append(r["text"])          # 주의: 재정렬은 변환된 검색어가 아니라 원본 질문으로 함
+        queries.append(rerank_query_of(r, query_mode))   # 기본은 원본 질문 (위 함수 설명 참고)
 
     if method == "cross":
         from src.retrieval.ranking import CrossEncoderReranker, DEFAULT_RERANKER
@@ -818,6 +835,9 @@ def main() -> None:
     ap.add_argument("--rerank", default="none", choices=["none", "cross", "embedding"],
                     help="재정렬 방식. 저장된 결과 위에서 돌아가므로 검색은 다시 하지 않는다")
     ap.add_argument("--rerank-depth", type=int, default=100, help="재정렬에 넣을 후보 수")
+    ap.add_argument("--rerank-query", default="raw", choices=["raw", "rewritten"],
+                    help="재정렬기에 넣을 질문. raw(기본)는 원본, rewritten 은 변환 결과. "
+                         "한국어를 영어로 옮기는 변환기를 쓸 때만 rewritten 이 의미가 있음")
     ap.add_argument("--batch-size", type=int, default=32)
 
     ap.add_argument("--corpus", default=str(config.CORPUS_DIR / "corpus-cs2021.jsonl"))
@@ -871,7 +891,7 @@ def main() -> None:
             lookup = TextLookup(args.index, args.corpus,
                                 None if args.no_cache else CACHE_PATH)
             rerank_rows(rows, args.rerank, args.rerank_depth, lookup,
-                        args.rrf_k, weights, args.batch_size)
+                        args.rrf_k, weights, args.batch_size, args.rerank_query)
             # 재정렬 결과를 파일에 되써서 재사용함 (실행 정보 _meta 줄은 그대로 보존).
             # --out 을 주면 원본을 건드리지 않고 새 파일로 씀 - 같은 검색 결과에서
             # 채널 조합을 여러 가지로 갈라 볼 때 서로 덮어쓰지 않기 위함임.
@@ -922,7 +942,7 @@ def main() -> None:
         lookup = TextLookup(args.index, args.corpus,
                             None if args.no_cache else CACHE_PATH)
         rerank_rows(results, args.rerank, args.rerank_depth, lookup,
-                    args.rrf_k, weights, args.batch_size)
+                    args.rrf_k, weights, args.batch_size, args.rerank_query)
 
     meta = {"_meta": True, "rewriter": args.rewriter, "queries": args.queries,
             "channels": args.channels, "k": args.k, "rrf_k": args.rrf_k,
