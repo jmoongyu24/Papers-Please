@@ -1,11 +1,11 @@
-"""특정 논문 지목(known-item) 해결기 — 방안 A.
+"""특정 논문 지목(known-item) 해결기 - 방안 A.
 
 '트랜스포머를 최초로 소개한 논문' 처럼 사용자가 특정 유명 논문을 '설명'으로 가리킬 때,
-키워드 검색은 그게 어떤 논문인지 못 알아낸다. 대신 LLM의 지식으로 그 논문의 실제 제목을
-추정하고, **arXiv에서 그 제목의 논문이 실제로 있는지 검증**한 뒤에만 제시한다.
+키워드 검색은 그게 어떤 논문인지 못 알아냄. 대신 LLM의 지식으로 그 논문의 실제 제목을
+추정하고, arXiv에서 그 제목의 논문이 실제로 있는지 검증한 뒤에만 제시함.
 
 검증이 핵심이다: LLM이 없는 제목을 그럴싸하게 지어낼 수 있으므로(할루시네이션), arXiv에서
-제목이 실제로 확인될 때만 "이 논문을 찾으시는 것 같습니다"로 내놓는다. 확인 안 되면 버린다.
+제목이 실제로 확인될 때만 "이 논문을 찾으시는 것 같습니다"로 내놓음. 확인 안 되면 버림.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def title_match(resolved: str, candidate: str, threshold: float = 0.8) -> bool:
 
 
 class PaperResolver:
-    """질문이 특정 논문을 가리키면 그 제목을 추정한다 (검증 전)."""
+    """질문이 특정 논문을 가리키면 그 제목을 추정함 (검증 전)."""
 
     def __init__(self, client: OllamaClient | None = None):
         self.client = client or OllamaClient()
@@ -67,12 +67,12 @@ class PaperResolver:
 
 def resolve_and_verify(query: str, resolver: PaperResolver, arxiv_retriever,
                        k: int = 3) -> tuple[ScoredPaper | None, str | None]:
-    """설명→제목 추정 후 arXiv에서 검증한다.
+    """설명->제목 추정 후 arXiv에서 검증함.
 
     Returns:
         (검증된 논문 or None, 추정 제목 or None)
-        - (논문, 제목): 특정 논문으로 판단 + arXiv에서 제목 확인됨 → 제시 가능
-        - (None, 제목): 제목은 추정했으나 arXiv에서 확인 안 됨 → 할루시네이션 의심, 제시 안 함
+        - (논문, 제목): 특정 논문으로 판단 + arXiv에서 제목 확인됨 -> 제시 가능
+        - (None, 제목): 제목은 추정했으나 arXiv에서 확인 안 됨 -> 할루시네이션 의심, 제시 안 함
         - (None, None): 특정 논문을 가리키는 질문이 아님
     """
     title = resolver.resolve(query)

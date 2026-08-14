@@ -1,13 +1,13 @@
-"""평가가 조용히 틀리는 자리를 못박아 두는 테스트 (검색·모델 없이 돈다).
+"""평가가 조용히 틀리는 자리를 못박아 두는 테스트 (검색, 모델 없이 돌아감).
 
-**1부. 집계 규칙 (pipeline_eval)**
-1. **오류·결과 0건 문항을 실패로 세는가.** 제외해 버리면 기준선이 부풀려진다(ISSUE #23).
-2. **저장된 채널 결과만으로 융합을 다시 계산할 수 있는가.** 이 하네스의 존재 이유다.
-3. **상한을 어느 집합으로 재는가.** 합집합과 '재정렬이 실제로 본 후보' 를 헷갈리면
-   융합이 흘린 몫이 재정렬 탓으로 넘어가 처방이 뒤바뀐다 (ISSUE #26·#31).
+1부. 집계 규칙 (pipeline_eval)
+1. 오류, 결과 0건 문항을 실패로 세는가. 제외해 버리면 기준선이 부풀려짐(ISSUE #23).
+2. 저장된 채널 결과만으로 융합을 다시 계산할 수 있는가. 이 하네스의 존재 이유임.
+3. 상한을 어느 집합으로 재는가. 합집합과 '재정렬이 실제로 본 후보' 를 헷갈리면
+   융합이 흘린 몫이 재정렬 탓으로 넘어가 처방이 뒤바뀜 (ISSUE #26, #31).
 
-**2부. 지표 계산 (metrics)**
-지표는 평가 전체의 기준이므로, 손으로 계산한 값과 맞는지 못박아 둔다.
+2부. 지표 계산 (metrics)
+지표는 평가 전체의 기준이므로, 손으로 계산한 값과 맞는지 못박아 둠.
 
 실행: $PY -m pytest tests/test_evaluation.py -q
 """
@@ -28,11 +28,11 @@ def row(qid, gold, channels, **extra):
 ROWS = [
     # 두 채널 모두 정답을 1등으로
     row("q1", "A", {"arxiv": ["A", "X"], "local_dense": ["A", "Y"]}),
-    # arXiv 는 못 찾고 의미 검색만 3등으로 찾음 → 합집합에는 들어온다
+    # arXiv 는 못 찾고 의미 검색만 3등으로 찾음 -> 합집합에는 들어옴
     row("q2", "B", {"arxiv": ["X", "Y"], "local_dense": ["X", "Y", "B"]}),
     # 두 채널 다 못 찾음
     row("q3", "C", {"arxiv": ["X"], "local_dense": ["Y"]}),
-    # 변환 실패 (오류 문항) — 검색을 아예 못 했다
+    # 변환 실패 (오류 문항) - 검색을 아예 못 했음
     row("q4", "D", {"arxiv": [], "local_dense": []}, error="rewrite_failed: X"),
     # 한 채널만 오류, 다른 채널은 정답을 찾음
     row("q5", "E", {"arxiv": [], "local_dense": ["E"]},
@@ -40,14 +40,14 @@ ROWS = [
 ]
 
 
-# ── 실패를 실패로 세는가 ──────────────────────────────────────────────────
+# -- 실패를 실패로 세는가 --------------------------------------------------
 def test_missing_and_error_rows_count_as_failures():
-    """분모는 항상 전체 문항 수여야 한다 (오류 문항을 빼면 안 된다)."""
+    """분모는 항상 전체 문항 수여야 함 (오류 문항을 빼면 안 됨)."""
     ranks = [pe.rank_in((r["channels"] or {}).get("arxiv") or [], r["gold_id"]) for r in ROWS]
     assert ranks == [1, None, None, None, None]
     hits = pe.hits_at(ranks, 10)
     assert hits == [1.0, 0.0, 0.0, 0.0, 0.0]
-    assert len(hits) == len(ROWS)            # 5문항 전부가 분모에 남아 있다
+    assert len(hits) == len(ROWS)            # 5문항 전부가 분모에 남아 있음
     assert sum(hits) / len(hits) == 0.2      # 제외했다면 1/2=0.5 로 부풀려졌을 값
 
 
@@ -55,14 +55,14 @@ def test_rank_respects_k():
     ranks = [pe.rank_in((r["channels"] or {}).get("local_dense") or [], r["gold_id"])
              for r in ROWS]
     assert ranks == [1, 3, None, None, 1]
-    assert pe.hits_at(ranks, 1) == [1.0, 0.0, 0.0, 0.0, 1.0]      # 3등은 @1에 안 든다
+    assert pe.hits_at(ranks, 1) == [1.0, 0.0, 0.0, 0.0, 1.0]      # 3등은 @1에 안 듦
     assert pe.hits_at(ranks, 3) == [1.0, 1.0, 0.0, 0.0, 1.0]
 
 
-# ── 합집합 상한 ───────────────────────────────────────────────────────────
+# -- 합집합 상한 -----------------------------------------------------------
 def test_union_is_the_ceiling_and_at_least_as_good_as_each_channel():
     union = pe.hits_at([pe.union_rank(r, 100) for r in ROWS], 1)
-    assert union == [1.0, 1.0, 0.0, 0.0, 1.0]        # q2 는 의미 검색 덕분에 상한에 들어온다
+    assert union == [1.0, 1.0, 0.0, 0.0, 1.0]        # q2 는 의미 검색 덕분에 상한에 들어옴
 
     for name in ("arxiv", "local_dense"):
         ch = pe.hits_at([pe.rank_in((r["channels"] or {}).get(name) or [], r["gold_id"])
@@ -72,25 +72,25 @@ def test_union_is_the_ceiling_and_at_least_as_good_as_each_channel():
 
 def test_union_respects_depth():
     r = row("q", "B", {"arxiv": ["X", "Y", "B"], "local_dense": ["Z"]})
-    assert pe.union_rank(r, 2) is None      # 상위 2편 안에는 없다
+    assert pe.union_rank(r, 2) is None      # 상위 2편 안에는 없음
     assert pe.union_rank(r, 3) == 1
 
 
-# ── 저장된 결과만으로 융합 재계산 ──────────────────────────────────────────
+# -- 저장된 결과만으로 융합 재계산 ------------------------------------------
 def test_fusion_recomputed_from_stored_ids():
-    """검색을 다시 하지 않고 채널 결과만으로 융합 순위가 나와야 한다."""
+    """검색을 다시 하지 않고 채널 결과만으로 융합 순위가 나와야 함."""
     r = row("q", "B", {"arxiv": ["X", "B"], "local_dense": ["B", "Y"]})
     fused = pe.fused_ids_of(r, rrf_k=60, top_n=10, weights={})
     assert fused[0] == "B"                  # 두 채널이 합의한 논문이 1등
 
-    # 가중치를 바꾸면 순서가 바뀐다 (검색은 여전히 0회)
+    # 가중치를 바꾸면 순서가 바뀜 (검색은 여전히 0회)
     tilted = pe.fused_ids_of(row("q", "B", {"arxiv": ["X"], "local_dense": ["B"]}),
                              rrf_k=60, top_n=10, weights={"local_dense": 5.0})
     assert tilted[0] == "B"
 
 
 def test_fusion_merges_version_tagged_ids_across_channels():
-    """arXiv 는 버전 표기가 붙어 오고 로컬 색인은 붙지 않는다 — 합쳐져야 한다."""
+    """arXiv 는 버전 표기가 붙어 오고 로컬 색인은 붙지 않음 - 합쳐져야 함."""
     r = row("q", "2103.00020",
             {"arxiv": ["9999.9999", "2103.00020v2"], "local_dense": ["8888.8888", "2103.00020"]})
     fused = pe.fused_ids_of(r, rrf_k=60, top_n=10, weights={})
@@ -140,10 +140,32 @@ def test_channel_error_does_not_stop_other_channels():
     assert out["channels"]["arxiv"] == []
     assert out["channels"]["local_dense"] == ["A"]
     assert "arxiv" in out["channel_errors"]
-    assert "error" not in out             # 문항 전체가 죽은 것은 아니다
+    assert "error" not in out             # 문항 전체가 죽은 것은 아님
 
 
-# ── 이어하기 ──────────────────────────────────────────────────────────────
+# -- 채널 조합 갈라 보기 (검색 없이) ----------------------------------------
+def test_채널을_골라내면_그_조합만_보게_된다():
+    """두 채널 결과에서 한 채널만 남기면 융합, 상한이 전부 그 조합만 봄."""
+    only_b = pe.select_channels(ROWS, ["local_dense"])
+
+    # q2 는 arXiv 가 못 찾고 의미 검색만 3등으로 찾은 문항
+    assert only_b[1]["channels"] == {"local_dense": ["X", "Y", "B"]}
+    assert pe.union_rank(only_b[1], 100) == 1
+    assert pe.fused_ids_of(only_b[1], rrf_k=60, top_n=10, weights={}) == ["X", "Y", "B"]
+
+    # 원본은 건드리지 않음 (같은 파일을 조합별로 여러 번 갈라 봐야 하므로)
+    assert set(ROWS[1]["channels"]) == {"arxiv", "local_dense"}
+
+
+def test_없는_채널을_고르면_조용히_넘어가지_않는다():
+    """오타로 빈 결과를 0점으로 세면 '성능이 떨어졌다'는 잘못된 결론이 나옴."""
+    import pytest
+
+    with pytest.raises(ValueError, match="없는 채널"):
+        pe.select_channels(ROWS, ["local_dnese"])
+
+
+# -- 이어하기 --------------------------------------------------------------
 def test_resume_retries_rows_with_any_channel_error(tmp_path):
     path = tmp_path / "run.jsonl"
     with open(path, "w", encoding="utf-8") as f:
@@ -157,7 +179,7 @@ def test_resume_retries_rows_with_any_channel_error(tmp_path):
     assert set(done) == {"ok"}            # 오류 문항 둘은 다시 시도 대상
 
 
-# ── 본문 조회 (재정렬 후보 복원) ───────────────────────────────────────────
+# -- 본문 조회 (재정렬 후보 복원) -------------------------------------------
 def test_text_lookup_falls_back_to_scanning_corpus(tmp_path):
     corpus = tmp_path / "mini.jsonl"
     with open(corpus, "w", encoding="utf-8") as f:
@@ -168,7 +190,7 @@ def test_text_lookup_falls_back_to_scanning_corpus(tmp_path):
     lookup = pe.TextLookup(index_prefix=None, corpus_path=corpus, arxiv_cache=None)
     got = lookup.fetch({"1111.1111", "3333.3333"})
     assert got["1111.1111"] == ("제목 1111.1111", "초록 1111.1111")
-    assert "3333.3333" not in got          # 못 찾은 것은 조용히 빠진다 → 하네스가 경고를 찍는다
+    assert "3333.3333" not in got          # 못 찾은 것은 조용히 빠짐 -> 하네스가 경고를 찍음
 
 
 def test_text_lookup_reads_arxiv_cache(tmp_path):
@@ -179,11 +201,11 @@ def test_text_lookup_reads_arxiv_cache(tmp_path):
              "title": "T", "abstract": "A"}]}) + "\n")
 
     lookup = pe.TextLookup(index_prefix=None, corpus_path=None, arxiv_cache=cache)
-    got = lookup.fetch({"2103.00020"})     # 버전 표기를 뗀 번호로도 찾아야 한다
+    got = lookup.fetch({"2103.00020"})     # 버전 표기를 뗀 번호로도 찾아야 함
     assert got["2103.00020"] == ("T", "A")
 
 
-# ── 보고가 터지지 않는가 (오류 문항·빈 결과 포함) ──────────────────────────
+# -- 보고가 터지지 않는가 (오류 문항, 빈 결과 포함) --------------------------
 def test_report_runs_on_rows_with_errors(capsys):
     pe.print_report(ROWS, "테스트", k_values=(1, 10), rrf_k=60, weights={})
     text = capsys.readouterr().out
@@ -197,16 +219,16 @@ def test_report_runs_when_nothing_is_found(capsys):
     assert "상한이 0이라 계산 불가" in capsys.readouterr().out
 
 
-# ── 상한을 어느 집합으로 재는가 (ISSUE #26 이 재발한 자리) ─────────────────
+# -- 상한을 어느 집합으로 재는가 (ISSUE #26 이 재발한 자리) -----------------
 #
-# 합집합과 '재정렬이 실제로 본 후보' 는 다른 집합이다. 융합이 후보를 줄이기 때문이다.
-# 합집합을 상한이라 부르면 **융합이 흘린 몫까지 재정렬 탓으로 넘어가** 처방이 뒤바뀐다.
-# 실측에서 시험용 300문항 기준 0.823 대 0.797 로 정답 8편이 그렇게 넘어가 있었다.
+# 합집합과 '재정렬이 실제로 본 후보' 는 다른 집합임. 융합이 후보를 줄이기 때문임.
+# 합집합을 상한이라 부르면 융합이 흘린 몫까지 재정렬 탓으로 넘어가 처방이 뒤바뀜.
+# 실측에서 시험용 300문항 기준 0.823 대 0.797 로 정답 8편이 그렇게 넘어가 있었음.
 
 FUSION_DROPS_GOLD = row(
     "q9", "GOLD",
-    # 정답은 의미 검색 3등이라 합집합@3 에는 들어온다.
-    # 그러나 arXiv 가 올린 P·Q 가 RRF 점수에서 앞서, 융합 상위 3편에서는 밀려난다.
+    # 정답은 의미 검색 3등이라 합집합@3 에는 들어옴.
+    # 그러나 arXiv 가 올린 P, Q 가 RRF 점수에서 앞서, 융합 상위 3편에서는 밀려남.
     {"local_dense": ["X", "Y", "GOLD"], "arxiv": ["P", "Q", "R"]},
 )
 
@@ -224,13 +246,13 @@ def test_융합이_흘린_몫과_재정렬이_못_건진_몫을_따로_보고한
     assert "채널 합집합" in text
     assert "재정렬이 실제로 본 후보" in text
     assert "융합이 흘린 몫" in text
-    # 합집합 1.000 → 융합 후 0.000 이므로 손실 전부가 융합 몫으로 잡혀야 한다
-    assert "융합이 흘린 몫  (① → ②)         : -1.000" in text
-    assert "재정렬이 못 건진 몫 (② → ③)      : +0.000" in text
+    # 합집합 1.000 -> 융합 후 0.000 이므로 손실 전부가 융합 몫으로 잡혀야 함
+    assert "융합이 흘린 몫  ((1) -> (2))         : -1.000" in text
+    assert "재정렬이 못 건진 몫 ((2) -> (3))      : +0.000" in text
 
 
 def test_파일에_새겨진_재정렬_깊이를_명령줄보다_우선한다(capsys):
-    """재집계할 때 기본값으로 상한을 재면 ISSUE #26 이 되살아난다."""
+    """재집계할 때 기본값으로 상한을 재면 ISSUE #26 이 되살아남."""
     rows = [dict(FUSION_DROPS_GOLD, reranked_ids=["GOLD"], rerank_depth=3)]
     pe.print_report(rows, "깊이 새김", k_values=(10,), rrf_k=60, weights={}, pool_depth=200)
     text = capsys.readouterr().out
@@ -239,9 +261,9 @@ def test_파일에_새겨진_재정렬_깊이를_명령줄보다_우선한다(ca
     assert "채널 합집합 @3" in text
 
 
-# ══════════════════════════════════════════════════════════════════════════
+# ==========================================================================
 # 지표 계산
-# ══════════════════════════════════════════════════════════════════════════
+# ==========================================================================
 
 def test_recall_at_k_hit_and_miss():
     qrels = {"q1": {"pA": 1}, "q2": {"pB": 1}}
@@ -263,7 +285,7 @@ def test_mrr_uses_rank():
 
 
 def test_paired_bootstrap_detects_improvement():
-    # 모든 질문에서 after가 before보다 확실히 좋으면 유의미(p 작음)해야 한다.
+    # 모든 질문에서 after가 before보다 확실히 좋으면 유의미(p 작음)해야 함.
     before = {f"q{i}": 0.0 for i in range(30)}
     after = {f"q{i}": 1.0 for i in range(30)}
     stat = metrics.paired_bootstrap(before, after, n_boot=2000, seed=0)

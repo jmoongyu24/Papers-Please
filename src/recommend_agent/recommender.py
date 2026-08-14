@@ -1,4 +1,4 @@
-"""논문 추천 에이전트 — 검색된 논문을 사용자 의도와 대조해 '추천 + 이유'를 낸다.
+"""논문 추천 에이전트 - 검색된 논문을 사용자 의도와 대조해 '추천 + 이유'를 냄.
 
 동작(한 번의 로컬 Qwen3-4B 호출):
   입력: 사용자 원본 검색어 + 검색된 논문 목록(제목 + '전체 초록')
@@ -6,13 +6,13 @@
   출력(JSON 강제): [{index, relevance, reason}, ...] + 전체 요약(summary)
 
 설계 이유:
-- **로컬 Qwen3-4B**: 서비스 런타임은 로컬 실행이 제약(오프라인 평가에만 유료 모델 사용). 그래서
-  이 에이전트도 로컬 모델을 쓴다.
-- **JSON 스키마 강제**: 사고 과정 유출(ISSUE #3)을 막고 논문별 판단을 안정적으로 파싱한다.
-- **그라운딩**: 주어진 초록 내용에만 근거하고, 없는 사실을 지어내거나 목록 밖 번호를 만들지
-  않도록 프롬프트로 강제 + 코드로 밖 번호를 필터한다(환각 방지).
-- **arXiv 키워드 검색의 한계 보완**: arXiv는 키워드 순위라 의도와 어긋난 논문이 위에 올 수 있는데
-  (ISSUE #7), 이 에이전트가 '의미로' 다시 골라줘 사용자가 볼 최종 추천의 정확도를 높인다.
+- 로컬 Qwen3-4B: 서비스 런타임은 로컬 실행이 제약(오프라인 평가에만 유료 모델 사용). 그래서
+  이 에이전트도 로컬 모델을 씀.
+- JSON 스키마 강제: 사고 과정 유출(ISSUE #3)을 막고 논문별 판단을 안정적으로 파싱함.
+- 그라운딩: 주어진 초록 내용에만 근거하고, 없는 사실을 지어내거나 목록 밖 번호를 만들지
+  않도록 프롬프트로 강제 + 코드로 밖 번호를 필터함(환각 방지).
+- arXiv 키워드 검색의 한계 보완: arXiv는 키워드 순위라 의도와 어긋난 논문이 위에 올 수 있는데
+  (ISSUE #7), 이 에이전트가 '의미로' 다시 골라줘 사용자가 볼 최종 추천의 정확도를 높임.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ RECOMMEND_SYSTEM = (
     "- 영어 학술 용어를 제외한 모든 설명은 한국어로."
 )
 
-# 초록이 너무 길면 자른다(입력 토큰 관리). 대부분 arXiv 초록은 이 안에 들어온다.
+# 초록이 너무 길면 자름(입력 토큰 관리). 대부분 arXiv 초록은 이 안에 들어옴.
 _ABSTRACT_CHARS = 3000
 
 
@@ -67,7 +67,7 @@ def build_prompt(query: str, papers: list[ScoredPaper]) -> str:
 
 
 class PaperRecommender:
-    """검색된 논문을 사용자 의도로 분석해 추천 목록과 이유를 만든다."""
+    """검색된 논문을 사용자 의도로 분석해 추천 목록과 이유를 만듦."""
 
     _ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -77,7 +77,7 @@ class PaperRecommender:
     def recommend(self, query: str, papers: list[ScoredPaper]) -> dict:
         """Returns: {"recommendations": [{index, relevance, reason}...], "summary": str}.
 
-        recommendations는 관련도 높은 순으로 정렬되며, 각 항목의 index는 papers의 1-기반 번호다.
+        recommendations는 관련도 높은 순으로 정렬되며, 각 항목의 index는 papers의 1-기반 번호임.
         """
         if not papers:
             return {"recommendations": [], "summary": "검색 결과가 없습니다."}

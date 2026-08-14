@@ -1,7 +1,7 @@
 """프로젝트에서 주고받는 데이터의 '모양'을 정의하는 파일.
 
-여기서 정의한 형태(논문, 평가용 질문, 검색 결과 등)를 모든 모듈이 공유한다.
-파이썬 표준 dataclass만 써서 가볍게 유지한다.
+여기서 정의한 형태(논문, 평가용 질문, 검색 결과 등)를 모든 모듈이 공유함.
+파이썬 표준 dataclass만 써서 가볍게 유지함.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ class EvalQuery:
 class RewriteResult:
     """쿼리 변환 결과.
 
-    단계별 내용(steps)과, 검색 방식별로 다르게 만든 최종 검색어(queries)를 담는다.
+    단계별 내용(steps)과, 검색 방식별로 다르게 만든 최종 검색어(queries)를 담음.
     검색 방식 이름: "sparse"(단어 일치), "dense"(의미 기반), "arxiv"(실시간 arXiv).
     """
 
@@ -87,7 +87,7 @@ class RewriteResult:
     parse_ok: bool = True                            # 출력 형식이 정상이었는지
 
     def query_for(self, backend: str) -> str:
-        """해당 검색 방식에 맞는 최종 검색어를 준다. 없으면 원본으로 폴백."""
+        """해당 검색 방식에 맞는 최종 검색어를 줌. 없으면 원본으로 폴백."""
         return self.queries.get(backend) or self.raw_query
 
     def to_dict(self) -> dict:

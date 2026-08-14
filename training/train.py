@@ -1,41 +1,41 @@
-"""쿼리 변환기 학습 — 지도 미세조정(SFT) 과 선호 학습(DPO) 을 한 파일에서.
+"""쿼리 변환기 학습 - 지도 미세조정(SFT) 과 선호 학습(DPO) 을 한 파일에서.
 
-    # 1단계 SFT — "이런 검색어를 만들어라" 를 흉내 내게 한다
+    # 1단계 SFT - "이런 검색어를 만들어라" 를 흉내 내게 함
     $PY -m training.train sft --data data/training/sft_pairs.jsonl \\
         --output-dir models/qwen3-4b-query-lora --epochs 8
 
-    # 2단계 DPO — SFT 어댑터 위에 "좋은 것과 나쁜 것의 차이" 를 얹는다
+    # 2단계 DPO - SFT 어댑터 위에 "좋은 것과 나쁜 것의 차이" 를 얹음
     $PY -m training.train dpo --data data/training/dpo_pairs.jsonl \\
         --sft-adapter models/qwen3-4b-query-lora/checkpoint-54 \\
         --output-dir models/qwen3-4b-query-dpo
 
-**순서가 중요하다.** SFT → DPO 가 표준이고, DPO 는 SFT 어댑터 위에 이어서 학습한다.
+순서가 중요함. SFT -> DPO 가 표준이고, DPO 는 SFT 어댑터 위에 이어서 학습함.
 서비스가 쓰는 것은 2단계까지 끝낸 `models/qwen3-4b-query-dpo` 다.
 
 ## 무엇을 학습하나
 
     입력  = 사용자의 일상어 질문
-    출력  = 그 질문의 정답 논문을 arXiv 에서 **실제로 찾아낸** 검색어
+    출력  = 그 질문의 정답 논문을 arXiv 에서 실제로 찾아낸 검색어
 
-라벨은 사람이 고른 것이 아니라 `training/build_training_data.py` 가 **검색 성공 여부로**
-뽑아 놓은 것이다. 즉 "학술적으로 그럴싸한 말" 이 아니라 "실제로 통하는 말" 을 배운다.
+라벨은 사람이 고른 것이 아니라 `training/build_training_data.py` 가 검색 성공 여부로
+뽑아 놓은 것임. 즉 "학술적으로 그럴싸한 말" 이 아니라 "실제로 통하는 말" 을 배움.
 
 ## SFT 와 DPO 의 차이
 
-- **SFT** 는 "이게 정답이다" 라는 예시만 보여준다. 무엇이 나쁜지는 안 가르친다.
-- **DPO** 는 좋은 답과 나쁜 답을 **쌍으로** 보여주고, 좋은 쪽의 확률은 올리고 나쁜 쪽은
-  내린다. 즉 "왜 이게 더 나은가" 의 경계를 배운다.
+- SFT 는 "이게 정답이다" 라는 예시만 보여줌. 무엇이 나쁜지는 안 가르침.
+- DPO 는 좋은 답과 나쁜 답을 쌍으로 보여주고, 좋은 쪽의 확률은 올리고 나쁜 쪽은
+  내림. 즉 "왜 이게 더 나은가" 의 경계를 배움.
 
 우리 데이터가 DPO 에 잘 맞는 이유: 같은 질문에 후보 검색어를 여러 개 만들고 실제 arXiv
-검색으로 채점했으므로, **정답을 찾아낸 검색어(chosen) vs 못 찾은 검색어(rejected)** 쌍이
-자연스럽게 생겼다. 둘 다 그럴싸한데 결과가 갈렸으므로, 모델이 배워야 할 것은 정확히
-'실제로 통하는 어휘' 의 미묘한 차이다.
+검색으로 채점했으므로, 정답을 찾아낸 검색어(chosen) vs 못 찾은 검색어(rejected) 쌍이
+자연스럽게 생겼음. 둘 다 그럴싸한데 결과가 갈렸으므로, 모델이 배워야 할 것은 정확히
+'실제로 통하는 어휘' 의 미묘한 차이임.
 
 ## 왜 LoRA 인가
 
-Qwen3-4B 는 값이 40억 개라 전부 학습시키려면 메모리가 매우 많이 필요하다. LoRA 는 원래
-모델은 얼려두고 **작은 보조 행렬(전체의 1% 미만)만 새로 학습**해 끼우는 방식이라, 16GB
-그래픽카드로 충분히 돌아간다. 결과물도 수십 메가바이트로 작아 관리가 쉽다.
+Qwen3-4B 는 값이 40억 개라 전부 학습시키려면 메모리가 매우 많이 필요함. LoRA 는 원래
+모델은 얼려두고 작은 보조 행렬(전체의 1% 미만)만 새로 학습해 끼우는 방식이라, 16GB
+그래픽카드로 충분히 돌아감. 결과물도 수십 메가바이트로 작아 관리가 쉬움.
 
 전제: `pip install transformers peft trl bitsandbytes accelerate datasets`
 """
@@ -46,8 +46,8 @@ import argparse
 import json
 import random
 
-# 학습에 쓰는 지시문. **SFT 와 DPO 가 반드시 같아야 한다** — 형식이 다르면 앞서 배운 것이
-# 흐트러진다. 실제 서비스에서 쓰는 프롬프트와도 형식을 맞춰야 학습 효과가 산다.
+# 학습에 쓰는 지시문. SFT 와 DPO 가 반드시 같아야 함 - 형식이 다르면 앞서 배운 것이
+# 흐트러짐. 실제 서비스에서 쓰는 프롬프트와도 형식을 맞춰야 학습 효과가 삶.
 INSTRUCTION = (
     "사용자의 검색어를 arXiv에서 관련 논문을 잘 찾아내는 검색 쿼리로 변환하라. "
     "결과 쿼리만 출력한다."
@@ -58,12 +58,12 @@ def read_rows(path: str) -> list[dict]:
     return [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
 
 
-# ══════════════════════════════════════════════════════════════════════════
+# ==========================================================================
 # 1단계. SFT (지도 미세조정)
-# ══════════════════════════════════════════════════════════════════════════
+# ==========================================================================
 
 def format_example(row: dict) -> dict:
-    """학습 예시 한 건을 대화 형식으로 만든다(모델이 실제로 쓰이는 방식과 동일하게)."""
+    """학습 예시 한 건을 대화 형식으로 만듦(모델이 실제로 쓰이는 방식과 동일하게)."""
     return {
         "messages": [
             {"role": "system", "content": INSTRUCTION},
@@ -74,14 +74,14 @@ def format_example(row: dict) -> dict:
 
 
 def split_by_paper(path: str, val_ratio: float, seed: int = 42):
-    """**논문 단위**로 학습/검증을 나눈다.
+    """논문 단위로 학습/검증을 나눔.
 
     왜 질문 단위로 나누면 안 되는가:
-    학습 데이터는 논문 한 편당 질문 여러 개로 만들어졌고, **같은 논문에서 나온 질문들은
-    정답 라벨이 거의 같다**(라벨을 그 논문에서 뽑았으므로). 질문 단위로 무작위 분할하면
-    같은 논문이 학습과 검증 양쪽에 들어가, 검증 손실이 실제보다 좋게 나온다. 그러면
-    과적합이 시작되는 지점을 놓쳐 잘못된 체크포인트를 고르게 된다.
-    (평가셋을 논문 단위로 나눈 것과 같은 이유다.)
+    학습 데이터는 논문 한 편당 질문 여러 개로 만들어졌고, 같은 논문에서 나온 질문들은
+    정답 라벨이 거의 같음(라벨을 그 논문에서 뽑았으므로). 질문 단위로 무작위 분할하면
+    같은 논문이 학습과 검증 양쪽에 들어가, 검증 손실이 실제보다 좋게 나옴. 그러면
+    과적합이 시작되는 지점을 놓쳐 잘못된 체크포인트를 고르게 됨.
+    (평가셋을 논문 단위로 나눈 것과 같은 이유임.)
 
     Returns: (학습용 Dataset, 검증용 Dataset)
     """
@@ -110,10 +110,10 @@ def cmd_sft(args) -> None:
     print(f"기본 모델: {args.base_model}")
     print(f"학습 데이터: {args.data}")
 
-    # 기본은 양자화 없이 bf16 으로 학습한다.
-    # 이유: Qwen3-4B 를 bf16 으로 올리면 가중치 약 8GB + 옵티마이저·활성화 약 1.7GB = 약 9.7GB
-    # 로, 16GB 그래픽카드에 충분히 들어간다. 4비트 양자화는 메모리가 모자랄 때 쓰는 타협책이며
-    # 가중치를 압축하는 만큼 품질이 떨어지므로, 여유가 있으면 쓰지 않는 것이 성능에 유리하다.
+    # 기본은 양자화 없이 bf16 으로 학습함.
+    # 이유: Qwen3-4B 를 bf16 으로 올리면 가중치 약 8GB + 옵티마이저, 활성화 약 1.7GB = 약 9.7GB
+    # 로, 16GB 그래픽카드에 충분히 들어감. 4비트 양자화는 메모리가 모자랄 때 쓰는 타협책이며
+    # 가중치를 압축하는 만큼 품질이 떨어지므로, 여유가 있으면 쓰지 않는 것이 성능에 유리함.
     quant_config = None
     if args.use_4bit:
         quant_config = BitsAndBytesConfig(
@@ -124,7 +124,7 @@ def cmd_sft(args) -> None:
         )
         print("4비트 양자화 사용 (메모리 절약, 품질 손실 감수)")
     else:
-        print("양자화 없음 — bf16 전체 정밀도로 학습 (품질 우선)")
+        print("양자화 없음 - bf16 전체 정밀도로 학습 (품질 우선)")
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     model = AutoModelForCausalLM.from_pretrained(
@@ -134,7 +134,7 @@ def cmd_sft(args) -> None:
         device_map="auto",
     )
 
-    # LoRA: 주의(attention)와 피드포워드 층에만 작은 보조 행렬을 붙여 학습한다
+    # LoRA: 주의(attention)와 피드포워드 층에만 작은 보조 행렬을 붙여 학습함
     peft_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_r * 2,
@@ -145,10 +145,10 @@ def cmd_sft(args) -> None:
                         "gate_proj", "up_proj", "down_proj"],
     )
 
-    # 데이터가 적으므로 일부를 검증용으로 떼어 과적합(외워버리기)을 감시한다.
-    # 학습 손실만 계속 떨어지고 검증 손실이 오르기 시작하면 과적합 신호다.
+    # 데이터가 적으므로 일부를 검증용으로 떼어 과적합(외워버리기)을 감시함.
+    # 학습 손실만 계속 떨어지고 검증 손실이 오르기 시작하면 과적합 신호임.
     train_ds, eval_ds = split_by_paper(args.data, args.val_ratio)
-    print(f"학습 예시 {len(train_ds)}개 · 검증 예시 {len(eval_ds)}개")
+    print(f"학습 예시 {len(train_ds)}개, 검증 예시 {len(eval_ds)}개")
 
     trainer = SFTTrainer(
         model=model,
@@ -180,9 +180,9 @@ def cmd_sft(args) -> None:
           f"  $PY -m training.train dpo --sft-adapter {args.output_dir}/checkpoint-<번호>")
 
 
-# ══════════════════════════════════════════════════════════════════════════
+# ==========================================================================
 # 2단계. DPO (선호 학습)
-# ══════════════════════════════════════════════════════════════════════════
+# ==========================================================================
 
 def load_preference_dataset(path: str):
     """DPO 형식으로 불러온다: prompt / chosen / rejected."""
@@ -206,18 +206,18 @@ def cmd_dpo(args) -> None:
 
     print(f"기본 모델: {args.base_model}")
     print(f"SFT 어댑터: {args.sft_adapter}")
-    print("양자화 없음 — bf16 전체 정밀도")
+    print("양자화 없음 - bf16 전체 정밀도")
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     base = AutoModelForCausalLM.from_pretrained(
         args.base_model, dtype=torch.bfloat16, device_map="auto"
     )
-    # SFT 어댑터를 얹고, 그 위에서 이어서 학습할 수 있도록 학습 가능 상태로 연다
+    # SFT 어댑터를 얹고, 그 위에서 이어서 학습할 수 있도록 학습 가능 상태로 열어 둠
     model = PeftModel.from_pretrained(base, args.sft_adapter, is_trainable=True)
 
     dataset = load_preference_dataset(args.data)
     split = dataset.train_test_split(test_size=args.val_ratio, seed=42)
-    print(f"학습 쌍 {len(split['train'])}개 · 검증 쌍 {len(split['test'])}개")
+    print(f"학습 쌍 {len(split['train'])}개, 검증 쌍 {len(split['test'])}개")
 
     trainer = DPOTrainer(
         model=model,
@@ -246,10 +246,10 @@ def cmd_dpo(args) -> None:
     print("서비스와 평가에서 쓰려면 변환기 이름을 'dpo' 로 부르면 된다.")
 
 
-# ══════════════════════════════════════════════════════════════════════════
+# ==========================================================================
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="쿼리 변환기 학습 (sft → dpo 순서로 쓴다)")
+    ap = argparse.ArgumentParser(description="쿼리 변환기 학습 (sft -> dpo 순서로 쓴다)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("sft", help="1단계: 지도 미세조정")
@@ -271,7 +271,7 @@ def main() -> None:
                    help="실제 데이터가 최대 424글자라 512로 충분(길면 메모리만 낭비)")
     s.add_argument("--val-ratio", type=float, default=0.15, help="검증용으로 뗄 비율")
     s.add_argument("--use-4bit", action="store_true",
-                   help="4비트 양자화 켜기. **기본은 끔** — 16GB VRAM 에서 bf16(약 9.7GB)이 "
+                   help="4비트 양자화 켜기. 기본은 끔 - 16GB VRAM 에서 bf16(약 9.7GB)이 "
                         "충분히 들어가고, 양자화는 성능을 깎기 때문. 메모리가 부족할 때만")
     s.set_defaults(func=cmd_sft)
 

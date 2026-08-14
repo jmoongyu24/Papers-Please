@@ -1,28 +1,47 @@
 """Papers-Please 웹 데모 (Streamlit) - 두 채널 검색 + 교차 인코더 재정렬.
 
-사용자가 일상어나 한국어로 검색하면, Qwen3-4B 가 정확한 영어 학술 용어로 바꾸는 과정을
-보여주고, 두 갈래로 논문을 찾아 사용자 의도에 맞게 다시 줄 세워 보여준다.
+사용자가 일상어나 한국어로 검색하면, 무엇을 어떻게 알아들었는지 보여주고, 두 갈래로
+논문을 찾아 사용자 의도에 맞게 다시 줄 세워 보여줌.
 
 ## 왜 검색 통로가 둘인가
 
     질문
-     ├─ 채널 A  쿼리 변환기 -> arXiv 실시간 검색   (글자가 정확히 맞아야 걸림)
-     └─ 채널 B  로컬 의미 검색 71만 편              (뜻으로 찾음)
+     +- 채널 A  쿼리 변환기 -> arXiv 실시간 검색   (글자가 정확히 맞아야 걸림)
+     \- 채널 B  로컬 의미 검색 71만 편              (뜻으로 찾음)
             |
        합치고 중복 제거
             |
        교차 인코더 재정렬 (원본 질문과 대조)
             |
+       추천 에이전트가 관련도와 이유를 붙임
+            |
        사용자에게 보여줄 10편
 
 arXiv 키워드 검색은 정확한 문자열 일치를 요구해서, 실패한 검색어의 63% 가 거의 맞음으로
-빗나갔다 (ISSUE 21). 뜻으로 찾는 두 번째 통로를 나란히 두어 그 벽을 넘는다.
+빗나갔음 (ISSUE 21). 뜻으로 찾는 두 번째 통로를 나란히 두어 그 벽을 넘음.
 
-시험용 300문항 실측으로 로컬 의미 검색 채널이 성능의 거의 전부를 만든다는 것을 확인했다
-(로컬 단독 0.677 대 두 채널 0.680, p=0.889). 그런데도 arXiv 채널을 남기는 이유는,
-평가셋의 정답 논문이 전부 로컬 색인 안에 있어서 그 평가가 색인 밖 논문을 못 찾는 약점을
-구조적으로 잴 수 없기 때문이다. 실제 사용자는 어제 올라온 논문도 묻는다.
-arXiv 채널의 역할은 정확도가 아니라 최신성과 범위다 (ISSUE 29).
+로컬 의미 검색 채널이 성능의 거의 전부를 만듦 (로컬 단독 0.677 대 두 채널 0.680,
+p=0.889). 그런데도 arXiv 채널을 남기는 이유는, 평가셋의 정답 논문이 전부 로컬 색인 안에
+있어서 그 평가가 색인 밖 논문을 못 찾는 약점을 구조적으로 잴 수 없기 때문임. 실제
+사용자는 어제 올라온 논문도 물음. arXiv 채널의 역할은 정확도가 아니라 최신성과 범위임
+(ISSUE 29).
+
+## 화면 구성 원칙 (ISSUE 11)
+
+옛 화면은 변환 과정, 검색된 논문 10편, 최종 추천 논문을 따로따로 세 덩어리로 쏟아냈음.
+같은 논문이 두 목록에 겹쳐 나와서 어느 것을 봐야 하는지 알 수 없었음. 지금은 이렇게 함.
+
+    1. 검색 전에는 입력창 하나만 보임
+    2. 검색하면 "무엇을 어떻게 알아들었는지" 를 가로 3단 카드로 먼저 보여줌
+    3. 결과는 목록 하나임. 추천 에이전트의 판단을 그 목록 카드 안에 녹임
+    4. 진행 중에는 지금 어느 단계인지 보여줌 (한 번 검색에 10초 넘게 걸리므로)
+
+## 로컬 의미 검색에 원본 질문을 넣는 이유
+
+이 채널은 글자가 아니라 뜻으로 찾으므로 변환이 필요 없음. 게다가 학습한 변환기(dpo)가
+내놓는 것은 arXiv 문법 문자열(all:"..." OR abs:"...")이라, 문장을 통째로 임베딩하는
+의미 검색에는 오히려 불리함. 평가도 같은 조건으로 맞춰 두었음
+(pipeline_eval 의 --local-query 기본값).
 
 실행:
   streamlit run app.py
@@ -31,6 +50,7 @@ arXiv 채널의 역할은 정확도가 아니라 최신성과 범위다 (ISSUE 2
 
 from __future__ import annotations
 
+import re
 import time
 
 import streamlit as st
@@ -49,45 +69,83 @@ EXAMPLES = [
     "Attention is all you need",
 ]
 
-# ── 검색 예산 ──────────────────────────────────────────────────────────────
+# -- 검색 예산 --------------------------------------------------------------
 TOP_K = 10              # 사용자에게 보여줄 최대 논문 수
 DEPTH_LOCAL = 300       # 로컬 의미 검색에서 받아올 후보 수
 DEPTH_ARXIV = 100       # arXiv 에서 받아올 후보 수 (page_size 가 100 이라 호출 1회로 끝남)
 RERANK_DEPTH = 300      # 재정렬에 넣을 최대 후보 수
 
-# 이 깊이는 평가에서 Recall@10 = 0.680 을 낸 설정과 같다. 서비스 속도를 위해 줄이고 싶은
-# 유혹이 있지만, 줄이기 전에 반드시 질문 하나 기준 응답 시간을 실측한다.
+# 깊이를 서비스 속도를 위해 줄이고 싶은 유혹이 있지만, 줄이기 전에 반드시 질문 하나 기준
+# 응답 시간을 실측함.
 #
-# 줄일 근거는 이미 있다. 정답의 1차 등수별 재정렬 회수율이 1~10등 0.956, 11~30등 0.938
-# 인데 101~200등 0.350, 201~300등 0.125 로 절벽처럼 떨어진다. 즉 재정렬은 이미 위에 있는
-# 정답만 지키고 깊은 곳에서는 끌어올리지 못하므로, 깊이를 줄여도 잃는 것이 적다.
-# 다만 그것은 추정이고, 얼마나 느린지는 재봐야 안다. 재기 전에 줄이면 얻는 것도 잃는
-# 것도 모르는 채로 바꾸는 것이다. 사이드바의 '단계별 소요 시간 보기'로 실측한다.
+# 줄일 근거는 이미 있음. 정답의 1차 등수별 재정렬 회수율이 1~10등 0.956, 11~30등 0.938
+# 인데 101~200등 0.350, 201~300등 0.125 로 절벽처럼 떨어짐. 즉 재정렬은 이미 위에 있는
+# 정답만 지키고 깊은 곳에서는 끌어올리지 못하므로, 깊이를 줄여도 잃는 것이 적음.
+# 다만 그것은 추정이고, 얼마나 느린지는 재봐야 안다:
+#   python -m evaluation.pipeline_eval --bench-service --n 5
 
-st.set_page_config(page_title="Papers-Please", page_icon="📄", layout="wide")
+# -- "못 찾았다"고 말할 기준선 ----------------------------------------------
+#
+# 로컬 의미 검색은 어떤 질문에도 항상 후보를 채워서 돌려줌. 아무리 무관한 질문이어도
+# 유사도가 가장 높은 논문들이 나옴. 그대로 뿌리면 무관한 논문을 추천으로 포장하는
+# 서비스가 됨. 옛 arXiv 키워드 검색은 못 찾으면 0건을 돌려줘서 이 문제가 없었는데,
+# 구조를 바꾸면서 새로 생긴 위험임.
+#
+# 이 값은 감으로 정하면 안 됨. 등급 정답지로 실측해서 정함:
+#   python -m evaluation.pipeline_eval --calibrate-threshold \
+#       --queries data/eval/dev.jsonl --grades data/eval/grades_dev.jsonl \
+#       --thresholds 0.001 0.002 0.005 0.01 0.02 0.05 0.10
+#
+# 2026-08-14 실측 (개발용 348문항, 등급 판정 7,112쌍, bge-reranker-v2-m3):
+#
+#   기준선   무관 걸러냄   만족 잘못 버림   (영어)   (한국어)
+#   0.001      31.7%          4.3%        3.1%     5.5%
+#   0.002      43.8%          7.7%        5.9%     9.5%   <- 이것을 고름
+#   0.005      61.9%         14.2%       11.4%    17.1%
+#   0.010      73.3%         22.5%       18.8%    26.2%
+#
+# 왜 0.002 인가 (일부러 느슨하게 잡음):
+#   이 기준선의 목적은 결과를 깎아내는 것이 아니라 "정말 아무것도 못 찾았을 때 그렇게
+#   말할 수 있게" 하는 것임. 잘못 낸 "못 찾았습니다" 는 무관한 논문 한 편을 보여주는 것보다
+#   훨씬 나쁜 경험임. 그래서 무관을 절반쯤만 걸러내고 좋은 논문은 거의 안 버리는 쪽으로 잡음.
+#   기준선 아래 논문도 지우지 않고 '관련성이 낮아 접어 둔' 자리로 내려보내기만 함.
+#
+# 한국어가 더 손해를 본다는 점을 알고 쓸 것:
+#   같은 만족도의 논문이라도 한국어 질문의 점수가 영어보다 낮게 나옴 (만족 등급 중앙값
+#   영어 0.17 대 한국어 0.07). 질문과 초록의 언어가 달라서임. 그래서 어느 기준선을 잡아도
+#   한국어 쪽이 1.5배쯤 더 걸림. 느슨하게 잡은 이유의 절반이 이것임.
+#
+# None 이면 걸러내지 않음. 재정렬 모델을 바꾸면 점수 눈금이 달라지므로 반드시 다시 재야 함.
+MIN_RERANK_SCORE: float | None = 0.002
+
+st.set_page_config(page_title="Papers, Please", layout="wide")
 
 
-@st.cache_resource(show_spinner="arXiv 검색기 준비 중…")
+# ==========================================================================
+# 무거운 부품 (한 번만 올림)
+# ==========================================================================
+
+@st.cache_resource(show_spinner="arXiv 검색기 준비 중...")
 def load_arxiv() -> ArxivLiveRetriever:
     return ArxivLiveRetriever()
 
 
-@st.cache_resource(show_spinner="쿼리 변환기(Qwen3-4B) 연결 중…")
+@st.cache_resource(show_spinner="쿼리 변환기(Qwen3-4B) 연결 중...")
 def load_rewriter():
-    """검색 성공을 보상으로 학습한 변환기를 쓴다.
+    """검색 성공을 보상으로 학습한 변환기를 씀.
 
-    계층 변환기(hierarchical)가 아니라 dpo 를 쓰는 이유는 실측 차이가 크기 때문이다.
-    시험용 300문항 Recall@10 기준 변환 안 함 0.167, 계층 0.220, 학습 후 0.343 이다.
+    계층 변환기(hierarchical)가 아니라 dpo 를 쓰는 이유는 실측 차이가 크기 때문임.
+    옛 시험용 300문항 Recall@10 기준 변환 안 함 0.167, 계층 0.220, 학습 후 0.343 임.
     """
     return build_rewriter("dpo")
 
 
-@st.cache_resource(show_spinner="논문 71만 편 색인 불러오는 중… (첫 실행은 1분 정도 걸립니다)")
+@st.cache_resource(show_spinner="논문 71만 편 색인 불러오는 중... (첫 실행은 1분 정도 걸립니다)")
 def load_local_index():
-    """로컬 의미 검색기. 반드시 cache_resource 로 감싼다.
+    """로컬 의미 검색기. 반드시 cache_resource 로 감쌈.
 
-    Streamlit 은 사용자가 무언가 누를 때마다 스크립트를 처음부터 다시 실행한다.
-    캐시하지 않으면 검색할 때마다 임베딩 2.93GB 를 새로 올려 메모리가 바로 터진다.
+    Streamlit 은 사용자가 무언가 누를 때마다 스크립트를 처음부터 다시 실행함.
+    캐시하지 않으면 검색할 때마다 임베딩 2.93GB 를 새로 올려 메모리가 바로 터짐.
     """
     from src.retrieval.local_index import LocalDenseRetriever
     return LocalDenseRetriever(
@@ -103,45 +161,63 @@ def load_resolver() -> PaperResolver:
 
 @st.cache_resource
 def load_recommender() -> PaperRecommender:
-    """추천 에이전트. **쿼리 변환기가 이미 올려 둔 Qwen3-4B 를 그대로 빌려 쓴다.**
+    """추천 에이전트. 쿼리 변환기가 이미 올려 둔 Qwen3-4B 를 그대로 빌려 씀.
 
-    따로 올리면 같은 모델이 두 벌이 되어 8.64GB + 3.54GB 를 쓴다. GPU 가 16GB 라
+    따로 올리면 같은 모델이 두 벌이 되어 8.64GB + 3.54GB 를 씀. GPU 가 16GB 라
     임베더와 재정렬까지 더하면 자리가 모자라고, 그러면 추천 쪽 모델이 오류 없이
-    조용히 CPU 로 밀려난다. 그 상태로 재보니 추천 한 번에 229.6초가 걸렸다.
-    GPU 에 올라가면 같은 일이 10.5초다.
+    조용히 CPU 로 밀려남. 그 상태로 재보니 추천 한 번에 229.6초가 걸렸음.
+    GPU 에 올라가면 같은 일이 10.5초임.
     """
     rewriter = load_rewriter()
     if hasattr(rewriter, "generate_json"):
         return PaperRecommender(client=rewriter)
-    return PaperRecommender()          # 변환기가 Ollama 계열이면 예전처럼 따로 부른다
+    return PaperRecommender()          # 변환기가 Ollama 계열이면 예전처럼 따로 부름
 
 
-@st.cache_resource(show_spinner="재정렬 모델 준비 중…")
+@st.cache_resource(show_spinner="재정렬 모델 준비 중...")
 def load_reranker():
-    """교차 인코더 재정렬기 (질문과 논문을 함께 읽고 관련도를 매긴다)."""
+    """교차 인코더 재정렬기 (질문과 논문을 함께 읽고 관련도를 매김)."""
     from src.retrieval.ranking import CrossEncoderReranker
     return CrossEncoderReranker()
 
+
+# ==========================================================================
+# 검색 파이프라인 (화면 그리기와 분리해 둠)
+# ==========================================================================
 
 def arxiv_url(paper_id: str) -> str:
     return f"https://arxiv.org/abs/{paper_id}"
 
 
-def search_arxiv(query: str, k: int):
-    """arXiv 검색. (결과, 오류메시지) 튜플. 오류를 결과 없음과 구분한다."""
-    try:
-        return load_arxiv().search(query, k=k), None
-    except Exception as e:
-        return None, (f"arXiv 검색 중 오류가 발생했습니다 (일시적일 수 있어요, "
-                      f"잠시 후 다시 시도해 주세요). [{type(e).__name__}]")
+_ABS_TERM = re.compile(r'abs:"([^"]+)"')
+
+
+def academic_terms_of(rw, raw_query: str) -> list[str]:
+    """변환기가 만든 영어 학술 용어를 뽑음.
+
+    계층 변환기는 용어를 `academic_terms` 에 따로 담지만, 서비스가 쓰는 학습 모델(dpo)은
+    arXiv 문법 문자열 하나만 내놓아서 그 필드가 빔. 그런데 용어 자체는 문자열 안에
+    `abs:"..."` 조각으로 들어 있음:
+
+        all:"사진 보고 글로 설명해주는 AI" OR abs:"image description" OR abs:"automatic captioning"
+
+    이걸 뽑아내지 않으면 화면이 "변환한 것이 없다"고 잘못 말하게 됨. 실제로는 있는데
+    구조화된 자리에 없을 뿐임.
+
+    `all:"..."` 조각은 원본 질문이라 제외함(용어가 아님).
+    """
+    if rw.academic_terms:
+        return list(rw.academic_terms)
+    found = _ABS_TERM.findall(rw.query_for("arxiv") or "")
+    return [t for t in dict.fromkeys(found) if t.strip() and t.strip() != raw_query.strip()]
 
 
 def merge_channels(*channels) -> list:
-    """채널별 결과를 합치고 같은 논문을 하나로 만든다.
+    """채널별 결과를 합치고 같은 논문을 하나로 만듦.
 
-    논문 번호 표기를 반드시 통일해야 한다. 통일하지 않으면 2103.00020 과 2103.00020v2 가
-    서로 다른 논문으로 취급되어, 두 채널이 함께 찾아낸 논문일수록 중복으로 남는다.
-    가장 확실한 정답이 가장 손해를 보는, 알아채기 어려운 고장이다 (ISSUE 27).
+    논문 번호 표기를 반드시 통일해야 함. 통일하지 않으면 2103.00020 과 2103.00020v2 가
+    서로 다른 논문으로 취급되어, 두 채널이 함께 찾아낸 논문일수록 중복으로 남음.
+    가장 확실한 정답이 가장 손해를 보는, 알아채기 어려운 고장임 (ISSUE 27).
     """
     seen: dict[str, object] = {}
     for ch in channels:
@@ -152,175 +228,287 @@ def merge_channels(*channels) -> list:
     return list(seen.values())
 
 
-def render_results(results, error: str | None = None) -> None:
-    if error:
-        st.warning(error)
+def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
+    """검색 한 번을 끝까지 수행하고 결과를 모아 돌려줌.
+
+    화면을 그리지 않고 자료만 만듦. 진행 상황은 `status.write` 로만 알림.
+    이렇게 나눠 두면 화면 구성을 바꿀 때 파이프라인을 건드리지 않아도 됨.
+    """
+    out: dict = {"timing": {}, "arxiv_error": None, "resolved": None,
+                 "local_hits": None, "arxiv_hits": None, "results": None,
+                 "recommendation": None}
+
+    # 특정 유명 논문을 설명으로 찾는 질문이면, 그 논문을 짚어서 먼저 보여줌
+    # (언어 모델 지식으로 제목 추정 -> arXiv 에서 실제 존재를 검증한 경우에만)
+    if use_arxiv:
+        status.write("어떤 논문을 찾는 질문인지 확인하는 중...")
+        t0 = time.time()
+        try:
+            out["resolved"], _ = resolve_and_verify(query, load_resolver(), load_arxiv())
+        except Exception:
+            out["resolved"] = None      # arXiv 오류 등은 배너 생략(치명적 아님)
+        out["timing"]["논문 지목 확인"] = time.time() - t0
+
+    status.write("검색어를 학술 용어로 바꾸는 중...")
+    t0 = time.time()
+    out["rewrite"] = load_rewriter().rewrite(query)
+    out["timing"]["쿼리 변환"] = time.time() - t0
+
+    if use_local:
+        status.write(f"논문 71만 편에서 뜻으로 찾는 중... (후보 {DEPTH_LOCAL}편)")
+        t0 = time.time()
+        try:
+            # 원본 질문을 그대로 넣음 (파일 위 설명 참고)
+            out["local_hits"] = load_local_index().search(query, k=DEPTH_LOCAL)
+        except Exception as e:
+            out["local_error"] = str(e)
+        out["timing"]["로컬 의미 검색"] = time.time() - t0
+
+    if use_arxiv:
+        status.write(f"arXiv 에서 찾는 중... (후보 {DEPTH_ARXIV}편)")
+        t0 = time.time()
+        try:
+            out["arxiv_hits"] = load_arxiv().search(
+                out["rewrite"].query_for("arxiv"), k=DEPTH_ARXIV)
+        except Exception as e:
+            out["arxiv_error"] = (f"arXiv 검색 중 오류가 났습니다. 일시적일 수 있으니 잠시 후 "
+                                  f"다시 시도해 주세요. [{type(e).__name__}]")
+        out["timing"]["arXiv 검색"] = time.time() - t0
+
+    candidates = merge_channels(out["local_hits"], out["arxiv_hits"])[:RERANK_DEPTH]
+    out["n_candidates"] = len(candidates)
+
+    if candidates:
+        status.write(f"질문 의도와 대조해 순위를 다시 매기는 중... (후보 {len(candidates)}편)")
+        t0 = time.time()
+        # 변환된 검색어가 아니라 원본 질문으로 재정렬함. 재정렬의 목적이
+        # 사용자 의도와 맞는가를 보는 것이기 때문임.
+        out["results"] = load_reranker().rerank(query, candidates, top_k=TOP_K)
+        out["timing"]["재정렬"] = time.time() - t0
+
+    if out["results"]:
+        status.write("각 논문이 왜 맞는지 정리하는 중...")
+        t0 = time.time()
+        try:
+            out["recommendation"] = load_recommender().recommend(query, out["results"])
+        except Exception as e:
+            out["recommend_error"] = str(e)
+        out["timing"]["추천 이유 생성"] = time.time() - t0
+
+    return out
+
+
+def confident_results(results, min_score: float | None):
+    """관련도 기준선으로 결과를 둘로 가름. 기준선이 없으면(측정 전) 전부 남김.
+
+    원래 순번을 함께 돌려줌. 추천 에이전트는 재정렬 결과의 1-based 번호로 판단을
+    붙이는데, 걸러낸 뒤 다시 번호를 매기면 그 판단이 엉뚱한 논문에 붙음. 오류가 나지
+    않고 이유만 뒤바뀌는 종류의 고장이라 눈으로 알아채기 어려움.
+
+    Returns: (남길 [(원래순번, 논문)], 접어 둘 [(원래순번, 논문)])
+    """
+    numbered = list(enumerate(results or [], start=1))
+    if min_score is None:
+        return numbered, []
+    keep = [(i, p) for i, p in numbered if p.score >= min_score]
+    drop = [(i, p) for i, p in numbered if p.score < min_score]
+    return keep, drop
+
+
+# ==========================================================================
+# 화면 조각
+# ==========================================================================
+
+def render_understanding(query: str, rw) -> None:
+    """무엇을 어떻게 알아들었는지 보여줌 (ISSUE 11).
+
+    이 화면이 검색 성능을 올리지는 않음. 사용자가 "내 말이 이런 전문 용어로 바뀌었구나"
+    를 이해하게 하는 설명 기능이고, 그 점을 감추지 않음 (PLAN 0절).
+
+    변환기가 실제로 낸 것만 보여줄 것 (실측으로 확인한 함정):
+    서비스가 쓰는 학습 모델(dpo)은 arXiv 문법 문자열 하나만 내놓음. 의도, 개념, 학술 용어를
+    따로 만들지 않아서 intent 자리에 원본 질문이 그대로 들어 있음. 그런데도 3단을 고정으로
+    그리면 "내가 쓴 말 / 내가 쓴 말 / (원본을 그대로 썼습니다)" 가 되어, 아무 내용도 없는 칸을
+    세 개 늘어놓게 됨. 계층 변환기(hierarchical)를 쓸 때만 3단이 채워짐.
+    """
+    # 변환기가 원본과 다른 것을 실제로 만들었는가
+    intent = (rw.intent or "").strip()
+    has_intent = bool(intent) and intent != query.strip()
+    terms = academic_terms_of(rw, query)
+
+    if not (has_intent or terms):
+        st.caption("입력하신 말을 그대로 뜻으로 검색했습니다.")
         return
+
+    st.markdown("#### 이렇게 알아들었습니다")
+    cols = st.columns(3 if has_intent else 2)
+    with cols[0]:
+        st.caption("내가 쓴 말")
+        st.info(query)
+    if has_intent:
+        with cols[1]:
+            st.caption("찾으시는 것")
+            st.info(intent)
+            if rw.concepts:
+                st.caption("핵심 개념: " + ", ".join(rw.concepts))
+    with cols[-1]:
+        st.caption("이런 영어 학술 용어로 바꿔서 찾았습니다")
+        st.success(", ".join(terms))
+    if not rw.parse_ok:
+        st.caption("변환에 실패해 원본 검색어로 검색했습니다.")
+
+
+def render_paper(rank: int, paper, judgement: dict | None) -> None:
+    """결과 한 편. 추천 에이전트의 판단을 이 카드 안에 녹임.
+
+    옛 화면은 '검색된 논문'과 '최종 추천 논문'을 따로 두어 같은 논문이 두 번 나왔음.
+    사용자는 어느 목록을 봐야 하는지 알 수 없었음 (ISSUE 11).
+    """
+    label = {"high": "강력 추천", "medium": "관련 있음", "low": "관련성 낮음"}
+    tag = label.get((judgement or {}).get("relevance", ""), "")
+    head = f"#### {rank}. [{paper.title}]({arxiv_url(paper.paper_id)})"
+    st.markdown(f"{head}  `{tag}`" if tag else head)
+    if judgement and judgement.get("reason"):
+        st.caption(judgement["reason"])
+    with st.expander("초록 보기"):
+        st.write(paper.abstract or "(초록 없음)")
+
+
+def render_results(state: dict) -> None:
+    """결과를 목록 하나로 보여줌."""
+    results = state.get("results")
     if not results:
-        st.info("검색 결과가 없습니다.")
+        if state.get("arxiv_error"):
+            st.warning(state["arxiv_error"])
+        else:
+            st.info("검색 결과가 없습니다. 검색어를 바꿔 다시 시도해 보세요.")
         return
-    for i, r in enumerate(results, 1):
-        st.markdown(f"**{i}. [{r.title}]({arxiv_url(r.paper_id)})**")
-        with st.expander("초록 보기"):
-            st.write(r.abstract)
+
+    rec = state.get("recommendation") or {}
+    by_index = {r["index"]: r for r in rec.get("recommendations", [])}
+    keep, dropped = confident_results(results, MIN_RERANK_SCORE)
+
+    # 추천 에이전트가 전부 '관련성 낮음'으로 봤다면, 목록을 내밀기 전에 그렇게 말함.
+    # 로컬 의미 검색은 어떤 질문에도 후보를 채워 돌려주므로 이 정직함이 없으면
+    # 무관한 논문을 추천으로 포장하게 됨.
+    #
+    # 판단이 하나도 없을 때(에이전트 호출 실패, 빈 목록)를 반드시 갈라내야 함. 그걸
+    # '전부 관련 없음' 으로 읽으면 멀쩡한 결과를 두고 "못 찾았습니다" 라고 말하게 됨.
+    judged = [j for j in (by_index.get(i, {}).get("relevance")
+                          for i in range(1, len(results) + 1)) if j]
+    nothing_good = bool(judged) and all(j == "low" for j in judged)
+
+    if not keep or nothing_good:
+        st.warning("딱 맞는 논문을 찾지 못했습니다. 검색어를 조금 다르게 써 보시면 "
+                   "결과가 달라질 수 있습니다.")
+        with st.expander(f"그래도 가장 가까운 {len(results)}편 보기"):
+            for i, p in enumerate(results, 1):
+                render_paper(i, p, by_index.get(i))
+        return
+
+    if rec.get("summary"):
+        st.info(rec["summary"])
+
+    # 화면에 보이는 번호는 1부터 다시 매기되, 추천 판단은 원래 순번으로 찾음
+    for shown, (orig, p) in enumerate(keep, 1):
+        render_paper(shown, p, by_index.get(orig))
+
+    if dropped:
+        with st.expander(f"관련성이 낮아 접어 둔 {len(dropped)}편 보기"):
+            for shown, (orig, p) in enumerate(dropped, len(keep) + 1):
+                render_paper(shown, p, by_index.get(orig))
 
 
-# ── 화면 ──────────────────────────────────────────────────────────────────
-st.title("📄 Papers, Please")
-st.caption("일상어, 한국어로 검색해도, arXiv에서 논문을 찾아 드립니다.")
+def render_sources(state: dict, use_local: bool, use_arxiv: bool) -> None:
+    """어디서 몇 편을 가져왔는지. 접어 두고, 궁금한 사람만 펼쳐 봄."""
+    with st.expander("어떻게 찾았는지 보기"):
+        src = []
+        if use_local:
+            src.append(f"로컬 의미 검색 {len(state.get('local_hits') or [])}편")
+        if use_arxiv:
+            src.append(f"arXiv {len(state.get('arxiv_hits') or [])}편")
+        st.caption(f"후보: {' + '.join(src)} -> 중복 제거 {state.get('n_candidates', 0)}편 "
+                   f"-> 재정렬해 상위 {TOP_K}편")
+        if use_arxiv:
+            st.caption(f"arXiv 검색어: `{state['rewrite'].query_for('arxiv')}`")
+        if state.get("local_error"):
+            st.caption(f"로컬 색인을 쓸 수 없었습니다: {state['local_error']}")
+        if state.get("arxiv_error"):
+            st.caption(state["arxiv_error"])
+        if state.get("recommend_error"):
+            st.caption(f"추천 이유를 만들지 못했습니다: {state['recommend_error']}")
+
+        timing = state.get("timing") or {}
+        if timing:
+            st.caption("단계별 소요 시간 (합계 {:.1f}초)".format(sum(timing.values())))
+            st.caption(" / ".join(f"{k} {v:.1f}초" for k, v in timing.items()))
+
+
+# ==========================================================================
+# 화면
+# ==========================================================================
+
+st.title("Papers, Please")
+st.caption("한국어나 일상어로 물어보셔도 arXiv 에서 논문을 찾아 드립니다.")
 
 with st.sidebar:
     st.header("설정")
+    st.caption("기본값 그대로 두셔도 됩니다.")
     use_local = st.checkbox("로컬 의미 검색 사용 (권장)", value=True,
                             help="논문 71만 편을 뜻으로 검색합니다. 첫 실행에 1분 정도 걸립니다.")
     use_arxiv = st.checkbox("arXiv 실시간 검색 사용", value=True,
                             help="최신 논문과 색인 밖 분야를 담당합니다.")
-    show_timing = st.checkbox("단계별 소요 시간 보기", value=False)
     st.divider()
     st.caption("arXiv 요청 제한을 지키기 위해 한 검색당 호출을 최소화합니다.")
 
 if "query" not in st.session_state:
     st.session_state.query = ""
 
-st.write("**예시로 시작하기:**")
+query = st.text_input(
+    "무엇을 찾으시나요?", value=st.session_state.query,
+    placeholder="예: 사진 보고 글로 설명해주는 AI",
+    label_visibility="collapsed")
+
+st.caption("이런 것도 찾을 수 있습니다:")
 cols = st.columns(len(EXAMPLES))
 for col, ex in zip(cols, EXAMPLES):
     if col.button(ex, use_container_width=True):
         st.session_state.query = ex
+        st.rerun()
 
-query = st.text_input("검색어", value=st.session_state.query,
-                      placeholder="예: 사진 보고 글로 설명해주는 AI")
+go = st.button("검색", type="primary", use_container_width=True)
 
-if st.button("🔍 검색", type="primary") and query.strip():
+if go and query.strip():
     if not (use_local or use_arxiv):
         st.error("검색 통로를 하나 이상 켜 주세요.")
         st.stop()
 
-    timing: dict[str, float] = {}
+    with st.status("논문을 찾는 중입니다...", expanded=True) as status:
+        state = run_search(query, use_local, use_arxiv, status)
+        status.update(label="검색을 마쳤습니다.", state="complete", expanded=False)
 
-    # 특정 유명 논문을 설명으로 찾는 질문이면, 그 논문을 짚어서 먼저 보여준다
-    # (LLM 지식으로 제목 추정 -> arXiv 에서 실제 존재를 검증한 경우에만)
-    if use_arxiv:
-        t0 = time.time()
-        with st.spinner("어떤 논문을 찾는 질문인지 확인 중…"):
-            try:
-                resolved_paper, _ = resolve_and_verify(query, load_resolver(), load_arxiv())
-            except Exception:
-                resolved_paper = None       # arXiv 오류 등은 배너 생략(치명적 아님)
-        timing["논문 지목 확인"] = time.time() - t0
-        if resolved_paper:
-            st.success("🎯 이 논문을 찾으시는 것 같습니다")
-            st.markdown(f"### [{resolved_paper.title}]({arxiv_url(resolved_paper.paper_id)})")
-            with st.expander("초록 보기"):
-                st.write(resolved_paper.abstract)
-            st.divider()
-
-    # 1) 변환 과정 (핵심 사용자 경험)
-    t0 = time.time()
-    with st.spinner("Qwen3-4B가 학술 용어로 변환 중…"):
-        rw = load_rewriter().rewrite(query)
-    timing["쿼리 변환"] = time.time() - t0
-
-    st.subheader("🧭 쿼리 변환 과정")
-    if not rw.parse_ok:
-        st.warning("변환에 실패해 원본 검색어로 검색합니다.")
-    c1, c2, c3 = st.columns(3)
-    c1.markdown("**1) 의도 파악**")
-    c1.info(rw.intent or "—")
-    c2.markdown("**2) 핵심 개념**")
-    c2.info("　".join(rw.concepts) if rw.concepts else "—")
-    c3.markdown("**3) 학술 용어**")
-    c3.success("　".join(rw.academic_terms) if rw.academic_terms else "—")
-
-    # 2) 두 채널로 후보 모으기
     st.divider()
-    st.subheader("🔍 검색된 논문")
 
-    local_hits, arxiv_hits, arxiv_err = None, None, None
-
-    if use_local:
-        t0 = time.time()
-        with st.spinner(f"논문 71만 편에서 뜻으로 찾는 중… (후보 {DEPTH_LOCAL}편)"):
-            # 로컬 의미 검색에는 변환된 검색어가 아니라 원본 질문을 넣는다.
-            # 이 채널은 글자가 아니라 뜻으로 찾으므로 변환이 필요 없고, 실측에서도
-            # 원본 질문 그대로가 가장 잘 나왔다.
-            try:
-                local_hits = load_local_index().search(query, k=DEPTH_LOCAL)
-            except Exception as e:
-                st.warning(f"로컬 색인을 쓸 수 없습니다: {e}")
-        timing["로컬 의미 검색"] = time.time() - t0
-
-    transformed_query = rw.query_for("arxiv")
-    if use_arxiv:
-        t0 = time.time()
-        with st.spinner(f"arXiv 검색 중… (후보 {DEPTH_ARXIV}편)"):
-            arxiv_hits, arxiv_err = search_arxiv(transformed_query, k=DEPTH_ARXIV)
-        timing["arXiv 검색"] = time.time() - t0
-
-    candidates = merge_channels(local_hits, arxiv_hits)[:RERANK_DEPTH]
-
-    # 3) 재정렬 - 원본 질문과 대조해 다시 줄 세운다
-    results = None
-    if candidates:
-        t0 = time.time()
-        with st.spinner(f"사용자 의도와 대조해 순위 다시 매기는 중… (후보 {len(candidates)}편)"):
-            # 변환된 검색어가 아니라 원본 질문으로 재정렬한다. 재정렬의 목적이
-            # 사용자 의도와 맞는가를 보는 것이기 때문이다.
-            results = load_reranker().rerank(query, candidates, top_k=TOP_K)
-        timing["재정렬"] = time.time() - t0
-
-    src = []
-    if use_local:
-        src.append(f"로컬 의미 검색 {len(local_hits or [])}편")
-    if use_arxiv:
-        src.append(f"arXiv {len(arxiv_hits or [])}편")
-    st.caption(f"후보: {' + '.join(src)} → 중복 제거 {len(candidates)}편 → 상위 {TOP_K}편")
-    if use_arxiv:
-        st.caption(f"arXiv 검색어: `{transformed_query}`")
-    render_results(results, arxiv_err if not candidates else None)
-
-    # 4) 추천 - 후보를 사용자 의도와 대조해 고르고 이유를 붙인다
-    #
-    # 강력 추천과 관련만 보여준다. 10편을 억지로 채우면 무관한 논문까지 추천처럼 보여
-    # 신뢰를 깎는다. 로컬 의미 검색은 어떤 질문에도 항상 10편을 채워 돌려주므로,
-    # 이 걸러내기가 없으면 무관한 논문을 추천으로 포장하는 서비스가 된다.
-    st.divider()
-    st.subheader("🤖 최종 추천 논문")
-    if results:
-        t0 = time.time()
-        with st.spinner("에이전트가 의도에 맞는 논문을 고르는 중…"):
-            rec = load_recommender().recommend(query, results)
-        timing["추천"] = time.time() - t0
-
-        if rec["summary"]:
-            st.info(f"**종합:** {rec['summary']}")
-        badge = {"high": "🟢 강력 추천", "medium": "🟡 관련"}
-        shown = [r for r in rec["recommendations"] if r["relevance"] in ("high", "medium")]
-        if not shown:
-            st.warning("의도에 맞는 논문을 찾지 못했습니다. 검색어를 바꿔 다시 시도해 보세요. "
-                       "(위 '검색된 논문'에서 직접 확인하실 수 있습니다)")
-        n_hidden = len(rec["recommendations"]) - len(shown)
-        if n_hidden:
-            st.caption(f"관련성이 낮은 {n_hidden}편은 숨겼습니다.")
-        for r in shown:
-            p = results[r["index"] - 1]
-            st.markdown(f"{badge.get(r['relevance'], '')}　**[{p.title}]({arxiv_url(p.paper_id)})**")
-            st.caption(f"↳ 추천 이유: {r['reason']}")
-    else:
-        st.info("검색 결과가 없어 추천할 논문이 없습니다.")
-
-    if show_timing and timing:
+    # 특정 논문을 지목하는 질문이었으면 그 논문을 맨 위에 짚어 줌
+    if state.get("resolved"):
+        p = state["resolved"]
+        st.success("이 논문을 찾으시는 것 같습니다")
+        st.markdown(f"### [{p.title}]({arxiv_url(p.paper_id)})")
+        with st.expander("초록 보기"):
+            st.write(p.abstract)
         st.divider()
-        st.subheader("⏱ 단계별 소요 시간")
-        total = sum(timing.values())
-        for k, v in timing.items():
-            st.caption(f"{k}: {v:.1f}초")
-        st.caption(f"**합계: {total:.1f}초**")
 
-# ── arXiv 이용 약관에 따른 표기 (공개 전 필수) ─────────────────────────────
-# arXiv 이용 약관은 arXiv 가 지원하거나 보증하는 것처럼 표현하는 것을 명시적으로 금지한다.
+    render_understanding(query, state["rewrite"])
+    st.divider()
+
+    st.markdown("#### 찾은 논문")
+    render_results(state)
+    render_sources(state, use_local, use_arxiv)
+
+# -- arXiv 이용 약관에 따른 표기 (공개 전 필수) -----------------------------
+# arXiv 이용 약관은 arXiv 가 지원하거나 보증하는 것처럼 표현하는 것을 명시적으로 금지함.
 # 메타데이터(제목, 초록, 논문 번호)는 CC0 로 배포되어 저장과 재사용이 허용되지만,
-# 논문 원문(PDF, 소스)은 우리 서버에서 제공하지 않고 arXiv 초록 페이지로 보낸다.
+# 논문 원문(PDF, 소스)은 우리 서버에서 제공하지 않고 arXiv 초록 페이지로 보냄.
 st.divider()
 st.caption(
     "논문 메타데이터(제목, 초록, 논문 번호)는 arXiv.org 에서 가져왔습니다. "

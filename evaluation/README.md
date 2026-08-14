@@ -74,8 +74,18 @@ $PY -m evaluation.pipeline_eval --report-only runs/dev_dpo.jsonl --rrf-k 30
 
 # 저장된 결과에 재정렬만 다시 적용 (검색 0회)
 $PY -m evaluation.pipeline_eval --report-only runs/dev_dpo.jsonl \
-    --rerank cross --rerank-depth 100
+    --rerank cross --rerank-depth 300
+
+# 같은 검색 결과 위에서 채널 조합만 갈라 보기 (검색 0회)
+$PY -m evaluation.pipeline_eval --report-only runs/dev_dpo.jsonl \
+    --use-channels local_dense --rerank cross --rerank-depth 300 \
+    --out runs/dev_dpo_localonly.jsonl
 ```
+
+**`--local-query` 를 건드리지 말 것 (기본 `raw`).** 학습한 변환기가 내놓는 것은 arXiv 문법
+문자열이라 로컬 **의미** 검색에 넣으면 불리하고, 무엇보다 서비스(`app.py`)가 로컬 채널에
+원본 질문을 넣는다. 기본값이 서비스와 같은 조건이다. `rewritten` 은 "변환이 의미 검색에도
+도움이 되는가"를 따로 물을 때만 쓴다.
 
 ## 4. 보고와 비교
 
@@ -97,6 +107,19 @@ $PY -m evaluation.report --run runs/dev_passthrough.jsonl runs/dev_dpo.jsonl \
 $PY -m evaluation.pipeline_eval --bench-service --n 5
 $PY -m evaluation.pipeline_eval --bench-service --n 5 --rerank-depth 50   # 깊이를 바꿔 비교
 ```
+
+## 6. "못 찾았다"고 말할 기준선 정하기
+
+로컬 의미 검색은 **어떤 질문에도 후보를 채워서** 돌려준다. 그대로 뿌리면 무관한 논문을
+추천으로 포장하게 된다. 몇 점 아래를 무관으로 볼지 등급 정답지로 실측한다.
+
+```bash
+$PY -m evaluation.pipeline_eval --calibrate-threshold \
+    --queries data/eval/dev.jsonl --grades data/eval/grades_dev.jsonl
+```
+
+정한 값은 `app.py` 의 `MIN_RERANK_SCORE` 에 넣는다. **재정렬 모델을 바꾸면 점수 눈금이
+달라지므로 반드시 다시 재야 한다.**
 
 ## 반드시 지킬 것
 

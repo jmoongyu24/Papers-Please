@@ -1,23 +1,23 @@
-"""쿼리 변환기 학습 데이터 생성 — '실제로 논문을 찾아내는 쿼리'를 정답 라벨로 만든다.
+"""쿼리 변환기 학습 데이터 생성 - '실제로 논문을 찾아내는 쿼리'를 정답 라벨로 만듦.
 
 핵심 아이디어 (왜 이 방식인가):
-지금 변환기의 문제는 지식 부족이 아니라, **"어떤 표현이 arXiv에서 실제로 통하는지" 모른다**는
-것이다(ISSUE #7). 그래서 사람이 "좋아 보이는" 라벨을 쓰지 않고, **arXiv 검색 결과를 정답
-신호로 삼는다**. 이를 best-of-N rejection sampling 이라고 한다.
+지금 변환기의 문제는 지식 부족이 아니라, "어떤 표현이 arXiv에서 실제로 통하는지" 모른다는
+것임(ISSUE #7). 그래서 사람이 "좋아 보이는" 라벨을 쓰지 않고, arXiv 검색 결과를 정답
+신호로 삼음. 이를 best-of-N rejection sampling 이라고 함.
 
     질문 Q(정답 논문 P가 정해져 있음)
-      → 변환기가 후보 쿼리를 N개 생성 (온도를 높여 서로 다르게)
-      → 각 후보로 실제 arXiv 검색
-      → 정답 논문 P를 가장 높은 순위로 찾아낸 후보 = 그 질문의 정답 라벨 ★
-      → 하나도 못 찾으면 그 질문은 학습에서 제외(잘못된 패턴을 배우지 않도록)
+      -> 변환기가 후보 쿼리를 N개 생성 (온도를 높여 서로 다르게)
+      -> 각 후보로 실제 arXiv 검색
+      -> 정답 논문 P를 가장 높은 순위로 찾아낸 후보 = 그 질문의 정답 라벨
+      -> 하나도 못 찾으면 그 질문은 학습에서 제외(잘못된 패턴을 배우지 않도록)
 
-이렇게 만들면 라벨이 "학술적으로 그럴싸한 표현"이 아니라 **"진짜 찾아내는 표현"** 이 되어,
-문제의 정곡을 찌른다. 실패한 후보도 버리지 않고 선호 학습(DPO)용 쌍으로 함께 저장한다.
+이렇게 만들면 라벨이 "학술적으로 그럴싸한 표현"이 아니라 "진짜 찾아내는 표현" 이 되어,
+문제의 정곡을 찌름. 실패한 후보도 버리지 않고 선호 학습(DPO)용 쌍으로 함께 저장함.
 
 출력 (data/training/):
-  sft_pairs.jsonl   : {"input": 질문, "output": 가장 잘 찾은 쿼리}  ← 지도 미세조정(SFT)용
-  dpo_pairs.jsonl   : {"input": 질문, "chosen": 잘 찾은 쿼리, "rejected": 못 찾은 쿼리} ← DPO용
-  candidates.jsonl  : 모든 후보와 점수(분석·재사용용)
+  sft_pairs.jsonl   : {"input": 질문, "output": 가장 잘 찾은 쿼리}  <- 지도 미세조정(SFT)용
+  dpo_pairs.jsonl   : {"input": 질문, "chosen": 잘 찾은 쿼리, "rejected": 못 찾은 쿼리} <- DPO용
+  candidates.jsonl  : 모든 후보와 점수(분석, 재사용용)
 
 실행 예:
   python -m training.build_training_data --queries data/eval/dev.jsonl \
@@ -42,17 +42,17 @@ from src.utils import read_jsonl, write_jsonl
 OUT_DIR = config.DATA_DIR / "training"
 CACHE_PATH = config.DATA_DIR / "cache" / "arxiv_search_cache.jsonl"
 
-# 논문 번호 표기 통일은 fusion.normalize_paper_id 한 곳에서만 한다.
+# 논문 번호 표기 통일은 corpus.normalize_paper_id 한 곳에서만 함.
 # 예전에 여기 있던 `paper_id.split("v")[0]` 은 옛 형식 번호 `solv-int/9611001v1` 을
-# `sol` 로 잘랐다. 잘린 번호는 정답과 절대 안 맞으므로, 그 후보 검색어는 실제로 정답을
-# 찾았더라도 **오류 없이 0점**을 받는다 — 학습 라벨이 조용히 오염되는 자리였다 (ISSUE #27).
+# `sol` 로 잘랐음. 잘린 번호는 정답과 절대 안 맞으므로, 그 후보 검색어는 실제로 정답을
+# 찾았더라도 오류 없이 0점을 받음 - 학습 라벨이 조용히 오염되는 자리였음 (ISSUE #27).
 
 
 def score_query(query: str, gold_id: str, retriever, k: int = 30) -> tuple[float, int | None]:
-    """후보 쿼리로 검색해 '정답 논문이 몇 등인가'로 점수를 매긴다.
+    """후보 쿼리로 검색해 '정답 논문이 몇 등인가'로 점수를 매김.
 
-    점수 = 1 / 순위 (1등이면 1.0, 2등이면 0.5 …). 못 찾으면 0.
-    단순히 찾았나/못 찾았나보다 세밀해서 후보 간 우열을 잘 가른다.
+    점수 = 1 / 순위 (1등이면 1.0, 2등이면 0.5 ...). 못 찾으면 0.
+    단순히 찾았나/못 찾았나보다 세밀해서 후보 간 우열을 잘 가름.
     """
     try:
         results = retriever.search(query, k=k)
@@ -68,14 +68,14 @@ def score_query(query: str, gold_id: str, retriever, k: int = 30) -> tuple[float
 
 def generate_candidates(rewriter: HierarchicalRewriter, question: str,
                         n: int, temperature: float) -> list[str]:
-    """같은 질문에 대해 서로 다른 변환 후보를 n개 만든다.
+    """같은 질문에 대해 서로 다른 변환 후보를 n개 만듦.
 
-    온도를 높여 매번 다른 학술 용어가 나오게 한다. 어떤 표현이 arXiv에서 통할지 모르므로
-    여러 개를 만들어 실제로 시험해 보기 위함이다.
+    온도를 높여 매번 다른 학술 용어가 나오게 함. 어떤 표현이 arXiv에서 통할지 모르므로
+    여러 개를 만들어 실제로 시험해 보기 위함임.
     """
     seen, candidates = set(), []
     for i in range(n):
-        # 첫 후보는 서비스와 동일하게 온도 0(결정적), 나머지는 다양성을 위해 온도를 올린다
+        # 첫 후보는 서비스와 동일하게 온도 0(결정적), 나머지는 다양성을 위해 온도를 올림
         temp = 0.0 if i == 0 else temperature
         try:
             data = rewriter.client.generate_json(
@@ -106,7 +106,7 @@ def main() -> None:
         rows = rows[: args.limit]
 
     rewriter = HierarchicalRewriter(OllamaClient())
-    retriever = ArxivLiveRetriever(cache_path=CACHE_PATH)   # 디스크 캐시로 중단·재개 가능
+    retriever = ArxivLiveRetriever(cache_path=CACHE_PATH)   # 디스크 캐시로 중단, 재개 가능
 
     sft, dpo, cand_log = [], [], []
     n_used = n_skipped = 0
@@ -128,7 +128,7 @@ def main() -> None:
         best = max(valid, key=lambda c: c["score"], default=None)
 
         if best and best["score"] > 0:
-            # 정답 논문을 실제로 찾아낸 쿼리만 학습 라벨로 쓴다
+            # 정답 논문을 실제로 찾아낸 쿼리만 학습 라벨로 씀
             sft.append({"input": question, "output": best["query"],
                         "gold_rank": best["gold_rank"]})
             # 못 찾은 후보가 있으면 선호쌍(잘 찾음 > 못 찾음)으로 저장
@@ -138,10 +138,10 @@ def main() -> None:
                                 "rejected": c["query"]})
             n_used += 1
         else:
-            n_skipped += 1     # 어떤 후보도 못 찾음 → 잘못된 패턴 학습 방지를 위해 제외
+            n_skipped += 1     # 어떤 후보도 못 찾음 -> 잘못된 패턴 학습 방지를 위해 제외
 
         if i % 10 == 0:
-            print(f"  {i}/{len(rows)} · 라벨 확보 {n_used} · 제외 {n_skipped} "
+            print(f"  {i}/{len(rows)}, 라벨 확보 {n_used}, 제외 {n_skipped} "
                   f"({time.time()-t0:.0f}초)", flush=True)
 
     out = Path(args.out_dir)
@@ -153,8 +153,8 @@ def main() -> None:
     print(f"질문 {len(rows)}개 처리")
     print(f"  학습 라벨 확보: {n_used}개 ({n_used/len(rows):.1%})")
     print(f"  제외(정답 못 찾음): {n_skipped}개")
-    print(f"  SFT 쌍: {len(sft)}개 → {out/'sft_pairs.jsonl'}")
-    print(f"  DPO 선호쌍: {len(dpo)}개 → {out/'dpo_pairs.jsonl'}")
+    print(f"  SFT 쌍: {len(sft)}개 -> {out/'sft_pairs.jsonl'}")
+    print(f"  DPO 선호쌍: {len(dpo)}개 -> {out/'dpo_pairs.jsonl'}")
 
 
 if __name__ == "__main__":
