@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from src.rewriter.llm_client import OllamaClient
+from src.rewriter.base import OllamaClient
 from src.schemas import ScoredPaper
 
 RECOMMEND_SCHEMA = {
@@ -49,7 +49,8 @@ RECOMMEND_SYSTEM = (
     "reason(한국어 1~2문장, 초록의 어떤 점이 의도에 맞고 안 맞는지)을 매겨라.\n"
     "- index는 입력에 준 번호를 **그대로** 쓴다. 목록에 없는 번호를 만들지 마라.\n"
     "- 의도에 맞는 논문이 하나도 없으면 전부 low로 하고 summary에 '맞는 논문이 없다'고 밝혀라.\n"
-    "- summary: 어떤 논문(번호)을 왜 추천하는지 사용자에게 한국어로 2~4문장 종합한다."
+    "- summary: 어떤 논문(번호)을 왜 추천하는지 사용자에게 한국어로 2~4문장 종합한다.\n"
+    "- 영어 학술 용어를 제외한 모든 설명은 한국어로."
 )
 
 # 초록이 너무 길면 자른다(입력 토큰 관리). 대부분 arXiv 초록은 이 안에 들어온다.

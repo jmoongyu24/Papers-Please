@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 
-from src.rewriter.llm_client import OllamaClient
+from src.rewriter.base import OllamaClient
 from src.schemas import ScoredPaper
 
 RESOLVE_SCHEMA = {

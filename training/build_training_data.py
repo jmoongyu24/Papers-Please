@@ -20,7 +20,7 @@
   candidates.jsonl  : 모든 후보와 점수(분석·재사용용)
 
 실행 예:
-  python -m training.build_training_data --queries data/eval/train.jsonl \
+  python -m training.build_training_data --queries data/eval/dev.jsonl \
       --n-candidates 5 --limit 50
 """
 
@@ -32,10 +32,11 @@ from pathlib import Path
 
 from src import config
 from src.retrieval.arxiv_live import ArxivLiveRetriever
-from src.retrieval.fusion import normalize_paper_id as normalize_id
-from src.rewriter.hierarchical import HierarchicalRewriter, build_arxiv_query
-from src.rewriter.llm_client import OllamaClient
-from src.rewriter.prompts import OUTPUT_SCHEMA, SYSTEM, build_messages
+from src.retrieval.corpus import normalize_paper_id as normalize_id
+from src.rewriter.base import OllamaClient
+from src.rewriter.baselines import (
+    OUTPUT_SCHEMA, SYSTEM, HierarchicalRewriter, build_arxiv_query, build_messages,
+)
 from src.utils import read_jsonl, write_jsonl
 
 OUT_DIR = config.DATA_DIR / "training"
@@ -92,7 +93,7 @@ def generate_candidates(rewriter: HierarchicalRewriter, question: str,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="검색 성공을 정답 신호로 쓰는 학습 데이터 생성")
-    ap.add_argument("--queries", default="data/eval/train.jsonl")
+    ap.add_argument("--queries", default="data/eval/dev.jsonl")
     ap.add_argument("--n-candidates", type=int, default=5, help="질문당 후보 쿼리 수")
     ap.add_argument("--temperature", type=float, default=0.9, help="후보 다양성 온도")
     ap.add_argument("--k", type=int, default=30, help="채점 시 볼 검색 결과 수")

@@ -1,17 +1,32 @@
-"""다채널 검색 파이프라인 평가 하네스 — 채널별 결과를 따로 저장해 몇 번이든 재계산한다.
+"""검색 파이프라인을 실제로 돌려 재는 하네스 — 성능(정확도)과 응답 시간 둘 다.
 
-## 왜 하네스를 새로 만드는가
+    # 개발용에서 두 채널로 (이어하기 켜짐)
+    $PY -m evaluation.pipeline_eval --queries data/eval/dev.jsonl \\
+        --channels arxiv local_dense --rewriter dpo --k 100 --out runs/dev_dpo.jsonl
 
-`evaluation/arxiv_eval.py` 는 검색 경로가 **하나(arXiv 실시간)** 라는 전제로 짜여 있어
-`retrieved_ids` 한 줄만 저장한다. 이제 경로가 둘 이상(arXiv 키워드 + 로컬 의미 검색)이 되면
-그 한 줄로는 다음 질문에 답할 수 없다.
+    # 저장된 결과만 다시 집계 (검색 0회). 융합 상수·가중치를 바꿔 가며 반복 가능
+    $PY -m evaluation.pipeline_eval --report-only runs/dev_dpo.jsonl \\
+        --rrf-k 30 --weights local_dense=2.0
+
+    # 저장된 결과에 재정렬만 다시 적용 (검색 0회)
+    $PY -m evaluation.pipeline_eval --report-only runs/dev_dpo.jsonl \\
+        --rerank cross --rerank-depth 100
+
+    # 서비스 응답 시간 실측 (평가셋이 아니라 실제 질문으로)
+    $PY -m evaluation.pipeline_eval --bench-service --n 5
+
+만족도(nDCG)까지 포함한 자세한 보고와 실행 간 비교는 `evaluation/report.py` 가 맡는다.
+
+## 왜 채널별 결과를 따로 저장하는가
+
+검색 경로가 둘 이상(arXiv 키워드 + 로컬 의미 검색)이면 다음 질문에 답할 수 있어야 한다.
 
   - 각 채널은 단독으로 얼마나 찾아내는가?
   - **두 채널을 합치면 후보 상한이 얼마나 올라가는가?** (ISSUE #21: 이 상한을 0.70 위로
     올리지 못하면 목표 달성이 산술적으로 불가능하다)
   - 그 상한 중 융합·재정렬이 실제로 얼마나 회수하는가?
 
-그래서 이 하네스는 **채널별 검색 결과 논문 번호를 전부 따로** 저장한다.
+그래서 채널별 검색 결과 논문 번호를 **전부 따로** 저장한다.
 
     {"channels": {"arxiv": [...100편...], "local_dense": [...100편...]}}
 
@@ -23,8 +38,7 @@
 
 **오류·결과 0건 문항을 제외하지 않고 실패(0점)로 센다.** 제외하면 기준선이 부풀려진다
 (같은 실행을 그렇게 재면 passthrough 가 0.257 대신 0.467 로 보인다). 이 하네스의 모든
-비율은 분모가 **전체 문항 수**다. `arxiv_eval.py` 는 오류를 제외하는 옛 방식이라 두
-하네스의 숫자를 직접 비교하면 안 된다.
+비율은 분모가 **전체 문항 수**다.
 
 ## 정답 누수에 대하여 (ISSUE #22)
 
@@ -33,20 +47,11 @@
 정상이다** — 실제 서비스도 arXiv 전체를 검색 대상으로 삼는다. 금지되는 것은 정답 논문의
 글을 보고 검색어를 만드는 것이며, 그 둘은 다른 이야기다.
 
-## 실행 예
+## 개발용과 시험용을 섞지 않는다 (ISSUE #25)
 
-    # 채널 두 개로 300문항 (이어하기 켜짐)
-    python -m evaluation.pipeline_eval --queries data/eval/train.jsonl \\
-        --channels arxiv local_dense --rewriter dpo --k 100 \\
-        --out runs/train300_multichannel.jsonl
-
-    # 저장된 결과만 다시 집계 (검색 0회). 융합 상수·가중치를 바꿔 가며 반복 가능
-    python -m evaluation.pipeline_eval --report-only runs/train300_multichannel.jsonl \\
-        --rrf-k 30 --weights local_dense=2.0
-
-    # 저장된 결과에 재정렬만 다시 적용 (검색 0회)
-    python -m evaluation.pipeline_eval --report-only runs/train300_multichannel.jsonl \\
-        --rerank cross --rerank-depth 100
+기본값이 `data/eval/dev.jsonl` 인 것은 의도적이다. 설정을 이리저리 바꿔 보는 탐색은 전부
+개발용에서 하고, 시험용(`test.jsonl`)으로는 **확정 판정만** 한다. 시험용을 보면서 설정을
+고르면 그 순간 시험지가 타 버린다 — 옛 평가셋이 정확히 그렇게 소모됐다.
 """
 
 from __future__ import annotations
@@ -62,7 +67,8 @@ import numpy as np
 
 from evaluation.metrics import bootstrap_ci
 from src import config
-from src.retrieval.fusion import normalize_paper_id, rrf_fuse_ids
+from src.retrieval.corpus import normalize_paper_id
+from src.retrieval.ranking import rrf_fuse_ids
 from src.rewriter.base import build_rewriter
 from src.schemas import ScoredPaper
 from src.utils import read_jsonl, write_jsonl
@@ -75,8 +81,20 @@ DEFAULT_K_VALUES = (1, 5, 10, 30, 50, 100)
 CHANNEL_QUERY_FIELD = {
     "arxiv": "arxiv",              # 키워드 검색용 (필드 지정·불리언 연산자가 든 문자열)
     "local_dense": "dense",        # 의미 검색용 (자연스러운 문장)
-    "local_dense_small": "dense",
 }
+
+# 응답 시간을 잴 때 쓰는 질문. 실제 사용자가 칠 법한 것으로, 한국어·영어와
+# 일상어·전문어를 섞었다. **평가셋이 아니다** — 정확도가 아니라 시간만 재는 용도다.
+BENCH_QUERIES = [
+    "사진 보고 글로 설명해주는 AI",
+    "가짜 뉴스 걸러내는 방법",
+    "AI가 사람처럼 대화하게 만들기",
+    "얼굴 인식이 화장만 바꿔도 속을 수 있는지 궁금해요",
+    "graph neural network for molecular property prediction",
+    "논문 검색할 때 내가 쓴 말이랑 논문 용어가 달라서 못 찾는 문제",
+    "black-box backdoor attack face recognition",
+    "로봇이 처음 보는 물건을 집는 방법",
+]
 
 
 def git_commit() -> str:
@@ -111,19 +129,10 @@ def build_channel(name: str, args) -> object:
         return ArxivLiveRetriever(cache_path=None if args.no_cache else CACHE_PATH)
 
     if name == "local_dense":
-        from src.retrieval.large_index import LargeDenseRetriever
-        return LargeDenseRetriever(args.large_corpus, args.large_index, mmap=args.mmap)
+        from src.retrieval.local_index import LocalDenseRetriever
+        return LocalDenseRetriever(args.corpus, args.index, mmap=args.mmap)
 
-    if name == "local_dense_small":
-        # 3만 편(corpus-v1) 색인. **코드가 도는지 확인하는 용도로만 쓴다.**
-        # 건초더미가 71만 편의 24분의 1이라 여기서 나온 수치는 부풀려진 값이다(ISSUE #10).
-        from src.retrieval.dense import DenseRetriever
-        r = DenseRetriever.build(config.CORPUS_DIR / "corpus-v1.jsonl")
-        r.name = "local_dense_small"
-        print("경고: 3만 편 색인은 스모크 테스트용이다. 여기서 나온 수치를 성능으로 읽지 말 것.")
-        return r
-
-    raise ValueError(f"알 수 없는 채널 이름: {name}")
+    raise ValueError(f"알 수 없는 채널 이름: {name} (쓸 수 있는 것: arxiv, local_dense)")
 
 
 # ── 질문 하나 평가 ─────────────────────────────────────────────────────────
@@ -239,7 +248,7 @@ class TextLookup:
         self.pos: dict[str, int] = {}
         self.offsets = None
         if index_prefix and self.corpus_path and self.corpus_path.exists():
-            from src.retrieval.large_index import index_paths
+            from src.retrieval.local_index import index_paths
             paths = index_paths(index_prefix)
             if paths["ids"].exists() and paths["offsets"].exists():
                 # 줄 위치는 **그 코퍼스 파일 전용**이다. 다른 파일에 갖다 쓰면 오류 없이
@@ -266,7 +275,7 @@ class TextLookup:
                     row = json.loads(f.readline())
                     out[pid] = (row.get("title", "").strip(), row.get("abstract", "").strip())
         elif self.corpus_path and self.corpus_path.exists():
-            # 줄 위치 색인이 없는 코퍼스(예: 3만 편 corpus-v1)는 한 번 훑어 필요한 것만 담는다.
+            # 줄 위치 색인이 없는 코퍼스는 한 번 훑어 필요한 것만 담는다.
             with open(self.corpus_path, encoding="utf-8") as f:
                 for line in f:
                     if not line.strip():
@@ -322,13 +331,14 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
         queries.append(r["text"])          # ★ 재정렬은 변환된 검색어가 아니라 원본 질문으로 한다
 
     if method == "cross":
-        from src.retrieval.rerank import CrossEncoderReranker, DEFAULT_RERANKER
+        from src.retrieval.ranking import CrossEncoderReranker, DEFAULT_RERANKER
         reranker = CrossEncoderReranker(DEFAULT_RERANKER, batch_size=batch_size)
         ranked = reranker.rerank_batch(queries, cand_lists, top_k=depth)
     elif method == "embedding":
-        from src.retrieval.dense import Embedder
-        from src.retrieval.rerank import rerank_by_similarity
-        embedder = Embedder()
+        from sentence_transformers import SentenceTransformer
+
+        from src.retrieval.ranking import rerank_by_similarity
+        embedder = SentenceTransformer(config.EMBED_MODEL)
         ranked = [rerank_by_similarity(q, c, embedder, top_k=depth)
                   for q, c in zip(queries, cand_lists)]
     else:
@@ -394,7 +404,7 @@ def print_report(rows: list[dict], title: str, k_values=DEFAULT_K_VALUES,
     print(f"■ {title}")
     print(f"   문항 {n}개 · 융합 k={rrf_k} · 가중치 {weights or '전부 1.0'}")
     print("   ※ 오류·결과 0건 문항을 **실패(0점)로 세고** 분모는 전체 문항 수다.")
-    print("      (오류를 제외하는 arxiv_eval.py 의 숫자와 직접 비교하면 안 된다)")
+    print("      (오류 문항을 빼고 잰 옛 숫자와 직접 비교하면 안 된다)")
 
     # 문항 상태
     rewrite_err = [r for r in rows if r.get("error")]
@@ -498,15 +508,146 @@ def load_done(out_path: Path) -> dict[str, dict]:
     return done
 
 
+# ── 서비스 응답 시간 실측 ──────────────────────────────────────────────────
+def bench_service(args) -> None:
+    """질문 하나에 몇 초가 걸리는지 **단계별로** 잰다.
+
+    ## 왜 재야 하는가
+
+    성능 숫자는 여러 번 쟀지만 응답 시간은 오래 안 쟀다. 그런데 사람은 30초를 넘으면
+    떠난다. 정확도를 아무리 올려도 느리면 아무도 안 쓴다.
+
+    특히 지금 구조는 한 번의 검색에 언어 모델을 세 번 부른다.
+
+      1. 논문 지목 확인 (paper_resolver)
+      2. 쿼리 변환 (dpo)
+      3. 추천 이유 생성 (recommender)
+
+    여기에 arXiv 호출과 교차 인코더 재정렬이 끼어 있다. 재정렬은 후보 수에 비례해 늘어난다.
+
+    ## 재기 전에 깊이를 줄이지 않는 이유
+
+    재정렬 깊이를 서비스용으로 줄이고 싶은 유혹이 있지만, 얼마나 느린지 모르는 채로 줄이면
+    얻는 것도 잃는 것도 모른 채 바꾸는 것이다. 먼저 평가와 같은 설정으로 재고, 그 숫자를
+    보고 줄일지 정한다.
+
+    ## GPU 를 한 장만 쓴다는 점
+
+    재정렬과 임베딩이 같은 GPU 에서 일어나므로, 사용자가 여러 명이면 줄을 선다. 여기서 재는
+    것은 혼자 쓸 때의 시간이라 실제 서비스에서는 더 느릴 수 있다. 그 점을 감안해 읽어야 한다.
+    """
+    import statistics as st
+
+    queries = BENCH_QUERIES[: args.n]
+
+    print("부품 불러오는 중… (이 시간은 서비스 시작 시 한 번만 든다)")
+    t0 = time.time()
+    from src.recommend_agent.recommender import PaperRecommender
+    from src.retrieval.arxiv_live import ArxivLiveRetriever
+    from src.retrieval.local_index import LocalDenseRetriever
+    from src.retrieval.ranking import CrossEncoderReranker
+    from src.rewriter.paper_resolver import PaperResolver, resolve_and_verify
+
+    load: dict[str, float] = {}
+    t = time.time(); rewriter = build_rewriter(args.rewriter); load["쿼리 변환기"] = time.time() - t
+    t = time.time(); index = LocalDenseRetriever(args.corpus, args.index)
+    load["로컬 색인 71만 편"] = time.time() - t
+    t = time.time(); reranker = CrossEncoderReranker(); load["재정렬 모델"] = time.time() - t
+    # 추천은 변환기가 이미 올린 모델을 빌려 쓴다 (같은 Qwen3-4B 를 두 벌 올리지 않기 위함)
+    t = time.time()
+    recommender = (PaperRecommender(client=rewriter)
+                   if hasattr(rewriter, "generate_json") else PaperRecommender())
+    load["추천 에이전트"] = time.time() - t
+    arxiv = None if args.skip_arxiv else ArxivLiveRetriever()
+    resolver = None if args.skip_resolver else PaperResolver()
+
+    print("\n■ 시작 시 준비 시간 (한 번만)")
+    for k, v in load.items():
+        print(f"   {k:<20} {v:6.1f}초")
+    print(f"   {'합계':<20} {time.time()-t0:6.1f}초")
+
+    stages = ["논문 지목 확인", "쿼리 변환", "로컬 의미 검색", "arXiv 검색", "재정렬", "추천"]
+    times: dict[str, list[float]] = {s: [] for s in stages}
+    totals: list[float] = []
+
+    print(f"\n■ 질문 {len(queries)}개 측정 "
+          f"(로컬 {args.k} + arXiv {args.k} → 재정렬 {args.rerank_depth})\n")
+
+    for i, q in enumerate(queries, 1):
+        one: dict[str, float] = {}
+        q0 = time.time()
+
+        if resolver and arxiv:
+            t = time.time()
+            try:
+                resolve_and_verify(q, resolver, arxiv)
+            except Exception:
+                pass
+            one["논문 지목 확인"] = time.time() - t
+
+        t = time.time(); rw = rewriter.rewrite(q); one["쿼리 변환"] = time.time() - t
+
+        t = time.time()
+        local_hits = index.search(q, k=args.k)
+        one["로컬 의미 검색"] = time.time() - t
+
+        arxiv_hits = []
+        if arxiv:
+            t = time.time()
+            try:
+                arxiv_hits = arxiv.search(rw.query_for("arxiv"), k=args.k)
+            except Exception as e:
+                print(f"   (arXiv 오류: {type(e).__name__})")
+            one["arXiv 검색"] = time.time() - t
+
+        seen: dict[str, object] = {}
+        for p in list(local_hits) + list(arxiv_hits):
+            seen.setdefault(normalize_paper_id(p.paper_id), p)
+        cands = list(seen.values())[: args.rerank_depth]
+
+        t = time.time()
+        results = reranker.rerank(q, cands, top_k=10)
+        one["재정렬"] = time.time() - t
+
+        t = time.time(); recommender.recommend(q, results); one["추천"] = time.time() - t
+
+        totals.append(time.time() - q0)
+        for k, v in one.items():
+            times[k].append(v)
+        print(f"   {i}. {totals[-1]:5.1f}초  후보 {len(cands):>3}편  {q[:38]}")
+
+    def p95(xs: list[float]) -> float:
+        return sorted(xs)[max(0, int(len(xs) * 0.95) - 1)] if xs else 0.0
+
+    print("\n■ 단계별 (질문 하나 기준)\n")
+    print(f"   {'단계':<16}{'중앙값':>9}{'95분위':>9}{'비중':>8}")
+    med_total = st.median(totals)
+    for s in stages:
+        xs = times[s]
+        if not xs:
+            continue
+        m = st.median(xs)
+        print(f"   {s:<16}{m:>8.1f}초{p95(xs):>8.1f}초{m/med_total:>7.0%}")
+    print(f"   {'─'*40}")
+    print(f"   {'합계':<16}{med_total:>8.1f}초{p95(totals):>8.1f}초")
+
+    print("\n■ 판정")
+    verdict = ("사람이 떠나는 30초를 넘는다. 단계를 줄여야 한다." if p95(totals) > 30 else
+               "20초를 넘어 체감이 느리다. 줄일 여지를 보는 것이 좋다." if p95(totals) > 20 else
+               "30초 기준을 지킨다.")
+    print(f"   95분위 {p95(totals):.1f}초 - {verdict}")
+    print("   ※ GPU 한 장에서 잰 값이라 사용자가 여러 명이면 줄을 서서 더 느려진다.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="다채널 검색 파이프라인 평가 (채널별 결과를 따로 저장해 재계산)")
-    ap.add_argument("--queries", default="data/eval/train.jsonl",
-                    help="개발은 train 으로만 한다. test 는 최종 확인 때만 쓴다")
+        description="검색 파이프라인 평가 (채널별 결과를 따로 저장해 재계산) + 응답 시간 실측")
+    ap.add_argument("--queries", default="data/eval/dev.jsonl",
+                    help="탐색은 dev 로만 한다. test 는 확정 판정 때만 쓴다 (ISSUE #25)")
     ap.add_argument("--channels", nargs="+", default=["arxiv", "local_dense"],
-                    help="arxiv · local_dense(71만 편) · local_dense_small(3만 편, 스모크용)")
+                    help="arxiv · local_dense(71만 편 로컬 의미 검색)")
     ap.add_argument("--rewriter", default="passthrough",
-                    help="변환기 이름 (passthrough / hierarchical / dpo / grounded:dpo ...)")
+                    help="변환기 이름 (passthrough / hierarchical / single_step / hyde / finetuned / dpo)")
     ap.add_argument("--k", type=int, default=100, help="채널마다 가져올 결과 수")
     ap.add_argument("--k-values", type=int, nargs="+", default=list(DEFAULT_K_VALUES))
     ap.add_argument("--limit", type=int, default=None, help="앞에서 N개만 (빠른 점검용)")
@@ -528,11 +669,23 @@ def main() -> None:
     ap.add_argument("--rerank-depth", type=int, default=100, help="재정렬에 넣을 후보 수")
     ap.add_argument("--batch-size", type=int, default=32)
 
-    ap.add_argument("--large-corpus", default=str(config.CORPUS_DIR / "corpus-cs2021.jsonl"))
-    ap.add_argument("--large-index", default=str(config.DATA_DIR / "embeddings" / "cs2021"))
+    ap.add_argument("--corpus", default=str(config.CORPUS_DIR / "corpus-cs2021.jsonl"))
+    ap.add_argument("--index", default=str(config.DATA_DIR / "embeddings" / "cs2021"))
     ap.add_argument("--mmap", action="store_true",
                     help="임베딩을 메모리에 올리지 않고 디스크에서 읽는다(메모리 절약, 느림)")
+
+    ap.add_argument("--bench-service", action="store_true",
+                    help="정확도가 아니라 **응답 시간**을 단계별로 잰다 (평가셋 대신 예시 질문)")
+    ap.add_argument("--n", type=int, default=5, help="--bench-service 에서 잴 질문 수")
+    ap.add_argument("--skip-arxiv", action="store_true",
+                    help="--bench-service 에서 arXiv 호출을 뺀다 (요청 제한을 아끼고 싶을 때)")
+    ap.add_argument("--skip-resolver", action="store_true",
+                    help="--bench-service 에서 논문 지목 확인 단계를 뺀다")
     args = ap.parse_args()
+
+    if args.bench_service:
+        bench_service(args)
+        return
 
     weights = parse_weights(args.weights)
 
@@ -542,7 +695,7 @@ def main() -> None:
         all_rows = list(read_jsonl(path))
         rows = [r for r in all_rows if not r.get("_meta")]
         if args.rerank != "none":
-            lookup = TextLookup(args.large_index, args.large_corpus,
+            lookup = TextLookup(args.index, args.corpus,
                                 None if args.no_cache else CACHE_PATH)
             rerank_rows(rows, args.rerank, args.rerank_depth, lookup,
                         args.rrf_k, weights, args.batch_size)
@@ -587,7 +740,7 @@ def main() -> None:
                 write_jsonl(out_path, results)      # 중간 저장 — 중단돼도 여기까지는 살아남는다
 
     if args.rerank != "none":
-        lookup = TextLookup(args.large_index, args.large_corpus,
+        lookup = TextLookup(args.index, args.corpus,
                             None if args.no_cache else CACHE_PATH)
         rerank_rows(results, args.rerank, args.rerank_depth, lookup,
                     args.rrf_k, weights, args.batch_size)

@@ -1,18 +1,46 @@
-"""논문 모음(코퍼스)을 불러오고 거르는 부분.
+"""논문 데이터를 다루는 부분 — 코퍼스 적재·구축과 논문 번호 표기 통일.
 
 코퍼스는 JSON Lines 파일이다 (줄마다 논문 하나). 캐글에서 받은 arXiv 스냅샷을
 우리 형식으로 정리해 저장하거나, 데모용 작은 샘플 파일을 불러올 때 쓴다.
+
+논문 번호 정규화(`normalize_paper_id`)도 여기 있다. 검색·평가·화면 어디서든 "같은 논문인가"를
+판단할 때 반드시 거쳐야 하는 관문이라, 특정 검색 경로가 아니라 논문 데이터를 다루는
+이 파일에 둔다.
 """
 
 from __future__ import annotations
 
 import argparse
 import random
+import re
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from src.schemas import Paper
 from src.utils import read_jsonl, write_jsonl
+
+# 끝에 붙은 버전 표기(v + 숫자)만 떼어낸다. 중간의 v 는 건드리지 않는다.
+_VERSION_SUFFIX = re.compile(r"v\d+$")
+
+
+def normalize_paper_id(paper_id: str) -> str:
+    """논문 번호를 어디서든 비교 가능한 한 형태로 만든다.
+
+    '2103.00020v2' -> '2103.00020',  'solv-int/9611001v1' -> 'solv-int/9611001'
+
+    ## 왜 이 함수가 필요한가
+
+    arXiv 실시간 결과는 `2103.00020v2` 처럼 **버전 표기가 붙어** 오고, 로컬 색인은
+    `2103.00020` 처럼 붙지 않은 형태로 저장돼 있다. 그대로 합치면 **같은 논문이 서로 다른
+    논문으로 취급돼, 두 채널이 합의한 논문일수록 오히려 점수가 반으로 쪼개진다.** 오류가
+    아니라 조용히 성능만 깎는 종류의 버그다.
+
+    ## 반드시 정규식으로 떼어낼 것 (ISSUE #27)
+
+    `paper_id.split("v")[0]` 을 쓰면 안 된다. 옛 형식 번호 중에는 `solv-int/9611001v1`
+    처럼 **번호 자체에 v가 들어간 것**이 있어 `sol` 로 잘려 버린다.
+    """
+    return _VERSION_SUFFIX.sub("", (paper_id or "").strip())
 
 
 def load_corpus(path: str | Path) -> list[Paper]:

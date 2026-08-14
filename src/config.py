@@ -6,8 +6,46 @@
 
 from __future__ import annotations
 
+import ctypes
+import glob
 import os
 from pathlib import Path
+
+
+def _fix_libstdcxx() -> None:
+    """torch 보다 먼저 새 C++ 표준 라이브러리를 올려 둔다.
+
+    무엇을 고치는가:
+    torch 를 먼저 부르면 시스템의 `/lib/x86_64-linux-gnu/libstdc++.so.6` 가 먼저 잡힌다.
+    그런데 그 파일에는 `CXXABI_1.3.15` 가 없어서, 뒤이어 pyarrow(sklearn 이 부른다)를
+    올릴 때 아래 오류로 깨진다.
+
+        ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6:
+        version `CXXABI_1.3.15' not found (required by .../libarrow.so.2100)
+
+    왜 이 방식인가:
+    `LD_PRELOAD` 환경변수로도 되지만, 그건 실행할 때마다 사람이 붙여 줘야 한다. 잊으면
+    어떤 경로에서는 되고 어떤 경로에서는 안 되는 상태가 된다. 여기서 미리 올려 두면
+    config 를 가져오는 모든 실행 경로에 자동으로 적용된다.
+
+    조건: **torch 가 올라오기 전에** 실행돼야 한다. config 는 거의 모든 모듈이 맨 위에서
+    가져오므로 이 자리가 맞다. 라이브러리를 못 찾으면 조용히 넘어간다(원래 환경이 멀쩡한
+    경우까지 깨뜨리지 않기 위함).
+    """
+    if os.environ.get("PAPERS_SKIP_LIBSTDCXX_FIX"):
+        return
+    for pattern in ("/home/jmoongyu/anaconda3/lib/libstdc++.so.6*",
+                    os.path.join(os.path.dirname(os.__file__), "..", "..", "libstdc++.so.6*")):
+        found = sorted(glob.glob(pattern))
+        if found:
+            try:
+                ctypes.CDLL(found[-1], mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+            return
+
+
+_fix_libstdcxx()
 
 # ── 경로 ────────────────────────────────────────────────────────────────
 # 이 파일 기준으로 저장소 최상위 폴더를 계산한다 (src/config.py -> 상위의 상위).

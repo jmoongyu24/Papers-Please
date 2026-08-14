@@ -215,7 +215,7 @@ def build_embeddings(corpus_path: str | Path, out_prefix: str | Path,
 
 
 # ── 검색기 ────────────────────────────────────────────────────────────────
-class LargeDenseRetriever:
+class LocalDenseRetriever:
     """71만 편 위에서 의미 기반 검색. 인터페이스는 다른 검색기와 동일하다."""
 
     name = "local_dense"
@@ -255,8 +255,20 @@ class LargeDenseRetriever:
                 f"색인({out_prefix})을 다시 만들 것.")
 
         if embedder is None:
+            import torch
             from sentence_transformers import SentenceTransformer
-            embedder = SentenceTransformer(model_name)
+            # 반정밀도(fp16)로 올린다. VRAM 이 2.14GB 에서 절반으로 줄어든다.
+            #
+            # 왜 이게 중요한가: GPU 가 16GB 인데 쿼리 변환기 8.64GB, 임베더 2.14GB,
+            # 재정렬 3.06GB 를 fp32 로 올리면 여유가 1.98GB 뿐이라, 추천 에이전트가
+            # 필요한 3.54GB 를 못 받아 **조용히 CPU 로 밀려난다.** 그러면 추천 한 번이
+            # 10.5초에서 229.6초가 된다(실측). ISSUE 23 점검표 4번이 서비스에서 재현된 것이다.
+            #
+            # 품질: 여기서 만드는 것은 질문 벡터 하나뿐이고, 저장된 논문 벡터는 fp32 그대로다.
+            # 내적 계산은 numpy 가 fp32 로 올려서 하므로 정밀도 손실은 질문 벡터 한 벌에만
+            # 생기고 무시할 수준이다. bge 계열은 fp16 추론이 표준이다.
+            kw = {"model_kwargs": {"dtype": torch.float16}} if torch.cuda.is_available() else {}
+            embedder = SentenceTransformer(model_name, **kw)
             embedder.max_seq_length = max_seq_length
         self.embedder = embedder
         # 논문 번호 -> 배열 위치 (재정렬 후보의 본문을 꺼낼 때 쓴다)
