@@ -3,13 +3,13 @@
 사용자가 일상어나 한국어로 검색하면, 무엇을 어떻게 알아들었는지 보여주고, 두 갈래로
 논문을 찾아 사용자 의도에 맞게 다시 줄 세워 보여줌.
 
-## 왜 검색 통로가 둘인가
+## 검색어를 두 개 만들어 한 색인을 두 번 찾음 (2026-08-16 구조 변경)
 
     질문
-     +- 채널 A  쿼리 변환기 -> arXiv 실시간 검색   (글자가 정확히 맞아야 걸림)
-     \- 채널 B  로컬 의미 검색 71만 편              (뜻으로 찾음)
+     +- 검색어 1  원본 (한국어면 영어로 옮김)      사용자가 실제로 쓴 말
+     \- 검색어 2  질문에 답할 법한 가상 초록        분야 용어로 건너가는 다리
             |
-       합치고 중복 제거
+       각각 로컬 의미 검색 71만 편 -> 순위 합치기(RRF)
             |
        교차 인코더 재정렬 (원본 질문과 대조)
             |
@@ -17,14 +17,19 @@
             |
        사용자에게 보여줄 10편
 
-arXiv 키워드 검색은 정확한 문자열 일치를 요구해서, 실패한 검색어의 63% 가 거의 맞음으로
-빗나갔음 (ISSUE 21). 뜻으로 찾는 두 번째 통로를 나란히 두어 그 벽을 넘음.
+     * arXiv 실시간 검색은 이 목록에 섞지 않고 '최신 논문' 칸으로 따로 보여줌
 
-로컬 의미 검색 채널이 성능의 거의 전부를 만듦 (로컬 단독 0.677 대 두 채널 0.680,
-p=0.889). 그런데도 arXiv 채널을 남기는 이유는, 평가셋의 정답 논문이 전부 로컬 색인 안에
-있어서 그 평가가 색인 밖 논문을 못 찾는 약점을 구조적으로 잴 수 없기 때문임. 실제
-사용자는 어제 올라온 논문도 물음. arXiv 채널의 역할은 정확도가 아니라 최신성과 범위임
-(ISSUE 29).
+왜 이렇게 바꿨는가 (개발용 348문항 실측):
+
+    번역만                  Recall@10 0.566   nDCG@10 0.514
+    가상 초록으로 대체        Recall@10 0.555   (hard 층만 좋아지고 나머지가 나빠짐)
+    둘을 합침                Recall@10 0.586   nDCG@10 0.523 (+0.009, p=0.040)
+
+옛 구조는 arXiv 채널과 로컬 채널을 합치는 것이었는데, 합치면 비율을 어떻게 잡아도
+만족도가 떨어졌음 (1대1 -0.041, 2대1 -0.040, 3대1 -0.034, 전부 p<0.001). 게다가 옛
+코드는 로컬 후보가 300칸을 다 채워 arXiv 후보를 한 편도 넣지 못하고 있었음 (ISSUE 39).
+arXiv 채널의 가치는 정확도가 아니라 색인에 없는 최신 논문이고, 그 가치는 평가셋으로
+잴 수 없으므로 (정답 논문이 전부 색인 안에 있음) 목록을 갈라 두는 것이 정직함.
 
 ## 화면 구성 원칙 (ISSUE 11)
 
@@ -66,9 +71,9 @@ import streamlit as st
 from src import config
 from src.recommend_agent.recommender import PaperRecommender
 from src.retrieval.arxiv_live import ArxivLiveRetriever
-from src.retrieval.corpus import normalize_paper_id
 from src.rewriter.base import build_rewriter
 from src.rewriter.paper_resolver import PaperResolver, resolve_and_verify
+from src.schemas import RewriteResult
 
 EXAMPLES = [
     "사진 보고 글로 설명해주는 AI",
@@ -79,18 +84,25 @@ EXAMPLES = [
 
 # -- 검색 예산 --------------------------------------------------------------
 TOP_K = 10              # 사용자에게 보여줄 최대 논문 수
-DEPTH_LOCAL = 300       # 로컬 의미 검색에서 받아올 후보 수
+DEPTH_LOCAL = 100       # 로컬 의미 검색 한 번에 받아올 후보 수 (검색어마다)
 DEPTH_ARXIV = 100       # arXiv 에서 받아올 후보 수 (page_size 가 100 이라 호출 1회로 끝남)
-RERANK_DEPTH = 300      # 재정렬에 넣을 최대 후보 수
+RERANK_DEPTH = 100      # 재정렬에 넣을 최대 후보 수
 
-# 깊이를 서비스 속도를 위해 줄이고 싶은 유혹이 있지만, 줄이기 전에 반드시 질문 하나 기준
-# 응답 시간을 실측함.
+# 깊이를 왜 300 에서 100 으로 줄였는가 (2026-08-16 실측, 개발용 348문항)
 #
-# 줄일 근거는 이미 있음. 정답의 1차 등수별 재정렬 회수율이 1~10등 0.956, 11~30등 0.938
-# 인데 101~200등 0.350, 201~300등 0.125 로 절벽처럼 떨어짐. 즉 재정렬은 이미 위에 있는
-# 정답만 지키고 깊은 곳에서는 끌어올리지 못하므로, 깊이를 줄여도 잃는 것이 적음.
-# 다만 그것은 추정이고, 얼마나 느린지는 재봐야 안다:
-#   python -m evaluation.pipeline_eval --bench-service --n 5
+#   후보 깊이   Recall@10   nDCG@10   상위 10편에 쓸모있는 논문이 한 편 이상
+#     100        0.566      0.514              93.4% (평균 3.14편)
+#     150        0.566      0.496                -
+#     200        0.569      0.487                -
+#     300        0.583      0.478              89.9% (평균 2.75편)
+#
+# 후보를 깊게 가져오면 후보 상한은 오르지만(0.635 -> 0.721) 최종 성능은 따라오지 않고
+# (+0.017, p=0.214 판정 불가) 만족도는 확실히 떨어짐(-0.036, p<0.001). 후보가 늘면
+# 재정렬기가 엉뚱한 논문을 상위로 올리는 일도 함께 늘기 때문임.
+# 사용자 입장에서 중요한 "쓸모있는 논문을 한 편이라도 보여줬는가" 도 100 쪽이 높음.
+#
+# 깊이를 다시 만지려면 감이 아니라 이 표를 다시 만들 것:
+#   python -m evaluation.pipeline_eval --report-only <실행결과> --rerank cross --rerank-depth N
 
 # -- "못 찾았다"고 말할 기준선 ----------------------------------------------
 #
@@ -168,18 +180,23 @@ def load_resolver() -> PaperResolver:
 
 
 @st.cache_resource
-def load_recommender() -> PaperRecommender:
-    """추천 에이전트. 쿼리 변환기가 이미 올려 둔 Qwen3-4B 를 그대로 빌려 씀.
+def load_recommender(borrow_dpo: bool = False) -> PaperRecommender:
+    """추천 이유 생성기. 어느 모델을 쓸지는 지금 dpo 변환기가 올라와 있는지에 달림.
 
-    따로 올리면 같은 모델이 두 벌이 되어 8.64GB + 3.54GB 를 씀. GPU 가 16GB 라
-    임베더와 재정렬까지 더하면 자리가 모자라고, 그러면 추천 쪽 모델이 오류 없이
-    조용히 CPU 로 밀려남. 그 상태로 재보니 추천 한 번에 229.6초가 걸렸음.
-    GPU 에 올라가면 같은 일이 10.5초임.
+    - arXiv 를 켜면 dpo 변환기(transformers, 8.64GB)가 이미 올라와 있으므로 그것을
+      빌려 씀. 안 빌리면 같은 모델이 두 벌이 되어 GPU 16GB 를 넘기고, 그러면 추천
+      모델이 오류 없이 조용히 CPU 로 밀려나 한 번에 229.6초가 걸림(실측).
+    - arXiv 를 끄면 dpo 를 아예 올리지 않음. 이때는 Ollama 의 qwen3:4b 를 씀.
+      번역기와 가상 초록 생성기가 이미 쓰고 있는 모델이라 VRAM 이 더 들지 않음.
+
+    빌릴 때 `borrow_dpo=True` 를 인자로 받는 이유는, 인자가 다르면 캐시가 갈라져서
+    두 경우가 서로 덮어쓰지 않게 하기 위함임.
     """
-    rewriter = load_rewriter()
-    if hasattr(rewriter, "generate_json"):
-        return PaperRecommender(client=rewriter)
-    return PaperRecommender()          # 변환기가 Ollama 계열이면 예전처럼 따로 부름
+    if borrow_dpo:
+        rewriter = load_rewriter()
+        if hasattr(rewriter, "generate_json"):
+            return PaperRecommender(client=rewriter)
+    return PaperRecommender()
 
 
 @st.cache_resource(show_spinner="재정렬 모델 준비 중...")
@@ -214,6 +231,39 @@ def load_translator():
     return TranslateRewriter()
 
 
+@st.cache_resource
+def load_hyde():
+    """질문에 답할 법한 가상의 영어 초록을 지어내는 변환기 (두 번째 검색어를 만듦).
+
+    ## 왜 필요한가 (2026-08-16 실측)
+
+    일상어로 묻는 hard 층은 번역만으로는 안 됨. 번역은 일상어를 일상어인 채로 옮기기
+    때문임. 실제 실패 사례:
+
+        질문      조건이 많은 문제를 아주 적은 메모리로 대충 잘 푸는 방법이 있나
+        번역      Is there a way to solve a problem with many conditions with very little memory?
+        정답 논문  Approximability of all Boolean CSPs with linear sketches  -> 457,938등
+
+    필요한 것은 번역이 아니라 "조건이 많은 문제 = 제약 충족 문제", "적은 메모리로 대충 =
+    스케치 근사" 같은 분야 지식임. 가상 초록은 그 지식을 끌어내는 장치임.
+
+    ## 반드시 바꿔치기가 아니라 함께 쓸 것 (실측)
+
+    개발용 348문항에서 가상 초록으로 원본 검색어를 대체하면 hard 층만 좋아지고
+    (0.181 -> 0.198) 나머지가 다 나빠짐(전체 0.583 -> 0.555). 4B 모델은 모르는 분야에서
+    그럴듯하지만 엉뚱한 초록을 지어내기 때문임. 두 검색어로 각각 검색해 순위를 합치면
+    양쪽을 다 얻음:
+
+        번역만          Recall@10 0.566   nDCG 0.514
+        가상 초록만      Recall@10 0.555   nDCG   -
+        둘을 합침        Recall@10 0.586   nDCG 0.523 (+0.009, p=0.040)
+
+    모델은 Ollama 의 qwen3:4b 로, 앱이 이미 올려 둔 것을 쓰므로 VRAM 이 더 들지 않음.
+    """
+    from src.rewriter.baselines import HydeRewriter
+    return HydeRewriter()
+
+
 # ==========================================================================
 # 검색 파이프라인 (화면 그리기와 분리해 둠)
 # ==========================================================================
@@ -245,20 +295,23 @@ def academic_terms_of(rw, raw_query: str) -> list[str]:
     return [t for t in dict.fromkeys(found) if t.strip() and t.strip() != raw_query.strip()]
 
 
-def merge_channels(*channels) -> list:
-    """채널별 결과를 합치고 같은 논문을 하나로 만듦.
+def fuse_local(literal_hits, hyde_hits) -> list:
+    """두 검색어로 얻은 로컬 결과를 순위 합치기(RRF)로 합침.
 
-    논문 번호 표기를 반드시 통일해야 함. 통일하지 않으면 2103.00020 과 2103.00020v2 가
-    서로 다른 논문으로 취급되어, 두 채널이 함께 찾아낸 논문일수록 중복으로 남음.
-    가장 확실한 정답이 가장 손해를 보는, 알아채기 어려운 고장임 (ISSUE 27).
+    점수를 그대로 더하지 않고 등수를 더함. 두 결과가 같은 임베딩 모델에서 나오긴 하지만,
+    가상 초록은 문장이 길어 유사도 값이 전반적으로 다르게 나옴. 점수를 더하면 어느 쪽이
+    옳은가가 아니라 점수 눈금이 큰 쪽이 이김 (ISSUE 29 자리).
+
+    논문 번호 표기 통일은 `rrf_fuse` 안에서 함. 통일하지 않으면 2103.00020 과
+    2103.00020v2 가 다른 논문이 되어, 두 검색어가 함께 찾아낸 논문일수록 손해를 봄
+    (ISSUE 27).
     """
-    seen: dict[str, object] = {}
-    for ch in channels:
-        for p in ch or []:
-            pid = normalize_paper_id(p.paper_id)
-            if pid not in seen:
-                seen[pid] = p
-    return list(seen.values())
+    from src.retrieval.ranking import rrf_fuse
+
+    channels = {"literal": literal_hits or []}
+    if hyde_hits:
+        channels["hyde"] = hyde_hits
+    return rrf_fuse(channels, k=config.RRF_K, top_n=RERANK_DEPTH)
 
 
 def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
@@ -268,8 +321,8 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
     이렇게 나눠 두면 화면 구성을 바꿀 때 파이프라인을 건드리지 않아도 됨.
     """
     out: dict = {"timing": {}, "arxiv_error": None, "resolved": None,
-                 "local_hits": None, "arxiv_hits": None, "results": None,
-                 "recommendation": None}
+                 "local_hits": None, "hyde_hits": None, "arxiv_hits": None,
+                 "results": None, "recommendation": None}
 
     # 특정 유명 논문을 설명으로 찾는 질문이면, 그 논문을 짚어서 먼저 보여줌
     # (언어 모델 지식으로 제목 추정 -> arXiv 에서 실제 존재를 검증한 경우에만)
@@ -296,22 +349,55 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
             out["translate_error"] = tr.intent
         out["timing"]["한국어를 영어로"] = time.time() - t0
 
-    status.write("검색어를 학술 용어로 바꾸는 중...")
-    t0 = time.time()
-    out["rewrite"] = load_rewriter().rewrite(query)
-    out["timing"]["쿼리 변환"] = time.time() - t0
+    # 두 번째 검색어: 질문에 답할 법한 가상의 영어 초록. 일상어 질문을 분야 용어로
+    # 건너게 하는 장치임 (load_hyde 설명글 참고). 원본 검색어를 대체하지 않고 함께 씀.
+    out["hyde_text"] = None
+    if use_local:
+        status.write("질문에 맞는 논문이 어떻게 쓰여 있을지 떠올리는 중...")
+        t0 = time.time()
+        hy = load_hyde().rewrite(query)
+        if hy.parse_ok:
+            out["hyde_text"] = hy.query_for("dense")
+        else:
+            out["hyde_error"] = hy.intent
+        out["timing"]["두 번째 검색어 만들기"] = time.time() - t0
+
+    # 학습한 변환기(dpo)는 arXiv 문법 문자열만 만듦. 그래서 arXiv 채널을 쓸 때만 부름.
+    # 켜 두면 매 검색마다 GPU 8.64GB 와 3.5초를 쓰는데, 로컬 검색에는 쓸 곳이 없음
+    # (ISSUE 39). arXiv 를 끄면 그 비용이 통째로 사라짐.
+    if use_arxiv:
+        status.write("arXiv 검색어를 학술 용어로 바꾸는 중...")
+        t0 = time.time()
+        out["rewrite"] = load_rewriter().rewrite(query)
+        out["timing"]["쿼리 변환"] = time.time() - t0
+    else:
+        out["rewrite"] = RewriteResult(
+            raw_query=query,
+            queries={"dense": out["search_text"], "arxiv": query},
+            intent="", parse_ok=True)
 
     if use_local:
-        status.write(f"논문 71만 편에서 뜻으로 찾는 중... (후보 {DEPTH_LOCAL}편)")
+        status.write(f"논문 71만 편에서 뜻으로 찾는 중... (검색어 2개 x 후보 {DEPTH_LOCAL}편)")
         t0 = time.time()
         try:
-            out["local_hits"] = load_local_index().search(out["search_text"], k=DEPTH_LOCAL)
+            index = load_local_index()
+            out["local_hits"] = index.search(out["search_text"], k=DEPTH_LOCAL)
+            if out["hyde_text"]:
+                out["hyde_hits"] = index.search(out["hyde_text"], k=DEPTH_LOCAL)
         except Exception as e:
             out["local_error"] = str(e)
         out["timing"]["로컬 의미 검색"] = time.time() - t0
 
+    # arXiv 결과는 재정렬 목록에 섞지 않고 따로 보여줌.
+    #
+    # 섞어 보고 판단한 결과임 (2026-08-16, 개발용 348문항). 로컬과 arXiv 를 순위 합치기로
+    # 섞으면 비율을 어떻게 잡아도 만족도가 떨어짐: 1대1 -0.041, 2대1 -0.040, 3대1 -0.034
+    # (전부 p<0.001). Recall 이득은 전부 판정 불가였음. 로컬 비중을 올릴수록 손해가 주는
+    # 방향이라, 그 추세의 종점이 '섞지 않음' 임.
+    # 그래도 호출은 남김. arXiv 채널의 가치는 정확도가 아니라 색인에 없는 최신 논문이고,
+    # 그 가치는 평가셋으로 잴 수 없기 때문임 (평가셋 정답 논문이 전부 색인 안에 있음).
     if use_arxiv:
-        status.write(f"arXiv 에서 찾는 중... (후보 {DEPTH_ARXIV}편)")
+        status.write(f"arXiv 에서 최신 논문을 찾는 중... (후보 {DEPTH_ARXIV}편)")
         t0 = time.time()
         try:
             out["arxiv_hits"] = load_arxiv().search(
@@ -321,7 +407,7 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
                                   f"다시 시도해 주세요. [{type(e).__name__}]")
         out["timing"]["arXiv 검색"] = time.time() - t0
 
-    candidates = merge_channels(out["local_hits"], out["arxiv_hits"])[:RERANK_DEPTH]
+    candidates = fuse_local(out["local_hits"], out["hyde_hits"])
     out["n_candidates"] = len(candidates)
 
     if candidates:
@@ -338,7 +424,7 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
         status.write("각 논문이 왜 맞는지 정리하는 중...")
         t0 = time.time()
         try:
-            out["recommendation"] = load_recommender().recommend(query, out["results"])
+            out["recommendation"] = load_recommender(use_arxiv).recommend(query, out["results"])
         except Exception as e:
             out["recommend_error"] = str(e)
         out["timing"]["추천 이유 생성"] = time.time() - t0
@@ -482,18 +568,43 @@ def render_results(state: dict) -> None:
                 render_paper(shown, p, by_index.get(orig))
 
 
+def render_recent(state: dict, use_arxiv: bool) -> None:
+    """arXiv 실시간 검색 결과를 '최신 논문' 으로 따로 보여줌.
+
+    본 목록에 섞지 않는 이유는 run_search 설명 참고 (섞으면 만족도가 떨어짐).
+    본 목록에 이미 있는 논문은 빼서, 같은 논문이 두 번 나오지 않게 함 (ISSUE 11).
+    """
+    hits = state.get("arxiv_hits") or []
+    if not (use_arxiv and hits):
+        return
+    from src.retrieval.corpus import normalize_paper_id
+
+    shown = {normalize_paper_id(p.paper_id) for p in (state.get("results") or [])}
+    fresh = [p for p in hits if normalize_paper_id(p.paper_id) not in shown][:5]
+    if not fresh:
+        return
+    with st.expander(f"arXiv 에서 방금 찾은 논문 {len(fresh)}편 더 보기 (색인에 없는 최신 논문 포함)"):
+        st.caption("이 목록은 관련도 순서가 아니라 arXiv 가 돌려준 순서입니다.")
+        for p in fresh:
+            st.markdown(f"- [{p.title}]({arxiv_url(p.paper_id)})")
+
+
 def render_sources(state: dict, use_local: bool, use_arxiv: bool) -> None:
     """어디서 몇 편을 가져왔는지. 접어 두고, 궁금한 사람만 펼쳐 봄."""
     with st.expander("어떻게 찾았는지 보기"):
         src = []
         if use_local:
-            src.append(f"로컬 의미 검색 {len(state.get('local_hits') or [])}편")
-        if use_arxiv:
-            src.append(f"arXiv {len(state.get('arxiv_hits') or [])}편")
-        st.caption(f"후보: {' + '.join(src)} -> 중복 제거 {state.get('n_candidates', 0)}편 "
+            src.append(f"뜻으로 찾기 {len(state.get('local_hits') or [])}편")
+            if state.get("hyde_hits"):
+                src.append(f"두 번째 검색어 {len(state['hyde_hits'])}편")
+        st.caption(f"후보: {' + '.join(src)} -> 순위 합치기 {state.get('n_candidates', 0)}편 "
                    f"-> 재정렬해 상위 {TOP_K}편")
+        if use_arxiv:
+            st.caption(f"arXiv 는 최신 논문 칸으로 따로 {len(state.get('arxiv_hits') or [])}편")
         if use_local and state.get("search_text") != state["rewrite"].raw_query:
             st.caption(f"로컬 의미 검색어(영어로 옮김): `{state['search_text']}`")
+        if state.get("hyde_text"):
+            st.caption(f"두 번째 검색어(가상 초록): `{state['hyde_text'][:200]}`")
         if use_arxiv:
             st.caption(f"arXiv 검색어: `{state['rewrite'].query_for('arxiv')}`")
         if state.get("local_error"):
@@ -521,8 +632,10 @@ with st.sidebar:
     st.caption("기본값 그대로 두셔도 됩니다.")
     use_local = st.checkbox("로컬 의미 검색 사용 (권장)", value=True,
                             help="논문 71만 편을 뜻으로 검색합니다. 첫 실행에 1분 정도 걸립니다.")
-    use_arxiv = st.checkbox("arXiv 실시간 검색 사용", value=True,
-                            help="최신 논문과 색인 밖 분야를 담당합니다.")
+    use_arxiv = st.checkbox("arXiv 최신 논문도 찾기", value=True,
+                            help="색인에 없는 최신 논문을 따로 찾아 아래에 따로 보여줍니다. "
+                                 "추천 목록의 순위에는 영향을 주지 않습니다. "
+                                 "끄면 약 5초 빨라집니다.")
     st.divider()
     st.caption("arXiv 요청 제한을 지키기 위해 한 검색당 호출을 최소화합니다.")
 
@@ -568,6 +681,7 @@ if go and query.strip():
 
     st.markdown("#### 찾은 논문")
     render_results(state)
+    render_recent(state, use_arxiv)
     render_sources(state, use_local, use_arxiv)
 
 # -- arXiv 이용 약관에 따른 표기 (공개 전 필수) -----------------------------
