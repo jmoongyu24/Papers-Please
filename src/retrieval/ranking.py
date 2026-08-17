@@ -230,13 +230,143 @@ def _doc_text(c: ScoredPaper) -> str:
 
 def _reorder(candidates: list[ScoredPaper], scores: np.ndarray,
              top_k: int) -> list[ScoredPaper]:
-    order = np.argsort(-scores)[:top_k]
+    # 안정 정렬을 씀. 점수가 정확히 같을 때 후보 목록에 들어온 순서(= 융합 순위)가
+    # 그대로 유지되게 하기 위함임. 기본값(quicksort)은 안정 정렬이 아니라서 동점일 때
+    # 어느 쪽이 앞에 올지가 1차 검색 순위와 무관하게 정해짐.
+    #
+    # 동점은 실제로 생김. 모델을 반정밀도(fp16)로 올리는데(위 __init__ 참고) 유효숫자가
+    # 세 자리쯤이라, 점수가 좁은 구간에 몰리면 원래 다른 값이 같은 값으로 반올림됨.
+    # 개발용 348문항 실측(2026-08-17): 이웃한 후보끼리 점수가 같은 자리가 후보 60,644개
+    # 중 3,626개(6.0%)였고, 일상어 층이 7.5%로 가장 높았음(어느 논문과도 낱말이 안 겹쳐
+    # 점수가 다 낮게 몰리기 때문임).
+    #
+    # 성능 차이는 거의 없음 - 상위 10편의 구성이 달라진 문항이 348개 중 2개뿐이었음.
+    # 그래도 이렇게 두는 이유는, 재정렬기가 판단을 못 하는 자리에서 1차 검색의 판단을
+    # 따르는 것이 아무 근거 없는 순서보다 낫기 때문임.
+    order = np.argsort(-scores, kind="stable")[:top_k]
     out: list[ScoredPaper] = []
     for rank, i in enumerate(order, start=1):
         c = candidates[int(i)]
         out.append(ScoredPaper(paper_id=c.paper_id, score=float(scores[int(i)]),
                                rank=rank, title=c.title, abstract=c.abstract))
     return out
+
+
+DEFAULT_LLM_RERANKER = "BAAI/bge-reranker-v2-gemma"
+
+# 'Yes' 앞에 붙이는 지시문. 이 모델이 학습된 형식 그대로임 - 형식을 바꾸면 점수가 무너짐.
+_LLM_PROMPT = ("Given a query A and a passage B, determine whether the passage contains "
+               "an answer to the query by providing a prediction of either 'Yes' or 'No'.")
+
+
+class LLMReranker:
+    """언어 모델을 재정렬기로 씀. 'Yes' 를 낼 로짓값을 관련도 점수로 삼음.
+
+    ## 왜 이것이 필요한가 (2026-08-17 진단, ISSUE #41)
+
+    지금 쓰는 `bge-reranker-v2-m3` 와 검색에 쓰는 `bge-m3` 는 **바탕 모델이 같음** -
+    둘 다 XLM-RoBERTa-large(24층, 은닉 1024, 어휘 250002)를 BAAI 가 다르게 미세조정한
+    것임. 바탕이 같으니 모르는 것도 같아서, 1차 검색이 어렵게 후보에 넣은 정답을
+    재정렬이 다시 '무관' 으로 판정함. 일상어 층에서 정답 점수 중앙값이 0.0081 이었음.
+
+    그래서 **바탕이 다른** 모델이 필요함. `bge-reranker-v2-gemma` 는 Gemma(2.51B) 라는
+    언어 모델이 바탕이라, XLM-RoBERTa 에 없는 분야 지식이 있을 가능성이 있음.
+
+    ## CrossEncoderReranker 와 무엇이 다른가
+
+    | | 교차 인코더 | 이쪽 |
+    |---|---|---|
+    | 구조 | `...ForSequenceClassification` | `GemmaForCausalLM` |
+    | 점수의 정체 | 분류 머리 출력에 시그모이드 -> 0~1 | 'Yes' 낱말의 로짓 -> 대략 -10~+10 |
+    | sentence-transformers `CrossEncoder` | 씀 | **못 씀** (분류 머리가 없음) |
+
+    **점수 눈금이 다르므로 `app.py` 의 `MIN_RERANK_SCORE` 를 그대로 쓰면 안 됨.**
+    모델을 바꾸면 반드시 다시 재야 함(`--calibrate-threshold`).
+    """
+
+    name = "llm_reranker"
+
+    def __init__(self, model_name: str = DEFAULT_LLM_RERANKER,
+                 device: str | None = None, max_length: int = 512,
+                 batch_size: int = 8, load_in_4bit: bool = False):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if load_in_4bit:
+            # 8GB 배포용. fp16 5.01GB 가 약 1.8GB 로 줄지만 점수가 달라지므로 다시 재야 함.
+            from transformers import BitsAndBytesConfig
+            kw = {"quantization_config": BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)}
+        else:
+            kw = {"dtype": torch.float16 if torch.cuda.is_available() else torch.float32}
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, **kw)
+        if device:
+            self.model = self.model.to(device)
+        elif torch.cuda.is_available() and not load_in_4bit:
+            self.model = self.model.cuda()
+        self.model.eval()
+
+        # 'Yes' 한 낱말의 번호. 이 자리의 로짓이 곧 점수임.
+        self.yes_id = self.tokenizer("Yes", add_special_tokens=False)["input_ids"][-1]
+        self.max_length = max_length
+        self.batch_size = batch_size
+
+    def _pairs_text(self, query: str, c: ScoredPaper) -> str:
+        """이 모델이 학습된 형식 그대로 만듦.
+
+        **지시문이 맨 뒤에 와야 함.** 다음 낱말을 예측하는 모델이라, 바로 앞에 무엇이
+        있느냐가 예측을 결정함. 지시문을 앞에 두면 모델이 'Yes' 를 낼 자리가 아니게 되어
+        점수가 무의미해짐 (2026-08-17 에 실제로 겪음 - 오류는 안 나고 Recall 만 0 이 됨).
+        """
+        return f"A: {query}\nB: {_doc_text(c)}\n{_LLM_PROMPT}"
+
+    def _score(self, texts: list[str]) -> np.ndarray:
+        import torch
+
+        out: list[float] = []
+        left_pad = self.tokenizer.padding_side == "left"
+        for s in range(0, len(texts), self.batch_size):
+            enc = self.tokenizer(
+                texts[s:s + self.batch_size],
+                return_tensors="pt", padding=True, truncation=True,
+                max_length=self.max_length).to(self.model.device)
+            with torch.no_grad():
+                logits = self.model(**enc).logits
+            # 마지막 '진짜' 낱말의 자리를 읽어야 함. 채움(padding)이 어느 쪽에 붙는지에
+            # 따라 그 자리가 다름 - Gemma 계열은 왼쪽 채움이라 항상 맨 끝이고, 오른쪽
+            # 채움이면 실제 길이 - 1 임. 이 자리를 잘못 잡으면 채움 자리의 로짓을 읽는데
+            # 오류는 안 나고 조용히 순위만 무너짐 (ISSUE #28 과 같은 종류의 함정임).
+            if left_pad:
+                picked = logits[:, -1, self.yes_id]
+            else:
+                last = enc["attention_mask"].sum(dim=1) - 1
+                picked = logits[torch.arange(logits.size(0)), last, self.yes_id]
+            out.extend(picked.float().cpu().tolist())
+        return np.asarray(out, dtype=np.float64)
+
+    def rerank(self, query: str, candidates: list[ScoredPaper],
+               top_k: int = 10) -> list[ScoredPaper]:
+        if not candidates:
+            return []
+        return _reorder(candidates,
+                        self._score([self._pairs_text(query, c) for c in candidates]),
+                        top_k)
+
+    def rerank_batch(self, queries: list[str],
+                     candidate_lists: list[list[ScoredPaper]],
+                     top_k: int = 10) -> list[list[ScoredPaper]]:
+        """평가용. 문항 경계를 기억해 두고 한 번에 채점함 (CrossEncoderReranker 와 같은 규약)."""
+        texts, spans = [], []
+        for q, cands in zip(queries, candidate_lists):
+            start = len(texts)
+            texts.extend(self._pairs_text(q, c) for c in cands)
+            spans.append((start, len(texts)))
+        if not texts:
+            return [[] for _ in queries]
+        scores = self._score(texts)
+        return [_reorder(cands, scores[s:e], top_k)
+                for cands, (s, e) in zip(candidate_lists, spans)]
 
 
 def rerank_by_similarity(query: str, candidates: list[ScoredPaper], embedder,

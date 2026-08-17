@@ -362,13 +362,26 @@ def rerank_query_of(row: dict, mode: str) -> str:
 
 def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
                 rrf_k: int, weights: dict[str, float], batch_size: int = 32,
-                query_mode: str = "raw") -> None:
+                query_mode: str = "raw", channel_depth: int | None = None) -> None:
     """저장된 결과를 융합한 뒤 상위 `depth` 편을 재정렬해 `reranked_ids` 로 채움.
 
     검색은 한 번도 하지 않음. 후보 본문을 못 찾은 논문은 후보에서 빠지는데, 그 논문이
     정답이면 손해이므로 몇 편이나 빠졌는지 반드시 보고함(조용히 성능이 깎이는 자리임).
+
+    channel_depth: 융합 전에 채널마다 몇 편까지만 볼지. 실행 결과 파일에 서비스보다 깊게
+        저장돼 있을 때 서비스와 조건을 맞추는 자리임. 안 주면 저장된 것을 다 씀.
+        `runs/dev_mq_w1_d100.jsonl` 은 채널당 300편이 저장돼 있는데 서비스는 채널당
+        100편만 가져오므로(app.py 의 DEPTH_LOCAL), 안 맞추면 상한이 0.675 대신 0.684 로
+        부풀려짐. #10, #13, #39, #40 과 같은 종류의 어긋남임.
+
+    점수를 함께 저장하는 이유:
+        교차 인코더는 후보를 하나씩 독립적으로 채점함. 어떤 논문의 점수는 같은 목록에
+        무엇이 더 들어 있는지와 무관함. 그래서 깊이 200으로 한 번 채점해 두면, 깊이 100의
+        결과는 '융합 상위 100편만 골라 저장된 점수로 다시 줄 세우기' 로 정확히 같은 값이
+        나옴. 재정렬을 깊이마다 다시 돌릴 필요가 없음.
     """
-    cand_ids = [fused_ids_of(r, rrf_k, top_n=depth, weights=weights) for r in rows]
+    cand_ids = [fused_ids_of(r, rrf_k, top_n=depth, weights=weights,
+                             depth=channel_depth) for r in rows]
     wanted = {pid for ids in cand_ids for pid in ids}
     print(f"재정렬 후보 본문 수집: 고유 논문 {len(wanted):,}편 ...", flush=True)
     texts = lookup.fetch(wanted)
@@ -393,6 +406,12 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
         from src.retrieval.ranking import CrossEncoderReranker, DEFAULT_RERANKER
         reranker = CrossEncoderReranker(DEFAULT_RERANKER, batch_size=batch_size)
         ranked = reranker.rerank_batch(queries, cand_lists, top_k=depth)
+    elif method == "llm":
+        # 언어 모델 재정렬기 (bge-reranker-v2-gemma). 점수 눈금이 교차 인코더와 다름 -
+        # 시그모이드 0~1 이 아니라 로짓이므로 MIN_RERANK_SCORE 를 그대로 쓰면 안 됨.
+        from src.retrieval.ranking import DEFAULT_LLM_RERANKER, LLMReranker
+        reranker = LLMReranker(DEFAULT_LLM_RERANKER, batch_size=batch_size)
+        ranked = reranker.rerank_batch(queries, cand_lists, top_k=depth)
     elif method == "embedding":
         from sentence_transformers import SentenceTransformer
 
@@ -405,12 +424,150 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
 
     for r, papers in zip(rows, ranked):
         r["reranked_ids"] = [p.paper_id for p in papers]
+        # 점수를 함께 남김. 이게 없으면 '정답과 오답의 점수가 얼마나 벌어졌는가' 를
+        # 보려고 재정렬을 통째로 다시 돌려야 함. 깊이를 바꿔 가며 재는 것도 이 값으로 함.
+        r["rerank_scores"] = [round(float(p.score), 6) for p in papers]
         # 어느 깊이로 재정렬했는지 문항에 새겨 둠. 이게 없으면 나중에 이 파일을 다시
         # 집계할 때 명령줄 기본값(fuse_top_n)으로 상한을 계산해 버림 - ISSUE #26 과
         # 똑같은 어긋남이 재집계 단계에서 되살아나는 자리임.
         r["rerank_depth"] = depth
         r["rerank_method"] = method
     print(f"재정렬 완료: {len(rows)}문항, 방식 {method}, 깊이 {depth}")
+
+
+# -- 재정렬 진단 (저장된 점수만 씀, 재실행 없음) -----------------------------
+#
+# `print_report` 는 "얼마나 맞혔는가"를 셈. 여기서는 "왜 틀렸는가"를 가름. 재정렬이
+# 정답을 상위 10편에서 버릴 때 원인이 둘인데 처방이 정반대임.
+#
+#   가) 정답과 오답의 점수가 거의 같아서 밀림 -> 구분력을 보태야 함
+#                                             (1차 검색 순위 함께 쓰기, 동점 처리 고치기)
+#   나) 정답에 확신을 갖고 낮은 점수를 줌      -> 모델을 바꿔야 함
+#
+# 점수를 저장하기 전에는 이 둘을 가를 방법이 없었음 (2026-08-17 부터 저장함).
+#
+# 자르는 위치(RERANK_DEPTH)도 여기서 함께 잼. 교차 인코더는 후보를 하나씩 독립적으로
+# 채점하므로, 어떤 논문의 점수는 같은 목록에 무엇이 더 들어 있는지와 무관함. 그래서
+# 깊이 200 으로 한 번 채점해 두면 깊이 100 의 결과는 '융합 상위 100편만 골라 저장된
+# 점수로 다시 줄 세우기' 로 정확히 같은 값이 나옴. 깊이마다 재정렬을 돌릴 필요가 없음.
+
+TIERS = ("전체", "easy", "medium", "hard")
+
+
+def _score_map(row: dict) -> dict[str, float]:
+    return dict(zip(row.get("reranked_ids") or [], row.get("rerank_scores") or []))
+
+
+def _top10_at_depth(row: dict, depth: int, rrf_k: int, weights: dict[str, float],
+                    channel_depth: int | None) -> list[str]:
+    """깊이 `depth` 로 잘랐을 때의 최종 상위 10편.
+
+    본문을 못 찾아 재정렬에서 빠진 논문은 점수가 없으므로 목록에서도 빠짐. 실제 실행과
+    같은 처리임 (`rerank_rows` 가 `kept` 로 거르는 것과 같음).
+    """
+    scores = _score_map(row)
+    fused = fused_ids_of(row, rrf_k, top_n=depth, weights=weights, depth=channel_depth)
+    kept = [pid for pid in fused if pid in scores]
+    kept.sort(key=lambda p: -scores[p])
+    return kept[:10]
+
+
+def diagnose_rerank(rows: list[dict], depths: list[int], rrf_k: int,
+                    weights: dict[str, float], channel_depth: int | None) -> None:
+    """자르는 위치, 점수 분포, 동점 세 가지를 한 번에 봄."""
+    from evaluation.metrics import paired_bootstrap
+
+    missing = sum(1 for r in rows if not r.get("rerank_scores"))
+    if missing:
+        raise SystemExit(f"재정렬 점수가 없는 문항이 {missing}개 있다. "
+                         f"--rerank cross 로 다시 만들어야 한다 (점수 저장은 2026-08-17 부터임)")
+
+    # (1) 자르는 위치별 Recall@10
+    # 짝지은 검정을 하려면 질문 번호를 열쇠로 들고 있어야 함 (paired_bootstrap 규약).
+    hits: dict[int, dict] = {}
+    for d in depths:
+        per: dict[str, dict[str, float]] = {t: {} for t in TIERS}
+        for r in rows:
+            ok = float(r["gold_id"] in _top10_at_depth(r, d, rrf_k, weights, channel_depth))
+            per["전체"][r["query_id"]] = ok
+            per.setdefault(r.get("difficulty", "?"), {})[r["query_id"]] = ok
+        hits[d] = per
+
+    print("\n" + "=" * 74)
+    print("## 자르는 위치(RERANK_DEPTH)별 Recall@10")
+    print("   후보가 채널당 100편씩 최대 200편이므로, 깊이 200 은 '한 편도 안 버림' 임.")
+    print(f"\n{'깊이':>6}" + "".join(f"{t:>10}" for t in TIERS) + f"{'평균 후보 수':>14}")
+    for d in depths:
+        n_cand = np.mean([len(fused_ids_of(r, rrf_k, top_n=d, weights=weights,
+                                           depth=channel_depth)) for r in rows])
+        print(f"{d:>6}" + "".join(
+            f"{np.mean(list(hits[d][t].values())):>10.3f}" for t in TIERS)
+              + f"{n_cand:>14.1f}")
+
+    base = depths[0]
+    print(f"\n## 깊이 {base} 대비 차이 (같은 문항끼리 짝지어 부트스트랩)")
+    for d in depths[1:]:
+        for t in TIERS:
+            a, b = hits[base][t], hits[d][t]
+            if not a:
+                continue
+            res = paired_bootstrap(a, b)
+            mark = "유의미" if res["p_value"] < 0.05 else "판정 불가"
+            print(f"   깊이 {d:>3}  {t:<8} {res['delta']:+.3f}  "
+                  f"[{res['ci_low']:+.3f},{res['ci_high']:+.3f}]  "
+                  f"p={res['p_value']:.3f}  {mark}")
+
+    # (2) 정답이 후보에 있었는데 밀려난 문항의 점수
+    depth = depths[-1]
+    lost_gold, lost_top1, lost_gap = {}, {}, {}
+    for r in rows:
+        scores, gold = _score_map(r), r["gold_id"]
+        fused = fused_ids_of(r, rrf_k, top_n=depth, weights=weights, depth=channel_depth)
+        if gold not in scores or gold not in fused:
+            continue
+        if gold in _top10_at_depth(r, depth, rrf_k, weights, channel_depth):
+            continue
+        tier = r.get("difficulty", "?")
+        pool = sorted((scores[p] for p in fused if p in scores), reverse=True)
+        tenth = pool[9] if len(pool) > 10 else pool[-1]
+        lost_gold.setdefault(tier, []).append(scores[gold])
+        lost_top1.setdefault(tier, []).append(pool[0])
+        lost_gap.setdefault(tier, []).append(tenth - scores[gold])
+
+    print("\n" + "=" * 74)
+    print(f"## 정답이 후보에 있었는데 상위 10에서 밀린 문항 (깊이 {depth})")
+    print(f"\n   {'난이도':<8}{'문항':>5}{'정답 점수(중앙)':>17}"
+          f"{'1등 점수(중앙)':>17}{'10등과의 차이(중앙)':>21}")
+    for t in TIERS[1:]:
+        if not lost_gold.get(t):
+            continue
+        print(f"   {t:<10}{len(lost_gold[t]):>5}{np.median(lost_gold[t]):>17.4f}"
+              f"{np.median(lost_top1[t]):>17.4f}{np.median(lost_gap[t]):>21.4f}")
+    print("\n   '10등과의 차이' 가 0 에 가까우면 아슬아슬하게 밀린 것이고(구분력 문제),")
+    print("   크면 모델이 확신을 갖고 정답을 낮게 본 것임(모델 문제). 처방이 서로 다름.")
+
+    # (3) 동점 - np.argsort 가 안정 정렬이 아니라 순서가 정해지지 않는 자리
+    print("\n" + "=" * 74)
+    print("## 동점 (fp16 반올림으로 원래 다른 점수가 같아질 수 있음)")
+    per = {t: [0, 0, 0] for t in TIERS}       # [이웃 동점쌍, 후보 총수, 상위 10 안 동점]
+    for r in rows:
+        s = r.get("rerank_scores") or []
+        keys = ("전체", r.get("difficulty", "?"))
+        for key in keys:
+            per.setdefault(key, [0, 0, 0])[1] += len(s)
+        for i in range(len(s) - 1):
+            if s[i] == s[i + 1]:
+                for key in keys:
+                    per[key][0] += 1
+                    if i < 10:
+                        per[key][2] += 1
+    print(f"\n   {'난이도':<8}{'이웃 동점쌍':>13}{'후보 총수':>12}{'비율':>10}{'상위10 안':>12}")
+    for t in TIERS:
+        ties, total, top = per[t]
+        if total:
+            print(f"   {t:<10}{ties:>13,}{total:>12,}{ties/total:>10.4f}{top:>12,}")
+    print("\n   상위 10 안 동점이 0 이 아니면 그 자리의 순서는 지금 정해져 있지 않음.")
+    print("   ranking.py 의 np.argsort 에 kind='stable' 을 주면 1차 검색 순서가 유지됨.")
 
 
 # -- 보고 ------------------------------------------------------------------
@@ -832,9 +989,16 @@ def main() -> None:
                     help="채널 가중치. 예: 'arxiv=1.0,local_dense=2.0'")
     ap.add_argument("--fuse-top-n", type=int, default=200, help="융합 결과를 몇 편까지 볼지")
 
-    ap.add_argument("--rerank", default="none", choices=["none", "cross", "embedding"],
+    ap.add_argument("--rerank", default="none",
+                    choices=["none", "cross", "embedding", "llm"],
                     help="재정렬 방식. 저장된 결과 위에서 돌아가므로 검색은 다시 하지 않는다")
     ap.add_argument("--rerank-depth", type=int, default=100, help="재정렬에 넣을 후보 수")
+    ap.add_argument("--channel-depth", type=int, default=None,
+                    help="융합 전에 채널마다 몇 편까지만 볼지 (서비스와 조건을 맞출 때 씀)")
+    ap.add_argument("--diagnose", default=None,
+                    help="재정렬 진단: 저장된 재정렬 점수로 자르는 위치, 점수 분포, 동점을 봄")
+    ap.add_argument("--diagnose-depths", type=int, nargs="+", default=[100, 150, 200],
+                    help="--diagnose 에서 견줄 자르는 위치 목록")
     ap.add_argument("--rerank-query", default="raw", choices=["raw", "rewritten"],
                     help="재정렬기에 넣을 질문. raw(기본)는 원본, rewritten 은 변환 결과. "
                          "한국어를 영어로 옮기는 변환기를 쓸 때만 rewritten 이 의미가 있음")
@@ -873,6 +1037,15 @@ def main() -> None:
 
     weights = parse_weights(args.weights)
 
+    # -- 재정렬 진단 모드 (검색 0회, 재정렬 0회) ---------------------------
+    if args.diagnose:
+        rows = [r for r in read_jsonl(Path(args.diagnose))
+                if not r.get("_meta") and r.get("gold_id")]
+        print(f"문항 {len(rows)}개, 파일 {args.diagnose}")
+        diagnose_rerank(rows, args.diagnose_depths, args.rrf_k, weights,
+                        args.channel_depth)
+        return
+
     # -- 재집계 전용 모드 (검색 0회) ---------------------------------------
     if args.report_only:
         path = Path(args.report_only)
@@ -891,7 +1064,8 @@ def main() -> None:
             lookup = TextLookup(args.index, args.corpus,
                                 None if args.no_cache else CACHE_PATH)
             rerank_rows(rows, args.rerank, args.rerank_depth, lookup,
-                        args.rrf_k, weights, args.batch_size, args.rerank_query)
+                        args.rrf_k, weights, args.batch_size, args.rerank_query,
+                        args.channel_depth)
             # 재정렬 결과를 파일에 되써서 재사용함 (실행 정보 _meta 줄은 그대로 보존).
             # --out 을 주면 원본을 건드리지 않고 새 파일로 씀 - 같은 검색 결과에서
             # 채널 조합을 여러 가지로 갈라 볼 때 서로 덮어쓰지 않기 위함임.
@@ -942,7 +1116,8 @@ def main() -> None:
         lookup = TextLookup(args.index, args.corpus,
                             None if args.no_cache else CACHE_PATH)
         rerank_rows(results, args.rerank, args.rerank_depth, lookup,
-                    args.rrf_k, weights, args.batch_size, args.rerank_query)
+                    args.rrf_k, weights, args.batch_size, args.rerank_query,
+                    args.channel_depth)
 
     meta = {"_meta": True, "rewriter": args.rewriter, "queries": args.queries,
             "channels": args.channels, "k": args.k, "rrf_k": args.rrf_k,
