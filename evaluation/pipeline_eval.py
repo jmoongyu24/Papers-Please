@@ -95,6 +95,7 @@ DEFAULT_K_VALUES = (1, 5, 10, 30, 50, 100)
 CHANNEL_QUERY_FIELD = {
     "arxiv": "arxiv",              # 키워드 검색용 (필드 지정, 불리언 연산자가 든 문자열)
     "local_dense": "raw",          # 의미 검색용 - 기본은 원본 질문 (서비스와 같게)
+    "local_hyde": "hyde",          # 같은 색인을 가상 초록으로 한 번 더 찾음
 }
 
 
@@ -143,17 +144,110 @@ def parse_weights(spec: str | None) -> dict[str, float]:
 
 
 # -- 채널 만들기 ------------------------------------------------------------
-def build_channel(name: str, args) -> object:
-    """이름으로 검색 채널(검색기)을 만듦. 모두 `search(query, k)` 인터페이스를 따름."""
-    if name == "arxiv":
-        from src.retrieval.arxiv_live import ArxivLiveRetriever
-        return ArxivLiveRetriever(cache_path=None if args.no_cache else CACHE_PATH)
+def build_channels(names: list[str], args) -> dict[str, object]:
+    """이름 목록으로 검색 채널을 만듦. 모두 `search(query, k)` 인터페이스를 따름.
 
-    if name == "local_dense":
-        from src.retrieval.local_index import LocalDenseRetriever
-        return LocalDenseRetriever(args.corpus, args.index, mmap=args.mmap)
+    로컬 색인을 쓰는 채널이 여럿이어도 **색인은 한 벌만 올림.** 임베딩이 2.93GB 라
+    채널마다 새로 올리면 시스템 메모리 15GB 에서 바로 터짐. 서비스(`app.py`)도
+    색인 한 벌에 검색어를 두 번 넣는 방식이라 이것이 서비스와도 같은 조건임.
+    """
+    out: dict[str, object] = {}
+    local = None
+    for name in names:
+        if name == "arxiv":
+            from src.retrieval.arxiv_live import ArxivLiveRetriever
+            out[name] = ArxivLiveRetriever(cache_path=None if args.no_cache else CACHE_PATH)
+            continue
 
-    raise ValueError(f"알 수 없는 채널 이름: {name} (쓸 수 있는 것: arxiv, local_dense)")
+        if name in ("local_dense", "local_hyde"):
+            if local is None:
+                from src.retrieval.local_index import LocalDenseRetriever
+                # 색인을 만든 모델과 질문을 임베딩하는 모델은 **반드시 같아야 함.**
+                # 다르면 오류가 안 나고 검색 결과만 조용히 무너짐 - 미세조정한 색인을
+                # 옛 모델로 찾는 사고를 막으려고 인자로 받음.
+                local = LocalDenseRetriever(
+                    args.corpus, args.index, mmap=args.mmap,
+                    model_name=getattr(args, "embed_model", None) or config.EMBED_MODEL)
+            out[name] = local if name == "local_dense" else LocalHydeChannel(local)
+            continue
+
+        raise ValueError(f"알 수 없는 채널 이름: {name} "
+                         f"(쓸 수 있는 것: arxiv, local_dense, local_hyde)")
+    return out
+
+
+class LocalHydeChannel:
+    """가상 초록을 검색어로 삼아 로컬 색인을 한 번 더 찾는 채널.
+
+    색인은 `local_dense` 채널과 같은 것을 공유함. 이 껍데기가 하는 일은 하나뿐임 -
+    검색어가 비었으면 검색하지 않고 빈 결과를 돌려줌. 가상 초록 생성이 실패했을 때
+    원본 질문으로 대신 찾으면 로컬 색인이 같은 검색어로 두 번 표를 던지게 되어
+    서비스(`app.py`)와 다른 순위가 나오기 때문임.
+    """
+
+    def __init__(self, retriever):
+        self.retriever = retriever
+
+    def search(self, query: str, k: int = 100):
+        if not query or not query.strip():
+            return []
+        return self.retriever.search(query, k=k)
+
+
+class ReplayRewriter:
+    """이전 실행 결과에 저장된 검색어를 그대로 다시 씀. 변환기를 아예 부르지 않음.
+
+    ## 왜 필요한가 (색인만 바꿔 견줄 때는 이것을 반드시 쓸 것)
+
+    미세조정한 색인이 좋아졌는지 보려면 **검색어는 같고 색인만 달라야 함.** 그런데
+    서비스 구성의 두 번째 검색어인 가상 초록은 온도 0.7 로 생성되므로 **실행마다 달라짐.**
+    ISSUE #45 에서 같은 구성을 다시 돌렸더니 일상어 층이 0.207 에서 0.181 로 움직였음
+    (116문항이라 실행 간 흔들림이 ±0.03).
+
+    새로 생성하면 색인이 만든 차이와 생성이 만든 흔들림이 섞여서, 우리가 찾는 크기
+    (기준 +0.08)를 잡아낼 수 없음. 저장된 검색어를 그대로 다시 쓰면 그 흔들림이 0 이 됨.
+
+    덤으로 언어 모델 호출이 사라져 실행이 30분 넘게 빨라짐.
+
+    ## 검색어를 질문 글로 찾는 이유
+
+    변환기 규약(`rewrite(raw_query)`)에는 문항 번호가 안 넘어옴. 평가셋은 질문 글이
+    문항마다 다르므로(개발용 348개 · 시험용 342개 전부 고유) 글을 열쇠로 써도 안전함.
+    실행할 때 몇 개가 짝을 못 찾았는지 세어 보고함 - 0 이 아니면 다른 평가셋의 결과
+    파일을 준 것임.
+
+    ## 검색어를 채널 이름으로 담는 이유
+
+    저장된 `search_queries` 는 채널 이름(`local_dense` · `local_hyde`)이 열쇠임.
+    그래서 `--reuse-queries` 를 주면 채널이 자기 이름으로 검색어를 찾도록 `query_fields`
+    도 함께 바꿔 줌(`main()` 참고). 안 그러면 `local_dense` 가 "raw" 를 찾다가 원본
+    질문으로 돌아가 번역문이 통째로 빠짐 - 오류는 안 나고 성능만 조용히 떨어짐.
+    """
+
+    name = "replay"
+
+    def __init__(self, run_path: str | Path):
+        self.by_text: dict[str, dict[str, str]] = {}
+        for r in read_jsonl(Path(run_path)):
+            if r.get("_meta") or not r.get("search_queries"):
+                continue
+            self.by_text[r["text"]] = dict(r["search_queries"])
+        self.n_missing = 0
+        if not self.by_text:
+            raise ValueError(f"{run_path} 에 저장된 검색어가 없다")
+        print(f"검색어 다시 쓰기: {run_path} 에서 문항 {len(self.by_text):,}개분을 읽었다 "
+              f"(채널 {sorted(next(iter(self.by_text.values())))})")
+
+    def rewrite(self, raw_query: str) -> "RewriteResult":
+        from src.schemas import RewriteResult
+
+        saved = self.by_text.get(raw_query)
+        if saved is None:
+            self.n_missing += 1
+            return RewriteResult(raw_query=raw_query, queries={}, intent="(저장된 검색어 없음)",
+                                 parse_ok=False)
+        return RewriteResult(raw_query=raw_query, queries=saved, intent=saved.get("local_dense", ""),
+                             parse_ok=True)
 
 
 # -- 질문 하나 평가 ---------------------------------------------------------
@@ -968,8 +1062,14 @@ def main() -> None:
     ap.add_argument("--local-query", default="raw", choices=["raw", "rewritten"],
                     help="로컬 의미 검색에 넣을 검색어. raw(기본)는 원본 질문으로 **서비스와 "
                          "같은 조건**이다. rewritten 은 변환 결과를 넣는다 (파일 위 설명 참고)")
+    ap.add_argument("--reuse-queries", default=None,
+                    help="이전 실행 결과의 검색어를 그대로 다시 쓴다(변환기를 안 부름). "
+                         "**색인만 바꿔 견줄 때는 반드시 이것을 쓸 것** - 가상 초록은 온도 "
+                         "0.7 로 생성되어 실행마다 달라지므로, 새로 만들면 색인이 만든 차이와 "
+                         "생성 흔들림(일상어 층 ±0.03)이 섞인다")
     ap.add_argument("--rewriter", default="passthrough",
-                    help="변환기 이름 (passthrough / hierarchical / single_step / hyde / finetuned / dpo)")
+                    help="변환기 이름 (passthrough / translate / service / hierarchical / "
+                         "single_step / hyde / finetuned / dpo). service 가 app.py 와 같은 조합임")
     ap.add_argument("--k", type=int, default=100, help="채널마다 가져올 결과 수")
     ap.add_argument("--k-values", type=int, nargs="+", default=list(DEFAULT_K_VALUES))
     ap.add_argument("--limit", type=int, default=None, help="앞에서 N개만 (빠른 점검용)")
@@ -1008,6 +1108,9 @@ def main() -> None:
     ap.add_argument("--index", default=str(config.DATA_DIR / "embeddings" / "cs2021"))
     ap.add_argument("--mmap", action="store_true",
                     help="임베딩을 메모리에 올리지 않고 디스크에서 읽는다(메모리 절약, 느림)")
+    ap.add_argument("--embed-model", default=None,
+                    help="질문을 임베딩할 모델. **--index 를 만든 모델과 같아야 한다.** "
+                         "미세조정한 색인을 쓸 때 반드시 함께 준다 (예: models/bge-m3-papers)")
 
     ap.add_argument("--bench-service", action="store_true",
                     help="정확도가 아니라 응답 시간을 단계별로 잰다 (평가셋 대신 예시 질문)")
@@ -1096,12 +1199,19 @@ def main() -> None:
 
     results = [done[q["query_id"]] for q in queries if q["query_id"] in done]
     if todo:
-        rewriter = build_rewriter(args.rewriter)
-        channels = {name: build_channel(name, args) for name in args.channels}
-        print(f"평가 시작: 문항 {len(todo)}개, 변환기={args.rewriter} "
+        query_fields = None
+        if args.reuse_queries:
+            rewriter = ReplayRewriter(args.reuse_queries)
+            # 저장된 검색어는 채널 이름이 열쇠이므로, 채널이 자기 이름으로 찾게 바꿔 줌.
+            query_fields = {name: name for name in args.channels}
+        else:
+            rewriter = build_rewriter(args.rewriter)
+        channels = build_channels(args.channels, args)
+        print(f"평가 시작: 문항 {len(todo)}개, "
+              f"변환기={'replay(' + args.reuse_queries + ')' if args.reuse_queries else args.rewriter} "
               f",  채널={list(channels)}, k={args.k}")
 
-        fields = channel_query_fields(args.local_query)
+        fields = query_fields or channel_query_fields(args.local_query)
         t0 = time.time()
         for i, q in enumerate(todo, 1):
             results.append(evaluate_one(q, rewriter, channels, args.k, fields))
@@ -1111,6 +1221,12 @@ def main() -> None:
                 print(f"  {i}/{len(todo)}, 경과 {elapsed/60:.1f}분 "
                       f",  남은 예상 {eta/60:.1f}분", flush=True)
                 write_jsonl(out_path, results)      # 중간 저장 - 중단돼도 여기까지는 살아남음
+
+        # 저장된 검색어를 다시 쓰는 경우, 짝을 못 찾은 문항이 있으면 크게 알림.
+        # 다른 평가셋의 결과 파일을 준 것이고, 그대로 두면 원본 질문으로 검색해 버림.
+        if args.reuse_queries and getattr(rewriter, "n_missing", 0):
+            print(f"\n*** 경고: 저장된 검색어를 못 찾은 문항 {rewriter.n_missing}개. "
+                  f"--reuse-queries 파일이 --queries 와 같은 평가셋인지 확인할 것 ***\n")
 
     if args.rerank != "none":
         lookup = TextLookup(args.index, args.corpus,

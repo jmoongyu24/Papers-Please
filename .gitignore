@@ -32,3 +32,6 @@ models/
 data/cache/
 
 logs/
+
+# 임베딩 학습 쌍 - ft_queries.jsonl + 색인에서 다시 만들 수 있고 208MB 라 무거움
+data/training/embed_pairs_*.jsonl

@@ -352,6 +352,65 @@ class TranslateRewriter:
         )
 
 
+class ServiceRewriter:
+    """서비스(`app.py`)가 실제로 만드는 검색어 두 개를 한 번에 만듦.
+
+    ## 왜 이것이 필요한가 (2026-08-18)
+
+    `app.py` 는 검색어를 두 개 만들어 로컬 색인을 두 번 찾음.
+
+        dense  한국어면 영어로 옮긴 질문 (영어면 원본 그대로)
+        hyde   질문에 답할 법한 가상의 영어 초록
+
+    그런데 평가 하네스에는 이 조합을 만드는 변환기가 없었음. 확정 결과
+    `results/test_multiquery_d100.jsonl` 은 `local_hyde` 채널을 쓰는데 그 채널을 만드는
+    코드가 저장소 어디에도 없어서, **보고서에 실은 Recall@10 0.617 을 다시 만들 수
+    없는 상태였음.** 평가 경로와 서비스 경로가 갈라진 것이며 #10 · #13 · #39 와 같은
+    종류로 네 번째임.
+
+    ## app.py 와 반드시 같아야 하는 것 두 가지
+
+    1. **가상 초록은 원본 질문으로 만듦** (번역문이 아님). `app.py:358` 이 그러함.
+       번역문을 넣으면 다른 초록이 나와 평가와 서비스가 또 갈라짐.
+    2. **번역기와 가상 초록 생성기가 같은 Ollama 연결을 씀.** 따로 만들면 모델이
+       두 번 올라감.
+
+    ## 가상 초록 생성이 실패하면
+
+    `app.py` 는 그 채널을 통째로 건너뜀. 여기서는 영어 검색어로 되돌리는데, 그러면
+    로컬 색인이 같은 검색어로 두 번 표를 던지는 셈이 되어 서비스와 순위가 달라짐.
+    그래서 실패 횟수를 `n_hyde_failed` 에 세어 둠. **0 이 아니면 이 처리를 다시
+    설계해야 함** - 지금 프롬프트에서는 실패가 나지 않는 것을 확인하고 이렇게 둠.
+    """
+
+    name = "service"
+
+    def __init__(self, client: OllamaClient | None = None):
+        client = client or OllamaClient()
+        self.translator = TranslateRewriter(client)
+        self.hyde = HydeRewriter(client)
+        self.n_hyde_failed = 0
+
+    def rewrite(self, raw_query: str) -> RewriteResult:
+        tr = self.translator.rewrite(raw_query)
+        english = tr.query_for("dense")
+
+        hy = self.hyde.rewrite(raw_query)          # 번역문이 아니라 원본 질문
+        if hy.parse_ok:
+            abstract = hy.query_for("dense")
+        else:
+            self.n_hyde_failed += 1
+            abstract = english
+
+        return RewriteResult(
+            raw_query=raw_query,
+            queries={"sparse": english, "dense": english,
+                     "arxiv": raw_query, "hyde": abstract},
+            intent=english,
+            parse_ok=tr.parse_ok and hy.parse_ok,
+        )
+
+
 class HydeRewriter:
     """HyDE: 가상 초록을 생성해 의미(dense) 검색어로 씀.
 

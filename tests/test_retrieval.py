@@ -142,6 +142,124 @@ def test_fuse_ids_matches_full_fusion():
     assert rrf_fuse_ids(channels, k=60, top_n=10) == ["2103.00020", "2222.2222", "1111.1111"]
 
 
+# -- 서비스와 평가가 같은 순위를 내는가 (ISSUE #10 · #13 · #39 가 난 자리) --------
+#
+# `app.py` 는 검색어 2개의 결과를 `fuse_local()` 로 합치고, 평가 하네스는 저장된
+# 채널별 논문 번호를 `fused_ids_of()` 로 합침. 두 경로가 다른 순위를 내면 평가로 잰
+# 값이 서비스의 값이 아니게 됨. 같은 종류의 어긋남을 세 번 겪었으므로 못박아 둠.
+#
+# 이 시험은 모델도 색인도 쓰지 않음 - 합치는 규칙만 봄.
+
+def test_서비스와_평가의_후보_합치기가_같은_순위를_낸다():
+    import app
+    from evaluation.pipeline_eval import fused_ids_of
+    from src import config
+
+    literal = ["2103.00020", "1111.1111", "2222.2222v1", "3333.3333"]
+    hyde = ["2222.2222", "2103.00020v2", "4444.4444", "1111.1111"]
+
+    from_service = [p.paper_id for p in app.fuse_local(
+        [sp(pid, i) for i, pid in enumerate(literal, 1)],
+        [sp(pid, i) for i, pid in enumerate(hyde, 1)],
+    )]
+    from_eval = fused_ids_of(
+        {"channels": {"local_dense": literal, "local_hyde": hyde}},
+        rrf_k=config.RRF_K, top_n=app.RERANK_DEPTH, weights={},
+    )
+
+    assert from_service == from_eval, (
+        f"서비스와 평가의 순위가 다름\n  서비스 {from_service}\n  평가   {from_eval}")
+
+
+def test_가상_초록이_비면_그_채널은_검색하지_않는다():
+    """생성이 실패했을 때 원본 질문으로 대신 찾으면 로컬 채널이 표를 두 번 던짐."""
+    from evaluation.pipeline_eval import LocalHydeChannel
+
+    class 부르면안됨:
+        def search(self, query, k=100):
+            raise AssertionError("빈 검색어로 색인을 찾으면 안 됨")
+
+    ch = LocalHydeChannel(부르면안됨())
+    assert ch.search("", k=10) == []
+    assert ch.search("   ", k=10) == []
+
+
+def test_저장된_검색어를_그대로_다시_쓴다(tmp_path):
+    """색인만 바꿔 견줄 때, 가상 초록을 새로 만들면 생성 흔들림이 섞여 판정이 흐려짐."""
+    import json
+    from evaluation.pipeline_eval import ReplayRewriter
+
+    run = tmp_path / "run.jsonl"
+    run.write_text(json.dumps({
+        "query_id": "q1", "text": "사진 보고 글로 설명해주는 AI",
+        "search_queries": {"local_dense": "image captioning models",
+                           "local_hyde": "We propose a vision-language model ..."},
+    }, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    rw = ReplayRewriter(run)
+    got = rw.rewrite("사진 보고 글로 설명해주는 AI")
+
+    # 채널이 자기 이름으로 찾을 때 저장된 검색어가 나와야 함.
+    assert got.query_for("local_dense") == "image captioning models"
+    assert got.query_for("local_hyde").startswith("We propose")
+    assert rw.n_missing == 0
+
+    # 저장에 없는 질문은 세어 두어야 함 (다른 평가셋 파일을 준 경우를 잡기 위함)
+    missed = rw.rewrite("저장에 없는 질문")
+    assert missed.parse_ok is False and rw.n_missing == 1
+
+
+def test_색인을_만든_모델로_질문을_임베딩한다():
+    """미세조정한 색인을 옛 모델로 찾으면 오류 없이 검색 결과만 무너짐."""
+    from evaluation import pipeline_eval as pe
+
+    받은인자 = {}
+
+    class 가짜색인:
+        def __init__(self, *a, **kw):
+            받은인자.update(kw)
+
+    import src.retrieval.local_index as li_mod
+    진짜 = li_mod.LocalDenseRetriever
+    li_mod.LocalDenseRetriever = 가짜색인
+    try:
+        class Args:
+            corpus, index, mmap, no_cache = "c", "i", False, True
+            embed_model = "models/bge-m3-papers"
+        pe.build_channels(["local_dense"], Args())
+    finally:
+        li_mod.LocalDenseRetriever = 진짜
+
+    assert 받은인자.get("model_name") == "models/bge-m3-papers", (
+        f"색인을 만든 모델이 안 넘어갔음: {받은인자}")
+
+
+def test_평가_채널을_만들_때_로컬_색인은_한_벌만_올린다():
+    """임베딩이 2.93GB 라 채널마다 새로 올리면 시스템 메모리 15GB 에서 터짐."""
+    from evaluation import pipeline_eval as pe
+
+    만든횟수 = []
+
+    class 가짜색인:
+        def __init__(self, *a, **kw):
+            만든횟수.append(1)
+
+    import src.retrieval.local_index as li_mod
+    진짜 = li_mod.LocalDenseRetriever
+    li_mod.LocalDenseRetriever = 가짜색인
+    try:
+        class Args:
+            corpus, index, mmap, no_cache = "c", "i", False, True
+            embed_model = None
+        chans = pe.build_channels(["local_dense", "local_hyde"], Args())
+    finally:
+        li_mod.LocalDenseRetriever = 진짜
+
+    assert len(만든횟수) == 1, f"색인을 {len(만든횟수)}번 올렸음"
+    assert chans["local_hyde"].retriever is chans["local_dense"]
+
+
+
 # ==========================================================================
 # 색인과 코퍼스의 짝 맞추기
 # ==========================================================================

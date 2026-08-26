@@ -251,14 +251,36 @@ def build_gen_prompt(abstract: str, difficulty: str) -> str:
   "why_level": "왜 이 문장이 그 전문성 수준에 맞는지 한 문장"}}"""
 
 
+def first_category(paper: dict) -> str:
+    """논문의 첫 번째 분야. 분야별로 뽑을 때 층으로 씀.
+
+    `categories` 는 리스트임(`['math.NA', 'cs.NA']`). 예전에는 `str(...).split()[0]` 로
+    뽑았는데, 그러면 `"['math.NA',"` 와 `"['math.NA']"` 가 서로 다른 층이 됐음 - 분야가
+    하나뿐인 논문과 여럿인 논문이 갈려서, 같은 분야가 두 층이 되고 두 배로 뽑혔음.
+    코퍼스 71만 편에서 층이 156종이 아니라 197종으로 세어졌음.
+    """
+    cats = paper.get("categories") or []
+    if isinstance(cats, str):
+        cats = cats.split()
+    return cats[0] if cats else "?"
+
+
 def sample_papers(corpus: str, n: int, exclude: set[str], seed: int,
-                  min_abs_words: int = 80) -> list[dict]:
+                  min_abs_words: int = 80, sampling: str = "stratified") -> list[dict]:
     """코퍼스에서 논문을 뽑음. 이미 평가에 쓰인 정답 논문은 제외함.
 
     제외하는 이유(ISSUE #25): 같은 논문에서 옛 질문과 새 질문이 나오면 둘이 쌍둥이가 되어,
     옛 평가셋으로 고른 설정이 새 평가셋에서도 유리해짐. 새 시험지의 뜻이 없어짐.
 
     초록이 너무 짧은 논문은 뺌 - 질문을 만들 재료가 부족해 층이 구분되지 않음.
+
+    sampling
+      stratified   분야마다 돌아가며 고르게 뽑음. 평가셋(v2)을 만든 방식임.
+                   작은 분야도 큰 분야와 같은 수만큼 나옴.
+      proportional 코퍼스에 있는 분야 비율 그대로 뽑음. 실제 검색 상황과 같은 분포임.
+                   다만 평가셋은 stratified 로 만들어져 있어 분포가 서로 다름 -
+                   코퍼스의 45.9%인 cs.CV·cs.LG·cs.CL·cs.AI 가 개발용 평가셋에서는
+                   2.9%(348문항 중 10개)뿐임.
     """
     pool = []
     with open(corpus, encoding="utf-8") as f:
@@ -273,34 +295,49 @@ def sample_papers(corpus: str, n: int, exclude: set[str], seed: int,
                          "categories": r.get("categories", "")})
     print(f"후보 논문 {len(pool):,}편 (제외 {len(exclude)}편, 초록 {min_abs_words}낱말 미만 제외)")
 
-    # 분야가 한쪽으로 쏠리지 않게 첫 번째 분야 기준으로 층화 추출함
-    by_cat: dict[str, list[dict]] = {}
-    for p in pool:
-        by_cat.setdefault(str(p["categories"]).split()[0] if p["categories"] else "?", []).append(p)
     rng = random.Random(seed)
-    out, cats = [], sorted(by_cat, key=lambda c: -len(by_cat[c]))
-    i = 0
-    while len(out) < n and cats:
-        c = cats[i % len(cats)]
-        if by_cat[c]:
-            out.append(by_cat[c].pop(rng.randrange(len(by_cat[c]))))
-        else:
-            cats.remove(c)
-            continue
-        i += 1
-    rng.shuffle(out)
-    print(f"분야 층화 추출: {len(out)}편, 분야 {len({str(p['categories']).split()[0] for p in out})}종")
+    if sampling == "proportional":
+        # 코퍼스 비율 그대로. 그냥 무작위로 뽑으면 비율이 저절로 맞음.
+        out = rng.sample(pool, min(n, len(pool)))
+    else:
+        # 분야가 한쪽으로 쏠리지 않게 첫 번째 분야 기준으로 층화 추출함
+        by_cat: dict[str, list[dict]] = {}
+        for p in pool:
+            by_cat.setdefault(first_category(p), []).append(p)
+        out, cats = [], sorted(by_cat, key=lambda c: -len(by_cat[c]))
+        i = 0
+        while len(out) < n and cats:
+            c = cats[i % len(cats)]
+            if by_cat[c]:
+                out.append(by_cat[c].pop(rng.randrange(len(by_cat[c]))))
+            else:
+                cats.remove(c)
+                continue
+            i += 1
+        rng.shuffle(out)
+
+    got = Counter(first_category(p) for p in out)
+    print(f"{sampling} 추출: {len(out)}편, 분야 {len(got)}종")
+    print("   많은 분야: " + ", ".join(f"{k} {v}편({v/max(len(out),1):.1%})"
+                                    for k, v in got.most_common(6)))
     return out
 
 
-def call_openai(client, model: str, prompt: str) -> tuple[dict, dict]:
-    """한 번 호출해 JSON 과 토큰 사용량을 돌려줌."""
+def call_openai(client, model: str, prompt: str, effort: str = "") -> tuple[dict, dict]:
+    """한 번 호출해 JSON 과 토큰 사용량을 돌려줌.
+
+    effort: gpt-5 계열의 추론 강도. 안 주면 medium 이 걸림. 실측(2026-08-18, gpt-5-mini,
+    같은 프롬프트 20회)으로 minimal 은 추론 토큰 0, medium 은 1,382개였고 값이 6.9배
+    차이 났음. 질문 품질은 눈으로 봐서 차이를 못 찾았음.
+    """
     kwargs = dict(
         model=model,
         messages=[{"role": "system", "content": GEN_SYSTEM}, {"role": "user", "content": prompt}],
         response_format={"type": "json_schema",
                          "json_schema": {"name": "query", "strict": True, "schema": GEN_SCHEMA}},
     )
+    if effort:
+        kwargs["reasoning_effort"] = effort
     try:
         resp = client.chat.completions.create(**kwargs)
     except Exception as e:
@@ -326,7 +363,8 @@ def cmd_generate(args) -> None:
             exclude |= {normalize_paper_id(r["gold_id"]) for r in read_jsonl(p)
                         if not r.get("_meta")}
 
-    papers = sample_papers(args.corpus, args.n_papers, exclude, args.seed)
+    papers = sample_papers(args.corpus, args.n_papers, exclude, args.seed,
+                           sampling=args.sampling)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -348,7 +386,8 @@ def cmd_generate(args) -> None:
     t0 = time.time()
     for i, (p, d) in enumerate(todo, 1):
         try:
-            got, usage = call_openai(client, args.model, build_gen_prompt(p["abstract"], d))
+            got, usage = call_openai(client, args.model,
+                                     build_gen_prompt(p["abstract"], d), args.effort)
         except Exception as e:
             print(f"  실패 {p['id']}/{d}: {e}")
             continue
@@ -377,6 +416,7 @@ def cmd_generate(args) -> None:
 
     meta = {"_meta": {"produced_by": "evaluation.dataset generate",
                       "model": args.model, "n_papers": len(papers),
+                      "sampling": args.sampling, "effort": args.effort,
                       "difficulties": args.difficulties, "seed": args.seed,
                       "time": time.strftime("%Y-%m-%d %H:%M:%S"), "usage": total_usage}}
     write_jsonl(out_path, [meta] + rows)
@@ -515,12 +555,114 @@ def cmd_split(args) -> None:
 # 것은 편향이 아님 - 실제 서비스도 그 논문을 결과로 내놓음. ISSUE #22 에서 문제였던 것은
 # 정답 논문의 글을 읽고 검색어를 만든 것이지, 검색 결과로 내놓은 것이 아님.
 
+def pool_from_runs(run_paths: list[str], by_pair: dict[str, dict],
+                   depth: int, stage: str = "rerank") -> dict[str, list[str]]:
+    """실행 결과 파일들에서 각 짝의 상위 `depth` 편을 모음 (ISSUE #42).
+
+    ## 왜 필요한가
+
+    `cmd_pool` 의 기본 방식은 후보를 "원본 질문으로 로컬 의미 검색한 상위 20편" 으로만
+    만듦. 그러면 그 20편 밖으로 논문을 끌어올리는 구성일수록, 올린 논문이 실제로 좋아도
+    등급이 없어 0점으로 세어져 손해를 봄(`metrics.ndcg_at_k_single` 은 등급 없는 논문을
+    0 으로 셈). 그래서 만족도로 구성을 고를 수 없었음.
+
+    비교할 구성들이 실제로 상위 10편에 올린 논문을 전부 판정 대상에 넣으면 그 손해가
+    없어짐. 정보 검색에서 쓰는 표준 방식임.
+
+    ## 재정렬 전후를 비교하려면 stage="both" 여야 함
+
+    `reranked_ids` 만 모으면 '재정렬을 켠 구성' 의 상위 10편만 판정 대상이 됨. 그러면
+    재정렬을 끈 구성이 올린 논문은 등급이 없어 0점이 되고, 재정렬이 실제보다 좋아 보임.
+    stage="both" 는 융합(RRF) 직후의 상위 N편도 함께 모아 그 비교를 가능하게 함.
+
+    ## 새 구성을 비교할 때는 다시 돌려야 함
+
+    여기 넣지 않은 구성이 올리는 논문은 여전히 등급이 없음. 미세조정한 검색기처럼 새
+    구성을 비교하게 되면 그 구성의 상위 10편을 넣어 한 번 더 판정해야 함.
+    """
+    from evaluation.pipeline_eval import fused_ids_of
+    qid_to_pair = {}
+    for pair, langs in by_pair.items():
+        for r in langs.values():
+            qid_to_pair[r["query_id"]] = pair
+
+    # 논문마다 (몇 개의 실행 결과가 상위에 올렸나, 등수 합) 을 셈. --depth 로 자를 때
+    # 여러 구성이 함께 올린 논문부터 남기기 위함임 - 한 구성에만 나온 논문을 먼저 자르면
+    # 그 구성만 등급을 못 받아 다시 손해를 봄(#42 가 생긴 것과 같은 자리).
+    tally: dict[str, dict[str, list]] = defaultdict(dict)
+    for fp in run_paths:
+        n = 0
+        for r in read_jsonl(fp):
+            if r.get("_meta") or not r.get("query_id"):
+                continue
+            pair = qid_to_pair.get(r["query_id"])
+            if pair is None:
+                continue
+            lists = []
+            if stage in ("rerank", "both"):
+                lists.append(r.get("reranked_ids") or [])
+            if stage in ("fused", "both"):
+                lists.append(fused_ids_of(r, rrf_k=60, top_n=depth, weights={}))
+            for ids in lists:
+                for rank, pid in enumerate(
+                        [normalize_paper_id(x) for x in ids][:depth], 1):
+                    v = tally[pair].setdefault(pid, [0, 0])
+                    v[0] += 1
+                    v[1] += rank
+            n += 1
+        print(f"  {Path(fp).name:<28} 문항 {n}개 반영", flush=True)
+
+    pool: dict[str, list[str]] = {}
+    for pair, papers in tally.items():
+        pool[pair] = sorted(papers, key=lambda d: (-papers[d][0], papers[d][1]))
+    return pool
+
+
 def cmd_pool(args) -> None:
     rows = [r for r in read_jsonl(args.queries) if not r.get("_meta")]
     by_pair: dict[str, dict] = defaultdict(dict)
     for r in rows:
         by_pair[r["pair_id"]][r["lang"]] = r
     print(f"문항 {len(rows)}개, 짝 {len(by_pair)}개")
+
+    # 실행 결과에서 후보를 모으는 길. 검색을 새로 하지 않으므로 임베더가 필요 없음.
+    if args.from_runs:
+        from src.retrieval.local_index import LocalDenseRetriever
+        print(f"실행 결과 {len(args.from_runs)}개에서 상위 {args.from_runs_depth}편씩 모음",
+              flush=True)
+        picked = pool_from_runs(args.from_runs, by_pair, args.from_runs_depth,
+                                args.from_runs_stage)
+        print("코퍼스 불러오는 중... (짝 확인 포함)", flush=True)
+        t0 = time.time()
+        # embedder 를 넘겨 주면 SentenceTransformer 를 안 올림. 본문만 꺼내면 되기 때문임.
+        ret = LocalDenseRetriever(args.corpus, args.index, embedder=False, mmap=True)
+        print(f"코퍼스 준비 완료 ({time.time()-t0:.0f}초)", flush=True)
+
+        out = []
+        for pair, langs in sorted(by_pair.items()):
+            gold = normalize_paper_id(next(iter(langs.values()))["gold_id"])
+            ids = picked.get(pair, [])
+            # --depth 0 이면 자르지 않음. 여러 구성이 함께 올린 논문이 앞에 오도록
+            # pool_from_runs 가 이미 정렬해 두었으므로 앞에서부터 자르면 됨.
+            if args.depth:
+                ids = ids[: args.depth]
+            if gold not in ids:                    # 정답이 안 걸렸으면 반드시 넣음
+                ids = ids + [gold]
+            bodies = ret.get_by_ids(ids)
+            cands = [{"paper_id": pid,
+                      "title": (bodies.get(pid) or {}).get("title", ""),
+                      "abstract": (bodies.get(pid) or {}).get("abstract", ""),
+                      "found_by": ["run"]}
+                     for pid in ids]
+            out.append({
+                "pair_id": pair, "gold_id": gold,
+                "query_en": langs.get("en", {}).get("text", ""),
+                "query_ko": langs.get("ko", {}).get("text", ""),
+                "difficulty": next(iter(langs.values()))["difficulty"],
+                "candidates": cands,
+            })
+        _report_pool(out, args.out)
+        return
 
     from src.retrieval.local_index import LocalDenseRetriever
     print("색인 불러오는 중... (짝 확인 포함)", flush=True)
@@ -556,14 +698,19 @@ def cmd_pool(args) -> None:
         if i % 50 == 0:
             print(f"  {i}/{len(by_pair)} ({time.time()-t0:.0f}초)", flush=True)
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    write_jsonl(args.out, out)
+    _report_pool(out, args.out)
+
+
+def _report_pool(out: list[dict], out_path: str) -> None:
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    write_jsonl(out_path, out)
     n_cand = sum(len(r["candidates"]) for r in out)
     n_judge = sum(1 for r in out for c in r["candidates"] if c["paper_id"] != r["gold_id"])
     print(f"\n풀 {len(out)}짝, 후보 {n_cand:,}편")
     print(f"판정이 필요한 (질문,논문) 쌍: {n_judge:,}개 (정답 논문은 자동 3등급이라 제외)")
     print(f"예상 비용 (gpt-4.1-mini, 쌍당 약 $0.0002): 약 ${n_judge*0.0002:.2f}")
-    print(f"-> {args.out}")
+    print(f"   (이미 판정된 쌍은 grade 가 건너뛰므로 실제 청구액은 이보다 적음)")
+    print(f"-> {out_path}")
 
 
 # ==========================================================================
@@ -910,6 +1057,12 @@ def main() -> None:
     g.add_argument("--n-papers", type=int, default=200)
     g.add_argument("--model", default="gpt-5.4")
     g.add_argument("--difficulties", nargs="*", default=["easy", "medium", "hard"])
+    g.add_argument("--sampling", choices=["stratified", "proportional"], default="stratified",
+                   help="stratified 는 분야마다 고르게(평가셋 v2 를 만든 방식), "
+                        "proportional 은 코퍼스 분야 비율 그대로")
+    g.add_argument("--effort", default="",
+                   help="추론 모델의 추론 강도(minimal/low/medium/high). gpt-5 계열에서 "
+                        "안 주면 medium 이 걸려 호출당 추론 토큰이 1,400개 붙음")
     g.add_argument("--exclude-from", nargs="*",
                    default=["data/eval/dev.jsonl", "data/eval/test.jsonl"],
                    help="이 평가셋들의 정답 논문은 뽑지 않는다 (ISSUE #25)")
@@ -930,8 +1083,17 @@ def main() -> None:
     p.add_argument("--corpus", default=str(config.CORPUS_DIR / "corpus-cs2021.jsonl"))
     p.add_argument("--index", default=str(config.DATA_DIR / "embeddings" / "cs2021"))
     p.add_argument("--depth", type=int, default=20,
-                   help="짝당 후보 수. 깊을수록 이론적 상한 추정이 정확해지지만 판정비가 는다")
+                   help="짝당 후보 수. 깊을수록 이론적 상한 추정이 정확해지지만 판정비가 는다. "
+                        "0 이면 자르지 않음 (--from-runs 에서만 뜻이 있음)")
     p.add_argument("--per-lang", type=int, default=15, help="언어별로 몇 편까지 가져와 합칠지")
+    p.add_argument("--from-runs", nargs="*", default=[],
+                   help="실행 결과 파일들. 주면 검색을 새로 하지 않고 그 결과의 상위 "
+                        "N편을 후보로 씀 (ISSUE #42)")
+    p.add_argument("--from-runs-depth", type=int, default=10,
+                   help="--from-runs 를 쓸 때 실행 결과마다 상위 몇 편을 가져올지")
+    p.add_argument("--from-runs-stage", choices=["rerank", "fused", "both"], default="rerank",
+                   help="재정렬 후(reranked_ids)만 모을지, 융합 직후도 모을지. "
+                        "재정렬 전후를 nDCG 로 비교하려면 both 여야 함")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_pool)
 

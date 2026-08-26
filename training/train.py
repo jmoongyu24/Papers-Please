@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 
 # 학습에 쓰는 지시문. SFT 와 DPO 가 반드시 같아야 함 - 형식이 다르면 앞서 배운 것이
 # 흐트러짐. 실제 서비스에서 쓰는 프롬프트와도 형식을 맞춰야 학습 효과가 삶.
@@ -246,10 +247,403 @@ def cmd_dpo(args) -> None:
     print("서비스와 평가에서 쓰려면 변환기 이름을 'dpo' 로 부르면 된다.")
 
 
+
+# ==========================================================================
+# 검색 모델(임베딩) 미세조정
+# ==========================================================================
+#
+# ## 무엇을 왜 하는가
+#
+# 지금 막힌 곳은 재정렬이 아니라 1차 검색임. 시험용 342문항에서 후보 100편 안에 정답이
+# 아예 없는 문항이 98개(일상어 층 69개)이고, 후보에 있는데 재정렬이 버린 문항은 33개임.
+# 후보 상한이 0.713 이고 회수율이 0.865 라 지금 값이 0.617 인데, 목표 0.700 에 닿으려면
+# 회수율을 0.982 까지 올리거나(사실상 불가능) 후보 상한을 0.809 로 올려야 함.
+#
+# 후보를 깊게 가져오는 길은 이미 막혔음 - 깊이 300 에서 상한은 0.721 로 오르지만 만족도가
+# 확실히 떨어짐(-0.036, p<0.001). 쿼리 변환 쪽으로도 다섯 번 시험해 다섯 번 실패했음.
+# 남은 것이 **검색 모델 자체를 학습시키는 것**임.
+#
+# ## 무엇을 학습하나
+#
+#     질문        "조건이 많은 문제를 아주 적은 메모리로 대충 잘 푸는 방법이 있나"
+#     정답 논문    그 질문을 만들어 낸 논문의 제목 + 초록      <- 가깝게
+#     오답 논문 6편  재정렬기가 무관하다고 한 논문             <- 멀게
+#
+# 학습 쌍은 `training/build_embed_pairs.py` 가 만듦. 오답을 어떻게 골랐는지와 왜 그렇게
+# 골랐는지는 그 파일 설명글에 실측표와 함께 있음. **오답 고르는 규칙이 이 학습의 성패를
+# 가르므로 반드시 읽을 것.**
+#
+# ## 반드시 지킬 것
+#
+# 1. **바탕 모델은 지금 색인을 만든 것과 같아야 함** (`BAAI/bge-m3`). 다르면 학습한 것과
+#    색인이 어긋남.
+# 2. **최대 길이 512** - `local_index.build_embeddings` 가 512 로 색인을 만들었음.
+#    학습을 다른 길이로 하면 학습할 때 본 글과 색인에 들어간 글이 달라짐.
+# 3. **저장은 합쳐서 함** - `LocalDenseRetriever` 는 `SentenceTransformer(경로)` 로 모델을
+#    올리므로, 보조 행렬만 저장하면 못 읽음. 합친 모델을 통째로 저장함.
+# 4. 학습이 끝나면 **색인을 다른 이름으로 새로 만들 것.** 같은 이름을 주면
+#    `build_embeddings` 가 기존 임베딩 2.93GB 를 덮어씀 (되돌릴 수 없음).
+
+
+def merge_lora_into(model) -> int:
+    """보조 행렬을 본체 가중치에 더하고 껍데기를 벗겨냄. 합친 층 수를 돌려줌.
+
+    ## 왜 손으로 합치는가
+
+    `get_peft_model` 은 보조 행렬을 **본체 안에 직접 끼워 넣고** 껍데기 객체를 따로
+    돌려줌. 그런데 `SentenceTransformer` 의 `auto_model` 자리에는 껍데기가 남지 않아서
+    (본체가 `XLMRobertaModel` 그대로임) 껍데기의 `merge_and_unload` 를 부를 수가 없음.
+
+    학습은 껍데기 없이도 제대로 됨 - 끼워 넣은 층을 그대로 통과하기 때문임. 문제는
+    저장뿐이고, 합치지 않은 채로 저장하면 `LocalDenseRetriever` 가 못 읽어 색인을
+    만들 수 없음. 그래서 층을 직접 찾아 합치고 원래 층으로 되돌려 놓음.
+
+    합친 층 수가 0 이면 학습이 안 된 것이므로 부르는 쪽에서 멈출 것.
+    """
+    from peft.tuners.lora import LoraLayer
+
+    merged = 0
+    for parent in list(model.modules()):
+        for name, child in list(parent.named_children()):
+            if isinstance(child, LoraLayer):
+                child.merge()
+                setattr(parent, name, child.get_base_layer())
+                merged += 1
+    return merged
+
+
+def cmd_embed(args) -> None:
+    import torch
+    from datasets import Dataset
+    from peft import LoraConfig
+    from sentence_transformers import (SentenceTransformer, SentenceTransformerTrainer,
+                                       SentenceTransformerTrainingArguments)
+    from sentence_transformers.losses import MultipleNegativesRankingLoss
+
+    rows = read_rows(args.data)
+    if args.limit:
+        rows = rows[: args.limit]
+    n_neg = min(len(r["negatives"]) for r in rows)
+    if n_neg < args.negatives:
+        print(f"경고: 오답이 {n_neg}편뿐인 문항이 있어 전부 {n_neg}편으로 맞춘다")
+    n_neg = min(n_neg, args.negatives)
+    print(f"학습 문항 {len(rows):,}개 · 오답 {n_neg}편씩")
+
+    cols = {"anchor": [r["query"] for r in rows],
+            "positive": [r["positive"] for r in rows]}
+    for j in range(n_neg):
+        cols[f"negative_{j + 1}"] = [r["negatives"][j] for r in rows]
+    train_ds = Dataset.from_dict(cols)
+
+    print(f"바탕 모델: {args.base_model}")
+    model = SentenceTransformer(args.base_model)
+    model.max_seq_length = args.max_len
+    print(f"최대 길이 {model.max_seq_length} (색인을 만든 값과 같아야 함)")
+
+    # 큰 모델은 얼려 두고 작은 보조 행렬만 학습함. 주의 층과 완전연결 층에 붙임.
+    #
+    # `SentenceTransformer.add_adapter` 가 아니라 `get_peft_model` 로 감싸는 이유:
+    # 앞의 것은 transformers 의 자체 연동을 써서 본체가 `XLMRobertaModel` 그대로 남는데,
+    # 그러면 학습이 끝난 뒤 보조 행렬을 본체에 합칠 방법(`merge_and_unload`)이 없음.
+    # 합치지 않은 모델은 `LocalDenseRetriever` 가 못 읽으므로 색인을 만들 수 없음.
+    from peft import get_peft_model
+    model[0].auto_model = get_peft_model(model[0].auto_model, LoraConfig(
+        r=args.lora_r, lora_alpha=args.lora_r * 2, lora_dropout=0.05,
+        target_modules=["query", "key", "value", "dense"], bias="none"))
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"학습하는 값 {trainable:,}개 / 전체 {total:,}개 ({trainable / total:.2%})")
+
+    # 대조 학습. 한 묶음 안의 다른 문항들이 자동으로 추가 오답이 됨 - 그래서 묶음이 클수록
+    # 오답이 많아져 학습이 세짐. 여기서는 문항 하나가 글 (1 + 1 + 오답 수) 개를 통과하므로
+    # 묶음 크기를 크게 잡으면 그래픽카드 메모리를 금방 넘김.
+    loss = MultipleNegativesRankingLoss(model)
+
+    targs = SentenceTransformerTrainingArguments(
+        output_dir=args.output_dir + "-ckpt",
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.lr,
+        warmup_ratio=0.1,
+        bf16=torch.cuda.is_available(),
+        gradient_checkpointing=args.grad_checkpoint,
+        logging_steps=args.logging_steps,
+        save_strategy="no",
+        report_to=[],
+        seed=args.seed,
+    )
+    trainer = SentenceTransformerTrainer(model=model, args=targs,
+                                         train_dataset=train_ds, loss=loss)
+
+    t0 = time.time()
+    trainer.train()
+    print(f"\n학습 시간 {(time.time() - t0) / 60:.1f}분")
+
+    # 보조 행렬을 본체에 합쳐서 저장함. 합치지 않으면 LocalDenseRetriever 가 못 읽음.
+    n_merged = merge_lora_into(model)
+    if not n_merged:
+        raise RuntimeError("합칠 보조 행렬 층을 하나도 못 찾았다 - 학습이 안 붙은 것이다")
+    print(f"보조 행렬 {n_merged}개 층을 본체에 합침")
+    model.save(args.output_dir)
+    print(f"모델 저장: {args.output_dir}")
+    print("다음 단계 - 색인을 **다른 이름으로** 새로 만들 것:")
+    print(f"  $PY -m src.retrieval.local_index --model {args.output_dir} "
+          f"--out data/embeddings/cs2021-ft")
+
+
+
+# ==========================================================================
+# 관문 1 - 미세조정이 정답 등수를 끌어올렸는가 (부분집합에서 값싸게 확인)
+# ==========================================================================
+#
+# ## 왜 부분집합인가
+#
+# 71만 편을 다시 임베딩하는 데 3시간이 걸림. 그 전에 "오르긴 하는가"를 값싸게 걸러냄.
+# 부분집합은 **정답 논문 + 지금 색인이 데려온 상위 후보** 로 만듦. 그 후보들이 정답과
+# 실제로 경쟁하는 논문이므로, 정답이 그것들 위로 올라가는지가 곧 우리가 알고 싶은 것임.
+#
+# ## 이 값을 어떻게 읽어야 하는가 (반드시 지킬 것)
+#
+# **이 관문은 "접는 판정"에만 씀.** 부분집합은 지금 모델이 고른 후보로 만들어졌으므로,
+# 미세조정한 모델이 **새로 끌어올릴 엉뚱한 논문**은 이 안에 없음. 그래서 여기 값은
+# 실제보다 좋게 나옴. 한 방향으로만 믿을 수 있음.
+#
+#     여기서 안 오름  ->  71만 편에서도 안 오름. 재색인하지 말고 접을 것
+#     여기서 오름     ->  아직 모름. 재색인해서 관문 2 에서 판정할 것
+#
+# ISSUE #26 · #31 이 "상한은 재정렬이 실제로 본 후보로 잰다"고 정한 것과 같은 정신임.
+#
+# ## 두 무리를 나눠서 보는 이유
+#
+#     검증용   학습에서 뺀 논문 500편의 문항. 학습 자료와 **같은 분야 분포**
+#     개발용   data/eval/dev.jsonl. 평가셋 분포 (분야가 크게 다름)
+#
+# 학습 자료는 코퍼스 비율대로 뽑아 cs.CV·cs.LG·cs.CL·cs.AI 가 45.9% 인데, 개발용
+# 평가셋은 분야를 고르게 뽑아 그 넷이 2.9%(348문항 중 10개) 뿐임. 그래서 검증용에서는
+# 오르는데 개발용에서만 안 오르면 그것은 **방법이 안 되는 것이 아니라 분야가 안 맞는 것**임.
+# 두 무리를 나눠 재야 그 둘을 가를 수 있음.
+
+
+def _rank_of(sub_emb, q_vec, gold_row: int) -> int:
+    """부분집합 안에서 정답이 몇 등인지 (1등이 1)."""
+    scores = sub_emb @ q_vec
+    return int((scores > scores[gold_row]).sum()) + 1
+
+
+def _report_ranks(name: str, ranks_before: list, ranks_after: list, groups: list) -> None:
+    import numpy as np
+
+    print(f"\n[{name}]")
+    print(f"  {'무리':<12}{'문항':>7}{'등수 중앙값':>22}{'10등 안':>18}{'100등 안':>18}")
+    print(f"  {'':<12}{'':>7}{'전':>10}{'후':>10}{'전':>8}{'후':>8}{'전':>9}{'후':>8}")
+    keys = sorted(set(groups)) + ["전체"]
+    for g in keys:
+        sel = [i for i in range(len(groups)) if g == "전체" or groups[i] == g]
+        if not sel:
+            continue
+        b = np.array([ranks_before[i] for i in sel], dtype=float)
+        a = np.array([ranks_after[i] for i in sel], dtype=float)
+        print(f"  {g:<12}{len(sel):>7,}{np.median(b):>10.0f}{np.median(a):>10.0f}"
+              f"{(b <= 10).mean():>8.3f}{(a <= 10).mean():>8.3f}"
+              f"{(b <= 100).mean():>9.3f}{(a <= 100).mean():>8.3f}")
+        moved_up = (a < b).mean()
+        moved_dn = (a > b).mean()
+        print(f"  {'':<12}       올라감 {moved_up:.3f} · 내려감 {moved_dn:.3f} · "
+              f"그대로 {1 - moved_up - moved_dn:.3f}")
+
+
+def cmd_embed_check(args) -> None:
+    import numpy as np
+    from sentence_transformers import SentenceTransformer
+
+    from src import config
+    from src.retrieval.corpus import normalize_paper_id
+    from src.retrieval.local_index import LocalDenseRetriever
+    from src.utils import read_jsonl
+    from training.build_embed_pairs import doc_text, score_batch
+
+    # -- 잴 문항 모으기 ----------------------------------------------------
+    val = [r for r in read_rows(args.pairs)]
+    if args.val_sample and args.val_sample < len(val):
+        val = random.Random(args.seed).sample(val, args.val_sample)
+    dev = [r for r in read_jsonl(args.queries) if not r.get("_meta")]
+    items = ([{"text": r["query"], "gold_id": r["gold_id"],
+               "group": "검증 " + r["difficulty"], "set": "val"} for r in val]
+             + [{"text": r["text"], "gold_id": r["gold_id"],
+                 "group": "개발 " + r["difficulty"], "set": "dev"} for r in dev])
+    print(f"검증용 {len(val):,}문항 · 개발용 {len(dev):,}문항")
+
+    # -- 지금 색인으로 후보 모으기 (이미 계산된 임베딩을 그대로 씀, 비용 0) ----
+    print("지금 색인 불러오는 중...", flush=True)
+    ret = LocalDenseRetriever(args.corpus, args.index)
+    items = [it for it in items if normalize_paper_id(it["gold_id"]) in ret._pos]
+    gold_pos = [ret._pos[normalize_paper_id(it["gold_id"])] for it in items]
+
+    print(f"질문 {len(items):,}개로 후보 {args.depth}편씩 모으는 중...", flush=True)
+    top_idx, _, _ = score_batch(ret, [it["text"] for it in items], args.depth, gold_pos,
+                                batch_size=args.batch_size)
+
+    subset = sorted(set(gold_pos) | {int(x) for row in top_idx for x in row})
+    row_of = {p: i for i, p in enumerate(subset)}
+    print(f"부분집합 논문 {len(subset):,}편 (71만 편 중 {len(subset) / len(ret.ids):.1%})")
+
+    # -- 미세조정 전 등수: 이미 있는 임베딩을 그대로 쓰므로 정확하고 공짜 ------
+    sub_before = np.asarray(ret.emb[subset], dtype=np.float32)
+    qb = ret.embedder.encode([it["text"] for it in items], normalize_embeddings=True,
+                             convert_to_numpy=True, batch_size=64).astype(np.float32)
+    ranks_before = [_rank_of(sub_before, qb[i], row_of[gold_pos[i]])
+                    for i in range(len(items))]
+    del sub_before, qb
+
+    # -- 부분집합 본문은 한 번만 읽음 (모델마다 다시 읽을 필요 없음) ----------
+    texts = [doc_text(r) for r in ret.read_rows(subset)]
+    del ret.emb                                   # 2.93GB 를 놓아 줌
+
+    # -- 모델마다: 부분집합을 다시 임베딩해 등수를 잼 -------------------------
+    import torch
+
+    summary = []
+    for model_path in args.model:
+        print(f"\n{'=' * 74}\n미세조정 모델 불러오는 중: {model_path}", flush=True)
+        kw = {"model_kwargs": {"dtype": torch.float16}} if torch.cuda.is_available() else {}
+        ft = SentenceTransformer(model_path, **kw)
+        ft.max_seq_length = args.max_len
+
+        print(f"부분집합 {len(subset):,}편을 다시 임베딩하는 중...", flush=True)
+        t0 = time.time()
+        sub_after = ft.encode(texts, normalize_embeddings=True, convert_to_numpy=True,
+                              batch_size=64, show_progress_bar=False).astype(np.float32)
+        qa = ft.encode([it["text"] for it in items], normalize_embeddings=True,
+                       convert_to_numpy=True, batch_size=64).astype(np.float32)
+        print(f"다시 임베딩 완료 ({(time.time() - t0) / 60:.1f}분)", flush=True)
+        ranks_after = [_rank_of(sub_after, qa[i], row_of[gold_pos[i]])
+                       for i in range(len(items))]
+        del sub_after, qa, ft
+        torch.cuda.empty_cache()
+
+        print(f"\n### {model_path}")
+        for tag, which in (("검증용 - 학습 자료와 같은 분야 분포", "val"),
+                           ("개발용 - 평가셋 분포", "dev")):
+            sel = [i for i in range(len(items)) if items[i]["set"] == which]
+            if sel:
+                _report_ranks(tag, [ranks_before[i] for i in sel],
+                              [ranks_after[i] for i in sel],
+                              [items[i]["group"] for i in sel])
+        summary.append((model_path, ranks_after))
+
+    # -- 모델끼리 한 표로 견줌 ------------------------------------------------
+    #
+    # 고를 때 봐야 하는 것은 한 층의 값이 아니라 **층별 맞바꿈**임. 일상어 층이 올라도
+    # 학술어 층이 그만큼 내려가면 전체는 제자리임. 그래서 세 층을 나란히 놓음.
+    print(f"\n{'=' * 74}\n[모델 견주기] 개발용 348문항, 100등 안에 정답이 든 비율")
+    groups = sorted({it["group"] for it in items if it["set"] == "dev"})
+    head = f"  {'모델':<34}" + "".join(f"{g.replace('개발 ', ''):>10}" for g in groups) + f"{'전체':>10}"
+    print(head)
+
+    def _row(name: str, ranks: list) -> None:
+        sel_all = [i for i in range(len(items)) if items[i]["set"] == "dev"]
+        line = f"  {name[-33:]:<34}"
+        for g in groups:
+            sel = [i for i in sel_all if items[i]["group"] == g]
+            line += f"{np.mean([ranks[i] <= 100 for i in sel]):>10.3f}"
+        line += f"{np.mean([ranks[i] <= 100 for i in sel_all]):>10.3f}"
+        print(line)
+
+    _row("(미세조정 전)", ranks_before)
+    for name, ranks in summary:
+        _row(name, ranks)
+
+    print("\n[관문 1 판정] 부분집합 안에서 잰 값이라 접는 판정에만 씀")
+    print("  기준: 검증용 등수 중앙값이 내려가면 재색인으로 넘어가고, "
+          "안 내려가면 여기서 접음")
+
+
+
+# ==========================================================================
+# 가중치 섞기 - 학습한 정도를 배율로 조절 (다시 학습하지 않음)
+# ==========================================================================
+#
+# ## 왜 필요한가 (2026-08-25, 관문 1 에서 드러난 문제)
+#
+# 미세조정이 일상어 층(hard)은 크게 올렸는데 **정확한 학술어 층(easy)을 떨어뜨렸음.**
+# 개발용 348문항 부분집합에서 잰 값임.
+#
+#     무리       100등 안 (전 -> 후)
+#     easy       0.836 -> 0.638      <- 잊어버림
+#     medium     0.655 -> 0.888
+#     hard       0.250 -> 0.776
+#
+# 원인은 학습 자료에 easy 를 안 넣은 것임. 당시 근거는 "후보 상한이 0.931 이라 올릴 자리가
+# 없다" 였는데, **올릴 자리가 없는 것과 잃을 자리가 없는 것은 다른 이야기였음.**
+# 개발용 easy 한국어 문항의 99.1%가 낱말 나열인데, 모델이 문장형 질문만 보고 학습해
+# 낱말 나열을 잊었음.
+#
+# ## 어떻게 고치는가
+#
+# 보조 행렬 학습은 원래 가중치에 변화량을 **더하는** 방식이라, 그 변화량에 배율을 곱하면
+# 원래 모델과 학습한 모델 사이의 중간 지점이 나옴.
+#
+#     섞은 모델 = 원래 모델 + 배율 x (학습한 모델 - 원래 모델)
+#
+#     배율 0.0  원래 모델 그대로       easy 안 잃음, hard 안 얻음
+#     배율 1.0  학습한 모델 그대로     easy 많이 잃음, hard 많이 얻음
+#
+# **다시 학습하지 않음.** 두 모델이 디스크에 있으면 가중치를 섞기만 하면 되고, 배율마다
+# 관문 1(`embed-check`)을 돌려 easy 와 hard 가 어떻게 맞바뀌는지 표로 볼 수 있음.
+#
+# ## 2026-08-25 결정: 이 도구는 남기되 쓰지 않음
+#
+# 배율을 관측 결과에 맞춰 고르는 것은 **사후 조정**이라, 개발용에서 좋아 보이는 배율이
+# 시험용에서도 맞을 보장이 없음. 고칠 자리는 배율이 아니라 학습 자료였음 - easy 질문을
+# 같은 방법으로 만들어 넣고 다시 학습하는 쪽을 골랐음(ISSUE #51).
+#
+# 남겨 두는 이유: easy 를 넣어 다시 학습해도 잊어버림이 남으면 그때 마지막 수단이 됨.
+
+
+def cmd_blend(args) -> None:
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    print(f"원래 모델: {args.base}")
+    base = SentenceTransformer(args.base)
+    print(f"학습한 모델: {args.tuned}")
+    tuned = SentenceTransformer(args.tuned)
+
+    sb = base[0].auto_model.state_dict()
+    st = tuned[0].auto_model.state_dict()
+    only_base, only_tuned = set(sb) - set(st), set(st) - set(sb)
+    if only_base or only_tuned:
+        raise RuntimeError(f"두 모델의 가중치 이름이 다르다 "
+                           f"(원래에만 {len(only_base)}개, 학습한 쪽에만 {len(only_tuned)}개)")
+
+    a = float(args.scale)
+    n_changed, max_delta = 0, 0.0
+    blended = {}
+    for k in sb:
+        vb, vt = sb[k], st[k]
+        if vb.dtype.is_floating_point and vb.shape == vt.shape:
+            d = (vt.float() - vb.float())
+            if d.abs().max().item() > 0:
+                n_changed += 1
+                max_delta = max(max_delta, d.abs().max().item())
+            blended[k] = (vb.float() + a * d).to(vb.dtype)
+        else:
+            blended[k] = vt
+    print(f"가중치 {len(sb):,}개 중 달라진 것 {n_changed:,}개 · 최대 변화량 {max_delta:.5f}")
+    if not n_changed:
+        raise RuntimeError("두 모델의 가중치가 완전히 같다 - 학습이 안 반영된 모델이다")
+
+    base[0].auto_model.load_state_dict(blended)
+    base.max_seq_length = tuned.max_seq_length
+    base.save(args.out)
+    print(f"배율 {a} 로 섞어 저장: {args.out}")
+
+
 # ==========================================================================
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="쿼리 변환기 학습 (sft -> dpo 순서로 쓴다)")
+    ap = argparse.ArgumentParser(description="학습 (변환기: sft -> dpo · 검색 모델: embed)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("sft", help="1단계: 지도 미세조정")
@@ -291,6 +685,53 @@ def main() -> None:
     d.add_argument("--max-len", type=int, default=512)
     d.add_argument("--val-ratio", type=float, default=0.15)
     d.set_defaults(func=cmd_dpo)
+
+    e = sub.add_parser("embed", help="검색 모델(임베딩) 미세조정 - 1차 검색을 고치는 것")
+    e.add_argument("--data", default="data/training/embed_pairs_train.jsonl")
+    e.add_argument("--base-model", default="BAAI/bge-m3",
+                   help="지금 색인을 만든 모델과 같아야 한다")
+    e.add_argument("--output-dir", default="models/bge-m3-papers")
+    e.add_argument("--epochs", type=float, default=1.0,
+                   help="대조 학습은 문항이 2만 개대면 1회로도 충분한 것이 보통")
+    e.add_argument("--batch-size", type=int, default=8,
+                   help="문항 하나가 글 8개(질문+정답+오답 6)를 통과하므로 크게 잡으면 넘침")
+    e.add_argument("--grad-accum", type=int, default=1)
+    e.add_argument("--lr", type=float, default=1e-4, help="보조 행렬 학습의 통상값")
+    e.add_argument("--lora-r", type=int, default=32)
+    e.add_argument("--negatives", type=int, default=6, help="문항당 쓸 오답 편수")
+    e.add_argument("--max-len", type=int, default=512,
+                   help="색인을 만든 값과 반드시 같아야 한다")
+    e.add_argument("--grad-checkpoint", action="store_true",
+                   help="메모리를 아끼는 대신 느려짐. 묶음 크기를 못 키울 때만")
+    e.add_argument("--logging-steps", type=int, default=50)
+    e.add_argument("--limit", type=int, default=None, help="앞에서 N문항만 (속도 재기용)")
+    e.add_argument("--seed", type=int, default=42)
+    e.set_defaults(func=cmd_embed)
+
+    c = sub.add_parser("embed-check", help="관문 1: 미세조정이 정답 등수를 올렸는지 값싸게 확인")
+    c.add_argument("--model", nargs="+", default=["models/bge-m3-papers"],
+                   help="여러 개를 주면 같은 부분집합에서 나란히 견줌 (배율 고를 때 씀)")
+    c.add_argument("--pairs", default="data/training/embed_pairs_val.jsonl",
+                   help="학습에서 뺀 검증용 문항")
+    c.add_argument("--queries", default="data/eval/dev.jsonl")
+    c.add_argument("--corpus", default="data/corpus/corpus-cs2021.jsonl")
+    c.add_argument("--index", default="data/embeddings/cs2021")
+    c.add_argument("--depth", type=int, default=100,
+                   help="문항마다 후보를 몇 편까지 부분집합에 넣을지")
+    c.add_argument("--val-sample", type=int, default=500,
+                   help="검증용 문항을 몇 개만 쓸지 (전부 쓰면 다시 임베딩할 논문이 너무 많음)")
+    c.add_argument("--max-len", type=int, default=512)
+    c.add_argument("--batch-size", type=int, default=250)
+    c.add_argument("--seed", type=int, default=42)
+    c.set_defaults(func=cmd_embed_check)
+
+    b = sub.add_parser("blend", help="원래 모델과 학습한 모델을 배율로 섞음 (다시 학습 안 함)")
+    b.add_argument("--base", default="BAAI/bge-m3")
+    b.add_argument("--tuned", default="models/bge-m3-papers")
+    b.add_argument("--scale", type=float, required=True,
+                   help="0 이면 원래 모델, 1 이면 학습한 모델. 사이 값이 중간 지점")
+    b.add_argument("--out", required=True)
+    b.set_defaults(func=cmd_blend)
 
     args = ap.parse_args()
     args.func(args)
