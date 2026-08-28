@@ -2,7 +2,7 @@
 
 ## 무엇을 만드는가
 
-    질문        ft_queries.jsonl 의 한 문항
+    질문        train_queries.jsonl 의 한 문항
     정답 논문    그 문항을 만들어 낸 논문의 제목 + 초록
     오답 논문    "가깝긴 한데 정답은 아닌" 논문 여러 편
 
@@ -57,6 +57,61 @@
 **한계도 적어 둠:** 0.160 이라는 값은 뽑힌 오답의 9.0% 만 등급을 받아서 잰 것이라 흔들림이
 큼. 빈틈없이 잰 것은 위의 점수-등급 표(0.224)이고, 그쪽도 같은 방향임.
 
+## 재정렬기용 오답은 규칙이 정반대임 (`--for-rerank`, 2026-08-27 신설)
+
+위의 규칙(점수가 가장 낮은 것부터)은 **검색 모델**을 가르칠 때 맞음. **재정렬기**를
+가르칠 때 그대로 쓰면 안 됨 - 그 오답은 재정렬기가 이미 확실히 버리고 있는 논문임.
+실제로 만들어진 자료를 세어 보면 이럼.
+
+    오답 24,000편의 재정렬 점수   중앙 0.003 · 0.002 미만 비율 0.413
+
+0.002 는 서비스가 "관련 없음" 으로 접어서 사용자에게 안 보여 주는 기준선임
+(`app.py` 의 `MIN_RERANK_SCORE`). **이미 버리는 것을 버리라고 가르치는 자료라 배울 것이 없음.**
+
+### 그래서 정답보다 점수가 높은 논문을 오답으로 씀
+
+재정렬기가 실제로 저지른 잘못은 "정답을 상위 10편 밖으로 밀어낸 것" 이고, 밀어낸 주체가
+바로 정답보다 점수가 높은 논문임. 그것을 오답으로 씀.
+
+### 반드시 알고 쓸 것 - 이 오답은 77% 가 진짜 쓸모 있는 논문임
+
+넓힌 등급 정답지로 규칙별 오염도를 쟀음(개발용 348문항, 새 계산 0회).
+
+    오답 6편을 뽑는 규칙              전체 등급2+   hard 등급2+   판정받은 비율   6편 못 채움
+    점수 가장 낮은 6편 (검색 모델용)      0.182       0.167        0.005       0.000
+    점수 가장 높은 6편                 0.628       0.687        1.000       0.000
+    정답보다 점수가 높은 것             0.771       0.754        1.000       0.794
+    0.002~0.02 구간에서 6편           0.453       0.555        0.381       0.049
+
+**신호가 있는 오답은 전부 심하게 오염돼 있음.** 그래서 학습할 때 이분 라벨
+(관련 1 / 무관 0)을 쓰면 안 됨 - "좋은 논문을 내려라" 를 가르치게 됨.
+**순서 손실을 써서 "정답이 이 논문들보다 위" 까지만 가르칠 것**
+(`CachedMultipleNegativesRankingLoss` 등). 자세한 것은 `training/train.py` 의
+`rerank` 설명글 참고.
+
+### 후보는 영어 짝의 검색 결과로 뽑음 (`--pool-from-en`)
+
+서비스는 한국어 질문을 **영어로 옮겨** 로컬 색인을 찾음. 그런데 이 파일은 원문 질문으로
+찾으므로, 한국어 문항의 후보 묶음이 서비스와 달라짐. 문항 200개로 실측함.
+
+    정답이 1차 검색 100등 안에 든 비율   영어 0.306 · 한국어 0.147
+
+여기서 고른 오답은 서비스가 만난 적 없는 논문임. 평가 경로와 서비스 경로를 같게 만드는
+규칙(#10 · #13 · #50)이 학습 자료에도 그대로 적용됨.
+
+학습 자료는 논문 한 편에서 한국어 질문과 영어 질문을 **짝으로** 만들어 뒀음(`pair_id` 가
+같음). 한국어 문항의 후보를 영어 짝의 검색 결과로 쓰면 번역해서 찾은 것과 같은 자리에 놓임.
+번역기를 36,000번 부르면 35시간이 걸리는데 이 방법은 비용이 0 임.
+
+**재정렬기에 넣는 질문은 원문 그대로 둠.** 서비스도 재정렬에는 원본 질문을 넣음
+(`ranking.py` 의 `rerank` 설명글). 바꾸는 것은 후보를 뽑는 쪽뿐임.
+
+### 정답이 이미 1등이면 오답이 0편임 - 그대로 둠
+
+밀어낸 논문이 없으면 고칠 잘못도 없음. 그 문항은 오답 없이 저장하고, 학습할 때
+묶음 안 다른 질문의 논문이 오답 노릇을 함. 억지로 채우면 위의 '이미 버리는 논문' 을
+도로 넣게 됨.
+
 ## 검증용을 떼어 두는 이유 (반드시 읽을 것)
 
 학습 자료와 평가셋의 **분야 분포가 다름.** `evaluation/dataset.py` 의 `sample_papers`
@@ -77,7 +132,7 @@
 
 ## 실행
 
-    $PY -m training.build_embed_pairs --queries data/training/ft_queries.jsonl \
+    $PY -m training.build_retrieval_pairs --queries data/training/train_queries.jsonl \
         --out-dir data/training --negatives 6 --rerank-pool 24
 
 전제: 지금 색인(data/embeddings/cs2021)과 재정렬 모델이 있어야 함.
@@ -146,11 +201,24 @@ def score_batch(retriever, queries: list[str], top_k: int,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="임베딩 미세조정용 학습 쌍 만들기")
-    ap.add_argument("--queries", default="data/training/ft_queries.jsonl")
+    ap.add_argument("--queries", default="data/training/train_queries.jsonl")
     ap.add_argument("--corpus", default=str(config.CORPUS_DIR / "corpus-cs2021.jsonl"))
     ap.add_argument("--index", default=str(config.DATA_DIR / "embeddings" / "cs2021"))
+    ap.add_argument("--embed-model", default=None,
+                    help="질문을 임베딩할 모델. 안 주면 색인을 만든 모델을 그대로 씀. "
+                         "색인과 다른 모델을 주면 멈춤 (ISSUE #50 과 같은 자리)")
     ap.add_argument("--out-dir", default="data/training")
     ap.add_argument("--negatives", type=int, default=6, help="문항당 오답 편수")
+    ap.add_argument("--pool-from-en", action="store_true",
+                    help="후보를 같은 짝(pair_id)의 영어 질문으로 뽑는다. 서비스가 한국어를 "
+                         "영어로 옮겨 검색하는 것과 조건을 맞춘다")
+    ap.add_argument("--for-rerank", action="store_true",
+                    help="재정렬기 미세조정용 학습 쌍을 만든다. 오답은 '정답을 뺀 상위 N편' 이고 "
+                         "결과를 train/val_reranker.jsonl 에 query/docs/labels 로 저장한다")
+    ap.add_argument("--neg-source", choices=["rerank", "retrieval"], default="rerank",
+                    help="오답을 어느 순서에서 고를지. rerank 는 교차 인코더로 후보를 다시 "
+                         "채점해 그 순서를 씀(느림, 33,000문항에 4시간 20분). retrieval 은 "
+                         "색인 등수를 그대로 씀(빠름, 약 20~30분). --for-rerank 에서만 뜻이 있음")
     ap.add_argument("--rerank-pool", type=int, default=24,
                     help="재정렬기에게 채점시킬 상위 후보 수. 이 중 점수가 가장 낮은 "
                          "--negatives 편을 오답으로 씀")
@@ -182,10 +250,21 @@ def main() -> None:
           f", 검증 {len(val_papers):,}편")
 
     # -- 색인 올리기 ------------------------------------------------------
-    from src.retrieval.local_index import LocalDenseRetriever
-    print("색인 불러오는 중... (짝 확인 포함)", flush=True)
+    #
+    # 색인을 만든 모델과 질문을 임베딩하는 모델이 다르면 오류 없이 순위만 무너짐.
+    # 평가 하네스에서 이미 한 번 겪은 자리임(ISSUE #50). 여기서도 막음.
+    from src.retrieval.local_index import LocalDenseRetriever, read_meta
+    meta_model = read_meta(args.index).get("model")
+    embed_model = args.embed_model or meta_model or config.EMBED_MODEL
+    if meta_model and embed_model != meta_model:
+        raise SystemExit(
+            f"색인을 만든 모델과 질문을 찾을 모델이 다르다.\n"
+            f"  색인({args.index})을 만든 모델: {meta_model}\n"
+            f"  질문을 임베딩할 모델        : {embed_model}\n"
+            f"이대로 쓰면 오류 없이 순위만 무너진다. --embed-model 을 맞추거나 빼고 돌릴 것.")
+    print(f"색인 불러오는 중... (짝 확인 포함, 모델 {embed_model})", flush=True)
     t0 = time.time()
-    ret = LocalDenseRetriever(args.corpus, args.index)
+    ret = LocalDenseRetriever(args.corpus, args.index, model_name=embed_model)
     print(f"색인 준비 완료 ({time.time() - t0:.0f}초, 논문 {len(ret.ids):,}편)", flush=True)
 
     # 정답 논문이 색인에 없는 문항은 학습 쌍을 만들 수 없음
@@ -197,10 +276,24 @@ def main() -> None:
     gold_pos = [ret._pos[normalize_paper_id(r["gold_id"])] for r in rows]
 
     # -- 채점 -------------------------------------------------------------
+    #
+    # 후보를 뽑는 데 쓰는 글과, 재정렬기에 넣는 글은 서로 다를 수 있음.
+    # 서비스가 한국어를 영어로 옮겨 검색하기 때문임 (--pool-from-en 설명글 참고).
+    search_text = [r["text"] for r in rows]
+    if args.pool_from_en:
+        en_of = {r["pair_id"]: r["text"] for r in rows if r.get("lang") == "en"}
+        n_swap = 0
+        for i, r in enumerate(rows):
+            if r.get("lang") != "en" and r.get("pair_id") in en_of:
+                search_text[i] = en_of[r["pair_id"]]
+                n_swap += 1
+        print(f"후보 뽑기용 글을 영어 짝으로 바꾼 문항 {n_swap:,}개 "
+              f"(재정렬기에 넣는 질문은 원문 그대로)")
+
     print(f"질문 {len(rows):,}개를 색인 {len(ret.ids):,}편과 대조하는 중...", flush=True)
     t0 = time.time()
     top_idx, top_score, gold_score = score_batch(
-        ret, [r["text"] for r in rows], args.top_k, gold_pos)
+        ret, search_text, args.top_k, gold_pos)
     print(f"채점 완료 ({time.time() - t0:.0f}초)", flush=True)
 
     # -- 진단: 정답이 지금 몇 등인가 (미세조정 전 기준값) --------------------
@@ -212,7 +305,7 @@ def main() -> None:
     print(f"\n[미세조정 전 정답 등수] 색인 {len(ret.ids):,}편 안에서 상위 {args.top_k}등까지 훑음")
     print(f"  {'난이도':<8}{'문항':>8}{'10등내':>9}{'100등내':>9}"
           f"{str(args.top_k)+'등내':>9}{'든 것의 중앙값':>14}")
-    for d in ("medium", "hard", None):
+    for d in ("easy", "medium", "hard", None):
         sel = [i for i, r in enumerate(rows) if d is None or r["difficulty"] == d]
         if not sel:
             continue
@@ -232,8 +325,12 @@ def main() -> None:
     # 재정렬기는 제목과 초록을 읽어야 채점할 수 있으므로, 채점할 후보의 본문이 먼저 필요함.
     # 정답 논문과 상위 --rerank-pool 편만 읽음 (200등까지 전부 읽으면 낭비임).
     need = set(gold_pos)
+    # 색인 등수로 오답을 고를 때는 상위 (오답 수 + 1)편만 있으면 됨. 교차 인코더로 고를
+    # 때는 채점할 후보 전체(--rerank-pool)의 본문이 필요함.
+    cheap = args.for_rerank and args.neg_source == "retrieval"
+    n_pool = (args.negatives + 1) if cheap else (args.rerank_pool + 1)
     for i in range(len(rows)):
-        need.update(int(x) for x in top_idx[i][: args.rerank_pool + 1])
+        need.update(int(x) for x in top_idx[i][: n_pool])
     need = sorted(need)
     print(f"\n본문을 꺼낼 논문 {len(need):,}편", flush=True)
     t0 = time.time()
@@ -245,32 +342,72 @@ def main() -> None:
     # 각 문항의 상위 후보를 교차 인코더에게 채점시켜, **점수가 가장 낮은** 편부터 오답으로 씀.
     # 왜 이 규칙인지는 이 파일 맨 위 설명글 참고 (상위 등수에서 그냥 집으면 뽑힌 오답의
     # 60.9% 가 실제로는 쓸모 있는 논문이었음).
-    print("재정렬기를 올리는 중...", flush=True)
-    from src.retrieval.ranking import CrossEncoderReranker
-    from src.schemas import ScoredPaper
-    reranker = CrossEncoderReranker(batch_size=64)
-
     neg_pos: list[list[int]] = []
     neg_score: list[list[float]] = []
+    gold_rr: list[float | None] = []             # --for-rerank 에서만 채움
+    gold_rr_rank: list[int | None] = []
+
+    if cheap:
+        # 색인 등수 그대로 정답을 뺀 상위 N편을 오답으로 씀. 교차 인코더를 한 번도 안 부름.
+        # 이 논문들은 서비스가 재정렬기에게 실제로 넘기는 후보와 같은 자리에서 나온 것임.
+        print(f"오답을 색인 등수에서 고름 (정답을 뺀 상위 {args.negatives}편, 교차 인코더 안 부름)")
+        for i in range(len(rows)):
+            gp = gold_pos[i]
+            neg_pos.append([int(x) for x in top_idx[i] if int(x) != gp][: args.negatives])
+            neg_score.append([])
+            gold_rr.append(None)
+            gold_rr_rank.append(None)
+        print(f"오답 고르기 완료 (0초)")
+        return_early = True
+    else:
+        return_early = False
+
+    if not return_early:
+        print("재정렬기를 올리는 중...", flush=True)
+    from src.retrieval.ranking import CrossEncoderReranker
+    from src.schemas import ScoredPaper
+    reranker = None if return_early else CrossEncoderReranker(batch_size=64)
+
     t0 = time.time()
     step = 200                                   # 문항 200개씩 묶어 채점
-    for s0 in range(0, len(rows), step):
+    for s0 in ([] if return_early else range(0, len(rows), step)):
         chunk = list(range(s0, min(s0 + step, len(rows))))
         queries, cand_lists, cand_pos = [], [], []
         for i in chunk:
             gp = gold_pos[i]
             pos = [int(x) for x in top_idx[i] if int(x) != gp][: args.rerank_pool]
+            if args.for_rerank:
+                # 정답도 함께 채점해야 '정답보다 위' 를 가릴 수 있음.
+                pos = pos + [gp]
             cand_pos.append(pos)
             queries.append(rows[i]["text"])
             cand_lists.append([ScoredPaper(paper_id=str(p), score=0.0, rank=j + 1,
                                            title="", abstract=body[p])
                                for j, p in enumerate(pos)])
-        # top_k 를 후보 수 전체로 주어 모든 후보의 점수를 받음. 그중 낮은 쪽을 씀.
-        ranked = reranker.rerank_batch(queries, cand_lists, top_k=args.rerank_pool)
-        for row_out in ranked:
-            pairs = sorted(((int(c.paper_id), c.score) for c in row_out), key=lambda t: t[1])
-            neg_pos.append([p for p, _ in pairs[: args.negatives]])
-            neg_score.append([round(sc, 6) for _, sc in pairs[: args.negatives]])
+        # top_k 를 후보 수 전체로 주어 모든 후보의 점수를 받음.
+        ranked = reranker.rerank_batch(queries, cand_lists,
+                                       top_k=args.rerank_pool + (1 if args.for_rerank else 0))
+        for k, row_out in enumerate(ranked):
+            # rerank_batch 는 점수가 높은 순으로 돌려줌.
+            scored = [(int(c.paper_id), float(c.score)) for c in row_out]
+            if not args.for_rerank:
+                pairs = sorted(scored, key=lambda t: t[1])
+                neg_pos.append([p for p, _ in pairs[: args.negatives]])
+                neg_score.append([round(sc, 6) for _, sc in pairs[: args.negatives]])
+                continue
+
+            gp = gold_pos[chunk[k]]
+            gs = next((sc for pid, sc in scored if pid == gp), None)
+            rank = next((j + 1 for j, (pid, _) in enumerate(scored) if pid == gp), None)
+            # 정답을 뺀 상위 N편. 2026-08-28 이전에는 여기에 `sc > gs`(정답보다 점수가
+            # 높은 것) 조건이 있었는데, 정답의 재정렬 등수 중앙값이 1등이라 문항의 64.5%가
+            # 오답 0편이 됐음. 그 문항들은 학습 때 묶음 안 다른 질문의 논문(쉬운 오답)만
+            # 상대하게 되어 "주제만 겹치면 높은 점수" 를 배웠음 (ISSUE #55).
+            others = [(pid, sc) for pid, sc in scored if pid != gp]
+            neg_pos.append([pid for pid, _ in others[: args.negatives]])
+            neg_score.append([round(sc, 6) for _, sc in others[: args.negatives]])
+            gold_rr.append(None if gs is None else round(gs, 6))
+            gold_rr_rank.append(rank)
         done = min(s0 + step, len(rows))
         el = time.time() - t0
         print(f"  오답 고르기 {done:,}/{len(rows):,}  경과 {el/60:.1f}분 "
@@ -285,8 +422,6 @@ def main() -> None:
         item = {
             "query_id": r["query_id"],
             "query": r["text"],
-            "positive": body[gold_pos[i]],
-            "negatives": [body[p] for p in neg_pos[i]],
             "gold_id": normalize_paper_id(r["gold_id"]),
             "lang": r["lang"],
             "difficulty": r["difficulty"],
@@ -294,14 +429,29 @@ def main() -> None:
             "rank_before": rank_before[i],
             "neg_rerank_scores": neg_score[i],
         }
+        if args.for_rerank:
+            # `RankNetLoss` / `LambdaLoss` 가 받는 모양임: (질문, 글 목록) + 라벨 목록.
+            # 정답을 맨 앞에 둠. 라벨은 순서만 가르치는 값이라 1 과 0 이면 충분함 -
+            # "이 논문은 무관하다" 를 가르치는 것이 아니라 "정답이 이 논문들보다 위" 만 가르침.
+            # `CachedMultipleNegativesRankingLoss` 로 학습할 때는 train.py 가 이 두 열에서
+            # anchor / positive / negative_N 을 만들어 씀.
+            item["docs"] = [body[gold_pos[i]]] + [body[p] for p in neg_pos[i]]
+            item["labels"] = [1] + [0] * len(neg_pos[i])
+            item["gold_rerank_score"] = gold_rr[i]
+            item["gold_rerank_rank"] = gold_rr_rank[i]
+        else:
+            item["positive"] = body[gold_pos[i]]
+            item["negatives"] = [body[p] for p in neg_pos[i]]
         (out_val if normalize_paper_id(r["gold_id"]) in val_papers
          else out_train).append(item)
 
     # -- 저장 ----------------------------------------------------------------
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for name, data in (("embed_pairs_train.jsonl", out_train),
-                       ("embed_pairs_val.jsonl", out_val)):
+    # 파일 이름은 어느 모듈을 가르치는 자료인지로 지음 (docs/ARTIFACTS.md 4절).
+    module = "reranker" if args.for_rerank else "retriever"
+    for name, data in ((f"train_{module}.jsonl", out_train),
+                       (f"val_{module}.jsonl", out_val)):
         fp = out_dir / name
         with open(fp, "w", encoding="utf-8") as f:
             for d in data:
@@ -313,7 +463,31 @@ def main() -> None:
     print("\n[학습 쌍 요약]")
     print(f"  학습 {len(out_train):,}문항 · 검증 {len(out_val):,}문항")
     print(f"  오답이 {args.negatives}편에 모자란 문항 {n_short:,}개")
-    print(f"  상위 {args.rerank_pool}편을 채점해 점수가 낮은 {args.negatives}편을 씀")
+    if args.for_rerank:
+        if cheap:
+            print(f"  색인 등수에서 정답을 뺀 상위 {args.negatives}편을 오답으로 씀 "
+                  f"(교차 인코더 안 부름)")
+        else:
+            print(f"  상위 {args.rerank_pool}편과 정답을 함께 채점해 정답을 뺀 "
+                  f"상위 {args.negatives}편을 씀")
+        cnt = [len(x) for x in neg_pos]
+        print(f"  오답 편수 분포: " + " · ".join(
+            f"{k}편 {sum(1 for c in cnt if c == k):,}개" for k in range(args.negatives + 1)))
+        zero = sum(1 for c in cnt if c == 0) / len(cnt)
+        print(f"  오답 0편 비율 {zero:.3f}  <- 2026-08-27 자료에서는 0.645 였음 (ISSUE #55)")
+        print(f"  저장 형식: query / docs(정답 맨 앞) / labels([1, 0, ...])")
+        gr = [x for x in gold_rr if x is not None]
+        if gr:
+            a = np.asarray(gr)
+            print(f"  정답의 재정렬 점수: 중앙값 {np.median(a):.4f} · "
+                  f"0.002 미만 {np.mean(a < 0.002):.3f}  <- 낮을수록 재정렬기가 못 알아본 것")
+        rk = [x for x in gold_rr_rank if x is not None]
+        if rk:
+            b = np.asarray(rk)
+            print(f"  재정렬 뒤 정답 등수: 중앙값 {np.median(b):.0f} · "
+                  f"10등 안 {np.mean(b <= 10):.3f}  <- 미세조정 전 기준값")
+    else:
+        print(f"  상위 {args.rerank_pool}편을 채점해 점수가 낮은 {args.negatives}편을 씀")
     if flat:
         a = np.asarray(flat)
         print(f"  뽑힌 오답의 재정렬 점수: 중앙값 {np.median(a):.4f} · "

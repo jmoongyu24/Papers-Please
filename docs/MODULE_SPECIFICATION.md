@@ -1,6 +1,6 @@
 # 모듈 명세서 (MODULE SPECIFICATION)
 
-- 작성일 2026-07-16 · **마지막 갱신 2026-08-16**
+- 작성일 2026-07-16 · **마지막 갱신 2026-08-28**
 - 각 모듈이 무슨 일을 하고, 어느 파일에 있고, 어떤 약속을 따르는지 적음.
   **왜 그렇게 만들었는지의 자세한 근거는 각 코드 파일 맨 위 설명글에 있음.** 고치기 전에 읽을 것.
 
@@ -31,17 +31,24 @@ Papers-Please/
 │   ├── pipeline_eval.py            파이프라인 실행 + 응답 시간 실측
 │   ├── metrics.py                  지표 계산
 │   └── report.py                   보고 · 실행 간 비교
-├── training/                   변환기 학습 (2개)
-├── tests/                      단위 테스트 (2개, 39건)
+├── training/                   학습 (3개)
+│   ├── build_translator_pairs.py   쿼리 변환기 학습 쌍
+│   ├── build_retrieval_pairs.py    검색 모델·재정렬기 학습 쌍
+│   └── train.py                    sft · dpo · embed · rerank · embed-check · blend
+├── tests/                      단위 테스트 (2개, 44건)
 ├── data/
 │   ├── corpus/ embeddings/     대용량 (git 제외)
-│   ├── eval/                   평가셋 4개만 둠
-│   ├── training/ cache/ sample/
-├── models/                     학습한 LoRA 어댑터 (git 제외)
+│   ├── eval/                   평가셋 (dev · test · 등급 정답지 2개)
+│   ├── training/               학습 자료 (train_* · val_*)
+│   ├── cache/ sample/
+├── models/                     학습한 모델 (git 제외)
 ├── runs/                       임시 실행 결과 (git 제외)
 ├── results/                    보고서가 인용하는 확정 결과 (커밋)
-└── docs/                       PLAN · PROGRESS · ISSUE · 이 문서 · ARXIV_API_POLICY
+└── docs/                       PLAN · PROGRESS · ISSUE · ARTIFACTS · 이 문서 · ARXIV_API_POLICY
 ```
+
+**모델·색인·학습 자료가 각각 무엇이고 성능이 어땠는지는 [ARTIFACTS.md](ARTIFACTS.md) 에 있음.**
+이름 규칙과 지운 파일의 기록도 그쪽에 있음.
 
 ### 파일을 나누는 규칙
 
@@ -301,17 +308,28 @@ GPU 16GB 에 여러 모델이 들어가야 함. 순진하게 올리면 넘침.
 
 ## 학습 — `training/`
 
-| 파일 | 무엇 |
-|---|---|
-| `build_training_data.py` | 후보 검색어를 여러 개 만들어 **실제 arXiv 검색으로 채점** → 정답 논문을 찾아낸 것을 라벨로, 못 찾은 것을 선호쌍의 거절 쪽으로 |
-| `train.py` | `sft`(지도 미세조정) → `dpo`(선호 학습). 순서가 중요함 |
+세 모듈을 학습함. **어느 모듈을 가르치는 자료인지가 파일 이름에 그대로 들어감.**
 
-**핵심 아이디어**: 라벨을 사람이 "좋아 보이는" 기준으로 고르지 않고 **검색 성공을 신호로** 삼음.
-**분할은 논문 단위로 함** — 같은 논문에서 나온 질문은 라벨이 거의 같아서, 질문 단위로 나누면
-검증 손실이 실제보다 좋게 나오고 과적합 시작점을 놓침.
+| 학습 대상 | 자료를 만드는 코드 | 학습 자료 | 학습 명령 | 나오는 모델 |
+|---|---|---|---|---|
+| 쿼리 변환기 | `build_translator_pairs.py` | `train_query_translator_sft.jsonl` `train_query_translator_dpo.jsonl` | `train.py sft` → `dpo` | `models/query-translator-sft` → `-dpo` |
+| 검색 모델 | `build_retrieval_pairs.py` | `train_retriever.jsonl` `val_retriever.jsonl` | `train.py embed` | `models/retriever-ft` |
+| 재정렬기 | `build_retrieval_pairs.py --for-rerank` | `train_reranker.jsonl` `val_reranker.jsonl` | `train.py rerank` | `models/reranker-ft` |
+
+`train.py` 의 나머지 두 명령: `embed-check`(관문 1 — 재색인 없이 부분집합에서 정답 등수를
+확인) · `blend`(원본 모델과 미세조정 모델을 섞어 봄).
+
+**쿼리 변환기의 핵심 아이디어**: 라벨을 사람이 "좋아 보이는" 기준으로 고르지 않고
+**검색 성공을 신호로** 삼음. **분할은 논문 단위로 함** — 같은 논문에서 나온 질문은 라벨이
+거의 같아서, 질문 단위로 나누면 검증 손실이 실제보다 좋게 나오고 과적합 시작점을 놓침.
 
 **한계 기록**: 이 방식은 "정답 논문이 몇 등인가"만 보상으로 삼았음. 그래서 Recall 은 조금
 올랐고 만족도(nDCG)는 떨어졌음(#37). 다시 학습한다면 보상에 만족도를 넣어야 함.
+
+**검색 모델과 재정렬기는 오답 고르는 규칙이 정반대임.** 검색 모델은 점수가 가장 낮은 논문을,
+재정렬기는 **정답보다 점수가 높은 논문**을 오답으로 씀. 이유는
+`build_retrieval_pairs.py` 설명글에 있음. 둘 다 이분 라벨을 쓰면 안 됨 — 그 오답의 상당수가
+실제로 쓸모 있는 논문이라 "좋은 논문을 내려라" 를 가르치게 됨(#49 · #55).
 
 ---
 

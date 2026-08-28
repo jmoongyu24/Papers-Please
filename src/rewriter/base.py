@@ -94,7 +94,7 @@ def build_rewriter(name: str) -> Rewriter:
     if name == "dpo":
         # SFT 위에 DPO(선호 학습)까지 얹은 모델 - 서비스가 쓰는 것
         from src.rewriter.finetuned import FinetunedRewriter
-        return FinetunedRewriter(adapter_path="models/qwen3-4b-query-dpo")
+        return FinetunedRewriter(adapter_path="models/query-translator-dpo")
     raise ValueError(
         f"알 수 없는 변환기 이름: {name} "
         f"(쓸 수 있는 것: passthrough, translate, service, hierarchical, single_step, "

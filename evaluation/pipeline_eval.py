@@ -456,7 +456,8 @@ def rerank_query_of(row: dict, mode: str) -> str:
 
 def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
                 rrf_k: int, weights: dict[str, float], batch_size: int = 32,
-                query_mode: str = "raw", channel_depth: int | None = None) -> None:
+                query_mode: str = "raw", channel_depth: int | None = None,
+                model_name: str | None = None, fuse_rerank: float = 0.0) -> None:
     """저장된 결과를 융합한 뒤 상위 `depth` 편을 재정렬해 `reranked_ids` 로 채움.
 
     검색은 한 번도 하지 않음. 후보 본문을 못 찾은 논문은 후보에서 빠지는데, 그 논문이
@@ -467,6 +468,20 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
         `runs/dev_mq_w1_d100.jsonl` 은 채널당 300편이 저장돼 있는데 서비스는 채널당
         100편만 가져오므로(app.py 의 DEPTH_LOCAL), 안 맞추면 상한이 0.675 대신 0.684 로
         부풀려짐. #10, #13, #39, #40 과 같은 종류의 어긋남임.
+
+    model_name: 쓸 재정렬 모델. 안 주면 서비스 기본값. 미세조정한 재정렬기를 견줄 때
+        반드시 줄 것 - 색인에서 겪은 것과 같은 자리임(#50). 어느 모델로 잰 값인지는
+        실행 정보(`_meta`)에도 남음(#54).
+
+    fuse_rerank: 0 보다 크면 재정렬 순위를 검색 순위와 한 번 더 합침. 값이 재정렬 쪽
+        가중치임(검색 쪽은 항상 1.0). 0 이면 재정렬 순위만 씀 - 2026-08-28 이전 동작.
+
+        왜 이런 것이 필요한가 (ISSUE #41):
+            hard 난이도에서 재정렬기가 후보 100편 전부에 '관련 없음' 에 해당하는 값을 줌
+            (정답 점수 중앙 0.0035, 10등 0.0152). 그 안의 순서는 근거가 없음. 그런데
+            검색 순위는 같은 문항에서 다른 논문을 맞히고 있어서, 둘을 합치면 올라감.
+            개발용 348문항 실측(미세조정 색인, 가중치 3): 전체 0.618 -> 0.635,
+            hard 0.267 -> 0.310. **지금 서비스 색인에서는 효과 없음**(+0.006, p=0.583).
 
     점수를 함께 저장하는 이유:
         교차 인코더는 후보를 하나씩 독립적으로 채점함. 어떤 논문의 점수는 같은 목록에
@@ -498,13 +513,15 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
 
     if method == "cross":
         from src.retrieval.ranking import CrossEncoderReranker, DEFAULT_RERANKER
-        reranker = CrossEncoderReranker(DEFAULT_RERANKER, batch_size=batch_size)
+        name = model_name or DEFAULT_RERANKER
+        print(f"재정렬 모델: {name}")
+        reranker = CrossEncoderReranker(name, batch_size=batch_size)
         ranked = reranker.rerank_batch(queries, cand_lists, top_k=depth)
     elif method == "llm":
         # 언어 모델 재정렬기 (bge-reranker-v2-gemma). 점수 눈금이 교차 인코더와 다름 -
         # 시그모이드 0~1 이 아니라 로짓이므로 MIN_RERANK_SCORE 를 그대로 쓰면 안 됨.
         from src.retrieval.ranking import DEFAULT_LLM_RERANKER, LLMReranker
-        reranker = LLMReranker(DEFAULT_LLM_RERANKER, batch_size=batch_size)
+        reranker = LLMReranker(model_name or DEFAULT_LLM_RERANKER, batch_size=batch_size)
         ranked = reranker.rerank_batch(queries, cand_lists, top_k=depth)
     elif method == "embedding":
         from sentence_transformers import SentenceTransformer
@@ -516,11 +533,22 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
     else:
         raise ValueError(f"알 수 없는 재정렬 방식: {method}")
 
-    for r, papers in zip(rows, ranked):
-        r["reranked_ids"] = [p.paper_id for p in papers]
+    for r, papers, fused in zip(rows, ranked, cand_ids):
+        ids = [p.paper_id for p in papers]
+        if fuse_rerank > 0:
+            # 재정렬 순위와 검색 순위를 한 번 더 합침. 점수가 아니라 등수를 더하므로
+            # 두 단계의 점수 눈금이 달라도 됨 (`ranking.py` 의 fuse_local 설명글과 같은 이유).
+            from src.retrieval.ranking import rrf_fuse_ids
+            ids = rrf_fuse_ids({"rerank": ids, "search": list(fused)}, k=rrf_k,
+                               top_n=depth, weights={"rerank": fuse_rerank, "search": 1.0})
+            r["fuse_rerank"] = fuse_rerank
+        r["reranked_ids"] = ids
         # 점수를 함께 남김. 이게 없으면 '정답과 오답의 점수가 얼마나 벌어졌는가' 를
         # 보려고 재정렬을 통째로 다시 돌려야 함. 깊이를 바꿔 가며 재는 것도 이 값으로 함.
-        r["rerank_scores"] = [round(float(p.score), 6) for p in papers]
+        # 점수는 재정렬기가 매긴 값 그대로 남김. 순위 합치기를 켜면 `reranked_ids` 의
+        # 순서와 짝이 안 맞으므로, 논문 번호를 키로 하는 표로 저장함.
+        by_id = {p.paper_id: round(float(p.score), 6) for p in papers}
+        r["rerank_scores"] = [by_id.get(pid, 0.0) for pid in ids]
         # 어느 깊이로 재정렬했는지 문항에 새겨 둠. 이게 없으면 나중에 이 파일을 다시
         # 집계할 때 명령줄 기본값(fuse_top_n)으로 상한을 계산해 버림 - ISSUE #26 과
         # 똑같은 어긋남이 재집계 단계에서 되살아나는 자리임.
@@ -1093,6 +1121,11 @@ def main() -> None:
                     choices=["none", "cross", "embedding", "llm"],
                     help="재정렬 방식. 저장된 결과 위에서 돌아가므로 검색은 다시 하지 않는다")
     ap.add_argument("--rerank-depth", type=int, default=100, help="재정렬에 넣을 후보 수")
+    ap.add_argument("--rerank-model", default=None,
+                    help="쓸 재정렬 모델 (미세조정한 것을 견줄 때 지정). 안 주면 서비스 기본값")
+    ap.add_argument("--fuse-rerank", type=float, default=0.0,
+                    help="재정렬 순위를 검색 순위와 한 번 더 합칠 때의 재정렬 쪽 가중치 "
+                         "(검색 쪽은 1.0). 0 이면 안 합침. 서비스는 3.0 을 씀 (ISSUE #41)")
     ap.add_argument("--channel-depth", type=int, default=None,
                     help="융합 전에 채널마다 몇 편까지만 볼지 (서비스와 조건을 맞출 때 씀)")
     ap.add_argument("--diagnose", default=None,
@@ -1110,7 +1143,7 @@ def main() -> None:
                     help="임베딩을 메모리에 올리지 않고 디스크에서 읽는다(메모리 절약, 느림)")
     ap.add_argument("--embed-model", default=None,
                     help="질문을 임베딩할 모델. **--index 를 만든 모델과 같아야 한다.** "
-                         "미세조정한 색인을 쓸 때 반드시 함께 준다 (예: models/bge-m3-papers)")
+                         "미세조정한 색인을 쓸 때 반드시 함께 준다 (예: models/retriever-ft)")
 
     ap.add_argument("--bench-service", action="store_true",
                     help="정확도가 아니라 응답 시간을 단계별로 잰다 (평가셋 대신 예시 질문)")
@@ -1168,10 +1201,29 @@ def main() -> None:
                                 None if args.no_cache else CACHE_PATH)
             rerank_rows(rows, args.rerank, args.rerank_depth, lookup,
                         args.rrf_k, weights, args.batch_size, args.rerank_query,
-                        args.channel_depth)
-            # 재정렬 결과를 파일에 되써서 재사용함 (실행 정보 _meta 줄은 그대로 보존).
+                        args.channel_depth, args.rerank_model, args.fuse_rerank)
+            # 재정렬 결과를 파일에 되써서 재사용함.
             # --out 을 주면 원본을 건드리지 않고 새 파일로 씀 - 같은 검색 결과에서
             # 채널 조합을 여러 가지로 갈라 볼 때 서로 덮어쓰지 않기 위함임.
+            #
+            # **여기서 다시 한 것을 _meta 에 덧붙임.** 옛 _meta 를 그대로 두면 새 파일이
+            # 옛 실행 정보를 달고 나감 - 확정 결과 파일이 다른 구성으로 기록된 적이
+            # 두 번 있었음(ISSUE #54). 원본 정보는 `replayed_from` 아래에 보존함.
+            metas = list(metas)
+            redone = {"_meta": True,
+                      "replayed_from": str(path),
+                      "replayed_at": datetime.now().isoformat(timespec="seconds"),
+                      "commit": git_commit(),
+                      "queries": args.queries,
+                      "use_channels": args.use_channels,
+                      "rrf_k": args.rrf_k, "weights": weights,
+                      "rerank": args.rerank, "rerank_depth": args.rerank_depth,
+                      "rerank_model": args.rerank_model,
+                      "rerank_query": args.rerank_query,
+                      "channel_depth": args.channel_depth,
+                      "fuse_rerank": args.fuse_rerank,
+                      "prev_meta": metas[0] if metas else None}
+            metas = [redone] + metas[1:]
             dest = Path(args.out) if args.out else path
             dest.parent.mkdir(parents=True, exist_ok=True)
             write_jsonl(dest, rows + metas)
@@ -1233,9 +1285,16 @@ def main() -> None:
                             None if args.no_cache else CACHE_PATH)
         rerank_rows(results, args.rerank, args.rerank_depth, lookup,
                     args.rrf_k, weights, args.batch_size, args.rerank_query,
-                    args.channel_depth)
+                    args.channel_depth, args.rerank_model, args.fuse_rerank)
 
+    # 무엇으로 잰 값인지 전부 남김. 이 줄이 비어 있어서 확정 결과 파일이 다른 구성으로
+    # 기록된 적이 있음(#54) - 색인, 두 모델, 검색어 재사용 여부까지 적음.
     meta = {"_meta": True, "rewriter": args.rewriter, "queries": args.queries,
+            "reuse_queries": args.reuse_queries,
+            "index": args.index, "embed_model": args.embed_model,
+            "rerank_model": args.rerank_model,
+            "rerank_depth": args.rerank_depth,
+            "fuse_rerank": args.fuse_rerank,
             "channels": args.channels, "k": args.k, "rrf_k": args.rrf_k,
             "local_query": args.local_query,
             "weights": weights, "rerank": args.rerank,

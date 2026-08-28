@@ -16,8 +16,9 @@
           → 후보 합치기 → 교차 인코더 재정렬 → 추천 이유 생성 → 10편
 ```
 
-> **2026-08-16 주의:** 지금 `app.py` 는 arXiv 채널의 후보를 전부 버리고 있고, 학습한 변환기
-> (dpo)도 결과에 영향을 주지 못함(docs/ISSUE.md #39). 구조를 확정하는 것이 현재 1순위임.
+> **2026-08-28 현재:** 위 구조는 2026-08-16 에 다시 짰음(ISSUE #39 해결). arXiv 결과는
+> 추천 목록에 섞지 않고 "최신 논문" 칸으로 따로 보여 줌. 시험용 342문항 Recall@10 **0.617** ·
+> nDCG@10 **0.521** 이고 목표는 0.70 임. 지금 1순위는 **재정렬기 미세조정**(ISSUE #55).
 
 ## 실행
 
@@ -46,8 +47,10 @@ $PY -m pytest tests/ -q
 | `src/retrieval/` | 검색 (코퍼스 · 로컬 색인 · arXiv · 순위) |
 | `src/recommend_agent/` | 추천 이유 생성 |
 | `evaluation/` | 평가셋 제작 · 파이프라인 실행 · 지표 · 보고 |
-| `training/` | 변환기 학습 (SFT → DPO) |
+| `training/` | 학습 (쿼리 변환기 · 검색 모델 · 재정렬기) |
 | `data/eval/` | 평가셋 4개 (`dev` · `test` · `grades_dev` · `grades_test`) |
+| `data/training/` | 학습 자료 (`train_*` · `val_*`) |
+| `models/` | 학습한 모델 (`query-translator-*` · `retriever-ft` · `reranker-ft`) |
 
 **디렉터리마다 코드 파일은 4개를 넘지 않는다.** 새 기능은 되도록 기존 파일 안에 넣는다.
 
@@ -59,6 +62,7 @@ $PY -m pytest tests/ -q
 | [docs/PLAN.md](docs/PLAN.md) | 큰 그림, 무엇을 왜 하는가 |
 | [docs/MODULE_SPECIFICATION.md](docs/MODULE_SPECIFICATION.md) | 모듈별 구조와 인터페이스 |
 | [docs/ISSUE.md](docs/ISSUE.md) | 겪은 문제와 해결 과정 (철회한 결론 포함) |
+| [docs/ARTIFACTS.md](docs/ARTIFACTS.md) | 모델·색인·학습 자료가 무엇이고 성능이 어땠는지 · 이름 규칙 · 지운 파일 기록 |
 | [docs/ARXIV_API_POLICY.md](docs/ARXIV_API_POLICY.md) | arXiv 이용 정책 준수 사항 |
 | [evaluation/README.md](evaluation/README.md) | 평가 실행 방법 |
 

@@ -15,12 +15,12 @@
 문제의 정곡을 찌름. 실패한 후보도 버리지 않고 선호 학습(DPO)용 쌍으로 함께 저장함.
 
 출력 (data/training/):
-  sft_pairs.jsonl   : {"input": 질문, "output": 가장 잘 찾은 쿼리}  <- 지도 미세조정(SFT)용
-  dpo_pairs.jsonl   : {"input": 질문, "chosen": 잘 찾은 쿼리, "rejected": 못 찾은 쿼리} <- DPO용
+  train_query_translator_sft.jsonl   : {"input": 질문, "output": 가장 잘 찾은 쿼리}  <- 지도 미세조정(SFT)용
+  train_query_translator_dpo.jsonl   : {"input": 질문, "chosen": 잘 찾은 쿼리, "rejected": 못 찾은 쿼리} <- DPO용
   candidates.jsonl  : 모든 후보와 점수(분석, 재사용용)
 
 실행 예:
-  python -m training.build_training_data --queries data/eval/dev.jsonl \
+  python -m training.build_translator_pairs --queries data/eval/dev.jsonl \
       --n-candidates 5 --limit 50
 """
 
@@ -145,16 +145,16 @@ def main() -> None:
                   f"({time.time()-t0:.0f}초)", flush=True)
 
     out = Path(args.out_dir)
-    write_jsonl(out / "sft_pairs.jsonl", sft)
-    write_jsonl(out / "dpo_pairs.jsonl", dpo)
+    write_jsonl(out / "train_query_translator_sft.jsonl", sft)
+    write_jsonl(out / "train_query_translator_dpo.jsonl", dpo)
     write_jsonl(out / "candidates.jsonl", cand_log)
 
     print("\n" + "=" * 60)
     print(f"질문 {len(rows)}개 처리")
     print(f"  학습 라벨 확보: {n_used}개 ({n_used/len(rows):.1%})")
     print(f"  제외(정답 못 찾음): {n_skipped}개")
-    print(f"  SFT 쌍: {len(sft)}개 -> {out/'sft_pairs.jsonl'}")
-    print(f"  DPO 선호쌍: {len(dpo)}개 -> {out/'dpo_pairs.jsonl'}")
+    print(f"  SFT 쌍: {len(sft)}개 -> {out/'train_query_translator_sft.jsonl'}")
+    print(f"  DPO 선호쌍: {len(dpo)}개 -> {out/'train_query_translator_dpo.jsonl'}")
 
 
 if __name__ == "__main__":

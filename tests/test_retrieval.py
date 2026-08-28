@@ -171,6 +171,82 @@ def test_서비스와_평가의_후보_합치기가_같은_순위를_낸다():
         f"서비스와 평가의 순위가 다름\n  서비스 {from_service}\n  평가   {from_eval}")
 
 
+def test_화면에_넣는_제목은_한_줄로_펴진다():
+    """arXiv 제목의 줄바꿈이 마크다운 머리글을 깨뜨리는 것을 막음.
+
+    코퍼스 표본 20,000편 중 814편(4.1%)의 제목에 줄바꿈이 들어 있음. 그대로
+    `#### 3. [{제목}]({주소})  `{판정}`` 에 끼우면 머리글이 첫 줄에서 끝나고, 나머지
+    제목과 링크 문법과 판정 표시가 본문 글씨로 떨어짐 - 논문마다 글씨 크기가 달라지고
+    링크가 안 걸림. 2026-08-28 에 사용자가 화면에서 발견했음.
+    """
+    import app
+
+    제목 = "ReinDiffuse: Crafting Physically Plausible Motions with Reinforced\n  Diffusion Model"
+    편 = app.one_line(제목)
+    assert "\n" not in 편, f"줄바꿈이 남아 있음: {편!r}"
+    assert 편 == ("ReinDiffuse: Crafting Physically Plausible Motions with Reinforced "
+                 "Diffusion Model"), 편
+    # 실제로 만드는 마크다운 한 줄이 정말 한 줄인지 확인함
+    head = f"#### 3. [{편}](https://arxiv.org/abs/2410.07296)  `관련 있음`"
+    assert head.count("\n") == 0
+    assert head.startswith("#### 3. [") and head.endswith("`관련 있음`")
+    # 탭과 여러 칸 띄어쓰기도 한 칸으로 모음
+    assert app.one_line("A\t\tB   C") == "A B C"
+    assert app.one_line("") == "" and app.one_line(None) == ""
+
+
+def test_서비스와_평가의_순위_합치기가_같은_순서를_낸다():
+    """재정렬 순위와 검색 순위를 합치는 계산이 두 경로에서 같아야 함.
+
+    같은 종류의 어긋남을 이미 네 번 겪었음 (#10, #13, #39, #40). 서비스가 한 가중치로
+    합치고 평가가 다른 가중치로 합치면 오류 없이 값만 달라지고, 그 값으로 채택을 정하게 됨.
+    """
+    import app
+    from src import config
+    from src.retrieval.ranking import rrf_fuse_ids
+
+    # 재정렬이 매긴 순서와 검색이 매긴 순서가 다른 상황
+    rerank_order = ["aaa", "bbb", "ccc", "ddd", "eee"]
+    search_order = ["eee", "ddd", "aaa", "ccc", "bbb"]
+
+    ranked = [sp(pid, i) for i, pid in enumerate(rerank_order, 1)]
+    candidates = [sp(pid, i) for i, pid in enumerate(search_order, 1)]
+
+    from_service = [p.paper_id for p in app.fuse_with_search(ranked, candidates)]
+    from_eval = rrf_fuse_ids(
+        {"rerank": rerank_order, "search": search_order},
+        k=config.RRF_K, top_n=len(rerank_order),
+        weights={"rerank": app.FUSE_RERANK_WEIGHT, "search": 1.0})
+
+    assert from_service == from_eval, (
+        f"서비스와 평가의 순위 합치기가 다름\n  서비스 {from_service}\n  평가   {from_eval}")
+    # 합치기를 껐을 때는 재정렬 순서 그대로여야 함
+    old = app.FUSE_RERANK_WEIGHT
+    try:
+        app.FUSE_RERANK_WEIGHT = 0.0
+        assert [p.paper_id for p in app.fuse_with_search(ranked, candidates)] == rerank_order
+    finally:
+        app.FUSE_RERANK_WEIGHT = old
+
+
+def test_순위_합치기가_재정렬_점수를_잃지_않는다():
+    """합친 뒤에도 각 논문의 재정렬 점수가 따라가야 함.
+
+    `MIN_RERANK_SCORE` 로 '못 찾았다' 를 판정하는 자리가 그 점수를 씀. 순서만 바꾸고
+    점수를 잃으면 그 판정이 조용히 망가짐.
+    """
+    import app
+
+    ranked = [sp("aaa", 1), sp("bbb", 2), sp("ccc", 3)]
+    for p, v in zip(ranked, (0.9, 0.5, 0.001)):
+        p.score = v
+    candidates = [sp("ccc", 1), sp("bbb", 2), sp("aaa", 3)]
+
+    out = app.fuse_with_search(ranked, candidates)
+    assert {p.paper_id for p in out} == {"aaa", "bbb", "ccc"}
+    assert {p.paper_id: p.score for p in out} == {"aaa": 0.9, "bbb": 0.5, "ccc": 0.001}
+
+
 def test_가상_초록이_비면_그_채널은_검색하지_않는다():
     """생성이 실패했을 때 원본 질문으로 대신 찾으면 로컬 채널이 표를 두 번 던짐."""
     from evaluation.pipeline_eval import LocalHydeChannel
@@ -225,12 +301,12 @@ def test_색인을_만든_모델로_질문을_임베딩한다():
     try:
         class Args:
             corpus, index, mmap, no_cache = "c", "i", False, True
-            embed_model = "models/bge-m3-papers"
+            embed_model = "models/retriever-ft"
         pe.build_channels(["local_dense"], Args())
     finally:
         li_mod.LocalDenseRetriever = 진짜
 
-    assert 받은인자.get("model_name") == "models/bge-m3-papers", (
+    assert 받은인자.get("model_name") == "models/retriever-ft", (
         f"색인을 만든 모델이 안 넘어갔음: {받은인자}")
 
 

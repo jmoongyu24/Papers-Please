@@ -88,6 +88,66 @@ DEPTH_LOCAL = 100       # 로컬 의미 검색 한 번에 받아올 후보 수 (
 DEPTH_ARXIV = 100       # arXiv 에서 받아올 후보 수 (page_size 가 100 이라 호출 1회로 끝남)
 RERANK_DEPTH = 100      # 재정렬에 넣을 최대 후보 수
 
+# -- 재정렬 순위를 검색 순위와 한 번 더 합칠 때의 재정렬 쪽 가중치 (검색 쪽은 1.0) ----
+#
+# 0 이면 안 합치고 재정렬 순위만 씀 (2026-08-28 이전 동작).
+#
+# 왜 합치는가 (ISSUE #41). hard 난이도에서 재정렬기가 후보 100편 **전부**에 '관련 없음' 에
+# 해당하는 값을 줌 - 정답이 후보에 있었는데 밀린 24문항의 정답 점수 중앙값이 0.0035,
+# 10등이 0.0152 임. 그 구간 안의 순서에는 근거가 없음. 그런데 검색 순위는 같은 문항에서
+# 다른 논문을 맞히고 있음. hard 에서 두 순위의 Recall@10 이 0.267 로 정확히 같은데
+# 겹치는 문항이 서로 달라서, 합치면 0.345 까지 오를 여지가 있었음.
+#
+# 2026-08-28 실측 (개발용 348문항, 미세조정 색인, 저장된 결과로 재계산):
+#
+#   가중치   전체     easy    medium    hard
+#    없음   0.618    0.914    0.672    0.267    <- 재정렬 순위만
+#      1    0.621    0.905    0.638    0.319
+#      2    0.624    0.905    0.647    0.319
+#      3    0.635    0.914    0.681    0.310    <- 이것을 고름
+#      4    0.629    0.905    0.672    0.310
+#
+# 3 을 고른 이유: 전체가 가장 높고 easy 가 안 떨어짐. 가중치를 낮추면 검색 순위가 세져
+# medium 이 깎임(0.672 -> 0.638).
+#
+# **지금 서비스 색인에서는 효과가 없음** - 전체 +0.006(p=0.583), hard +0.017(p=0.445).
+# 미세조정 색인(`data/embeddings/cs2021-ft`)과 함께 켜야 뜻이 있음.
+#
+# 기준선 0.002 에 미치는 영향도 쟀음: 상위 10편 3,480칸 중 접히는 칸이 60칸에서
+# 72칸(2.1%)으로 늘고, **접혀서 사라지는 정답은 0문항**. 상위 10편이 통째로 접히는
+# 문항이 0개에서 2개가 됨.
+#
+# 다시 만지려면 감이 아니라 이 표를 다시 만들 것:
+#   python -m evaluation.pipeline_eval --report-only <실행결과> --rerank cross \
+#       --rerank-depth 100 --fuse-rerank N
+FUSE_RERANK_WEIGHT: float = 3.0
+
+# -- 쓸 색인 ----------------------------------------------------------------
+#
+# `cs2021`    원본 `BAAI/bge-m3` 로 만든 색인
+# `cs2021-ft` 우리 자료로 미세조정한 `models/retriever-ft` 로 만든 색인  <- 지금 쓰는 것
+#
+# 질문을 임베딩할 모델은 `load_local_index` 가 색인 파일에 적힌 것을 읽어 씀.
+# 손으로 맞추지 말 것 - 어긋나면 오류 없이 순위만 무너짐(ISSUE #50).
+#
+# 2026-08-28 에 `cs2021` 에서 바꿨음. 시험용 342문항 Recall@10 (순위 합치기와 한 묶음):
+#
+#              전체    easy   medium   hard    한국어    영어
+#   옛 구성    0.617   0.930   0.658   0.263   0.591   0.643
+#   지금       0.658   0.904   0.737   0.333   0.661   0.655
+#   차이      +0.041  -0.026  +0.079  +0.070  +0.070  +0.012
+#   p          0.085   0.442   0.094   0.120   0.045   0.768
+#
+# **주 지표(전체)는 p=0.085 로 유의성을 확보하지 못했음.** 개발용에서는 +0.060(p=0.003)
+# 이었고 시험용에서 방향과 크기가 재현됐으나 342문항으로는 이 크기를 잡아내기에 모자람
+# (신뢰구간 [-0.003, +0.085]). **채택 근거는 성능이 아니라 ⓐ 유의미하게 나빠진 무리가
+# 하나도 없고 ⓑ 한국어가 유의미하게 좋아졌다는 것임**(+0.070, p=0.045). 2026-08-16 에
+# 지금 구성을 채택할 때와 같은 형태의 근거임. 보고서에 이대로 적을 것.
+#
+# 되돌리려면 이 값을 "cs2021" 로 바꾸고 FUSE_RERANK_WEIGHT 를 0 으로 둘 것.
+# 둘은 한 묶음임 - 순위 합치기는 원본 색인에서 효과가 없음(+0.006, p=0.583).
+LOCAL_INDEX = "cs2021-ft"
+
 # 깊이를 왜 300 에서 100 으로 줄였는가 (2026-08-16 실측, 개발용 348문항)
 #
 #   후보 깊이   Recall@10   nDCG@10   상위 10편에 쓸모있는 논문이 한 편 이상
@@ -135,6 +195,23 @@ RERANK_DEPTH = 100      # 재정렬에 넣을 최대 후보 수
 #   영어 0.17 대 한국어 0.07). 질문과 초록의 언어가 달라서임. 그래서 어느 기준선을 잡아도
 #   한국어 쪽이 1.5배쯤 더 걸림. 느슨하게 잡은 이유의 절반이 이것임.
 #
+# 2026-08-28 재측정 (색인을 cs2021-ft 로 바꾸고 순위 합치기를 켠 뒤, 개발용 348문항):
+#
+#   기준선   무관 걸러냄   만족 잘못 버림   (영어)   (한국어)
+#   0.001      33.8%          6.3%        5.3%     7.3%
+#   0.002      44.4%         11.0%        9.4%    12.6%   <- 그대로 둠
+#   0.005      59.0%         19.3%       17.3%    21.3%
+#   0.010      68.4%         28.3%       25.3%    31.3%
+#
+# **재정렬 모델을 안 바꿨으므로 점수 눈금도 그대로임.** 값을 바꿀 이유가 없어 0.002 유지.
+# 순위 합치기를 켠 뒤 실제로 접히는 양도 쟀음:
+#
+#                        접히는 칸        접힌 정답   상위10 통째 접힘   등급2+ 논문 중 접힘
+#   순위 합치기 없음      60/3480 (1.7%)      0문항        2문항          20/2188 (0.9%)
+#   순위 합치기 3:1      72/3480 (2.1%)      0문항        2문항          16/2045 (0.8%)
+#
+# 접혀서 사라지는 정답이 0문항이고 쓸모 있는 논문이 접히는 비율도 1% 미만임.
+#
 # None 이면 걸러내지 않음. 재정렬 모델을 바꾸면 점수 눈금이 달라지므로 반드시 다시 재야 함.
 MIN_RERANK_SCORE: float | None = 0.002
 
@@ -167,10 +244,16 @@ def load_local_index():
     Streamlit 은 사용자가 무언가 누를 때마다 스크립트를 처음부터 다시 실행함.
     캐시하지 않으면 검색할 때마다 임베딩 2.93GB 를 새로 올려 메모리가 바로 터짐.
     """
-    from src.retrieval.local_index import LocalDenseRetriever
+    from src.retrieval.local_index import LocalDenseRetriever, read_meta
+
+    # 색인을 만든 모델과 질문을 임베딩하는 모델은 **반드시 같아야 함.** 어긋나면 오류 없이
+    # 순위만 무너짐 (ISSUE #50). 색인 파일에 적힌 모델을 그대로 읽어 씀.
+    prefix = config.DATA_DIR / "embeddings" / LOCAL_INDEX
+    model = read_meta(prefix).get("model") or config.EMBED_MODEL
     return LocalDenseRetriever(
         corpus_path=config.CORPUS_DIR / "corpus-cs2021.jsonl",
-        out_prefix=config.DATA_DIR / "embeddings" / "cs2021",
+        out_prefix=prefix,
+        model_name=model,
     )
 
 
@@ -268,6 +351,18 @@ def load_hyde():
 # 검색 파이프라인 (화면 그리기와 분리해 둠)
 # ==========================================================================
 
+def one_line(text: str) -> str:
+    """제목을 한 줄로 폄.
+
+    arXiv 메타데이터의 제목은 원문 그대로 줄이 접혀 있음(줄바꿈 + 공백 두 칸).
+    코퍼스 표본 2만 편 중 814편(약 4%)이 그런 제목임. 이걸 그대로
+    `#### [제목](주소)` 에 넣으면 줄바꿈 자리에서 제목 표시가 끊겨,
+    앞줄만 제목 크기로 크게 나오고 뒷줄은 본문 크기로 작게 나오며 링크 표기가
+    글자 그대로 드러남 (2026-08-29 화면에서 확인).
+    """
+    return " ".join((text or "").split())
+
+
 def arxiv_url(paper_id: str) -> str:
     return f"https://arxiv.org/abs/{paper_id}"
 
@@ -314,6 +409,27 @@ def fuse_local(literal_hits, hyde_hits) -> list:
     return rrf_fuse(channels, k=config.RRF_K, top_n=RERANK_DEPTH)
 
 
+def fuse_with_search(ranked: list, candidates: list) -> list:
+    """재정렬 순위와 검색 순위를 한 번 더 합침 (`FUSE_RERANK_WEIGHT` 설명글 참고).
+
+    `candidates` 는 `fuse_local` 이 만든 검색 순위 그대로임. 점수가 아니라 등수를 더하므로
+    두 단계의 점수 눈금이 달라도 됨.
+
+    재정렬 점수는 그대로 들고 감. `MIN_RERANK_SCORE` 로 접는 판정이 그 값을 쓰기 때문임.
+    """
+    if FUSE_RERANK_WEIGHT <= 0 or not ranked:
+        return ranked
+    from src.retrieval.ranking import rrf_fuse_ids
+
+    order = rrf_fuse_ids(
+        {"rerank": [p.paper_id for p in ranked],
+         "search": [c.paper_id for c in candidates]},
+        k=config.RRF_K, top_n=len(ranked),
+        weights={"rerank": FUSE_RERANK_WEIGHT, "search": 1.0})
+    by_id = {p.paper_id: p for p in ranked}
+    return [by_id[pid] for pid in order if pid in by_id]
+
+
 def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
     """검색 한 번을 끝까지 수행하고 결과를 모아 돌려줌.
 
@@ -340,7 +456,7 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
     from src.rewriter.baselines import TranslateRewriter
     out["search_text"] = query
     if use_local and TranslateRewriter.has_hangul(query):
-        status.write("한국어 질문을 영어로 옮기는 중...")
+        status.write("한국어 질문을 영어로 번역하는 중...")
         t0 = time.time()
         tr = load_translator().rewrite(query)
         if tr.parse_ok:
@@ -377,7 +493,7 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
             intent="", parse_ok=True)
 
     if use_local:
-        status.write(f"논문 71만 편에서 뜻으로 찾는 중... (검색어 2개 x 후보 {DEPTH_LOCAL}편)")
+        status.write(f"코퍼스에서 찾는 중...")
         t0 = time.time()
         try:
             index = load_local_index()
@@ -397,13 +513,13 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
     # 그래도 호출은 남김. arXiv 채널의 가치는 정확도가 아니라 색인에 없는 최신 논문이고,
     # 그 가치는 평가셋으로 잴 수 없기 때문임 (평가셋 정답 논문이 전부 색인 안에 있음).
     if use_arxiv:
-        status.write(f"arXiv 에서 최신 논문을 찾는 중... (후보 {DEPTH_ARXIV}편)")
+        status.write(f"arXiv 에서 최신 논문을 찾는 중...")
         t0 = time.time()
         try:
             out["arxiv_hits"] = load_arxiv().search(
                 out["rewrite"].query_for("arxiv"), k=DEPTH_ARXIV)
         except Exception as e:
-            out["arxiv_error"] = (f"arXiv 검색 중 오류가 났습니다. 일시적일 수 있으니 잠시 후 "
+            out["arxiv_error"] = (f"arXiv 검색 중 오류가 발생했습니다. 잠시 후 "
                                   f"다시 시도해 주세요. [{type(e).__name__}]")
         out["timing"]["arXiv 검색"] = time.time() - t0
 
@@ -411,17 +527,19 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
     out["n_candidates"] = len(candidates)
 
     if candidates:
-        status.write(f"질문 의도와 대조해 순위를 다시 매기는 중... (후보 {len(candidates)}편)")
+        status.write(f"질문 의도를 분석해 관련 논문 순위를 다시 매기는 중...")
         t0 = time.time()
         # 번역문이 아니라 원본 질문으로 재정렬함.
         # 재정렬의 목적이 '사용자 의도와 맞는가' 를 보는 것이라 사용자가 실제로 쓴 말을 씀.
         # 번역문으로도 재봤는데 이득이 없었음 - 시험용 342문항에서 Recall +0.006(p=0.678),
         # nDCG -0.007(p=0.226) 으로 둘 다 잡음과 구분되지 않았음 (2026-08-14).
-        out["results"] = load_reranker().rerank(query, candidates, top_k=TOP_K)
+        # 후보 전체를 채점받음. 뒤에서 검색 순위와 합치려면 상위 10편만으로는 모자람.
+        ranked = load_reranker().rerank(query, candidates, top_k=len(candidates))
+        out["results"] = fuse_with_search(ranked, candidates)[:TOP_K]
         out["timing"]["재정렬"] = time.time() - t0
 
     if out["results"]:
-        status.write("각 논문이 왜 맞는지 정리하는 중...")
+        status.write("각 논문을 왜 추천하는지 정리하는 중...")
         t0 = time.time()
         try:
             out["recommendation"] = load_recommender(use_arxiv).recommend(query, out["results"])
@@ -453,6 +571,11 @@ def confident_results(results, min_score: float | None):
 # 화면 조각
 # ==========================================================================
 
+# 가상 초록은 초록 한 편 길이라 칸에 그대로 넣으면 줄 전체가 세로로 길어짐.
+# 앞부분만 보여주고 나머지는 접어 둠.
+HYDE_PREVIEW_LEN = 100
+
+
 def render_understanding(query: str, state: dict) -> None:
     """무엇을 어떻게 알아들었는지 보여줌 (ISSUE 11).
 
@@ -463,6 +586,9 @@ def render_understanding(query: str, state: dict) -> None:
     학습 모델(dpo)은 arXiv 문법 문자열 하나만 내놓음. 의도, 개념, 학술 용어를 따로 만들지
     않아서 intent 자리에 원본 질문이 그대로 들어 있음. 그런데도 칸을 고정으로 그리면
     "내가 쓴 말 / 내가 쓴 말 / (원본을 그대로 썼습니다)" 가 되어 빈 칸만 늘어놓게 됨.
+
+    가상 초록도 여기서 함께 보여줌. 두 번째 검색어로 실제로 검색에 쓰이는 글이므로,
+    접어 둔 '어떻게 찾았는지 보기' 가 아니라 다른 검색어들과 나란히 놓는 편이 맞음.
     """
     rw = state["rewrite"]
     translated = state.get("search_text")
@@ -471,24 +597,34 @@ def render_understanding(query: str, state: dict) -> None:
     intent = (rw.intent or "").strip()
     has_intent = bool(intent) and intent != query.strip()
     terms = academic_terms_of(rw, query)
+    hyde = (state.get("hyde_text") or "").strip()
 
-    if not (has_translation or has_intent or terms):
+    if not (has_translation or hyde or has_intent or terms):
         st.caption("입력하신 말을 그대로 뜻으로 검색했습니다.")
         return
 
-    st.markdown("#### 이렇게 알아들었습니다")
-    n = 1 + int(has_translation) + int(has_intent) + int(bool(terms))
+    st.markdown("#### 이렇게 검색했습니다")
+    n = 1 + int(has_translation) + int(bool(hyde)) + int(has_intent) + int(bool(terms))
     cols = st.columns(n)
     i = 0
     with cols[i]:
-        st.caption("내가 쓴 말")
+        st.caption("원본 질문")
         st.info(query)
     if has_translation:
         i += 1
         with cols[i]:
-            st.caption("영어로 이렇게 옮겨 찾았습니다")
+            st.caption("영어로 번역한 쿼리")
             st.success(translated)
-            st.caption("arXiv 논문이 영어라, 한국어로 물으시면 먼저 영어로 옮깁니다.")
+    if hyde:
+        i += 1
+        with cols[i]:
+            st.caption("쿼리를 바탕으로 작성한 가상 초록")
+            if len(hyde) > HYDE_PREVIEW_LEN:
+                st.success(hyde[:HYDE_PREVIEW_LEN] + "...")
+                with st.expander("가상 초록 전체 보기"):
+                    st.write(hyde)
+            else:
+                st.success(hyde)
     if has_intent:
         i += 1
         with cols[i]:
@@ -499,12 +635,12 @@ def render_understanding(query: str, state: dict) -> None:
     if terms:
         i += 1
         with cols[i]:
-            st.caption("arXiv 에는 이 용어로 물었습니다")
-            st.info(", ".join(terms))
+            st.caption("arXiv 검색에 사용한 키워드")
+            st.success(", ".join(terms))
     if state.get("translate_error"):
-        st.caption(f"번역에 실패해 원본으로 검색했습니다. {state['translate_error']}")
+        st.caption(f"번역에 실패해 원본 질문으로 검색했습니다. {state['translate_error']}")
     if not rw.parse_ok:
-        st.caption("변환에 실패해 원본 검색어로 검색했습니다.")
+        st.caption("변환에 실패해 원본 질문으로 검색했습니다.")
 
 
 def render_paper(rank: int, paper, judgement: dict | None) -> None:
@@ -513,9 +649,9 @@ def render_paper(rank: int, paper, judgement: dict | None) -> None:
     옛 화면은 '검색된 논문'과 '최종 추천 논문'을 따로 두어 같은 논문이 두 번 나왔음.
     사용자는 어느 목록을 봐야 하는지 알 수 없었음 (ISSUE 11).
     """
-    label = {"high": "강력 추천", "medium": "관련 있음", "low": "관련성 낮음"}
+    label = {"high": "관련성 높음", "medium": "관련성 있음", "low": "관련성 낮음"}
     tag = label.get((judgement or {}).get("relevance", ""), "")
-    head = f"#### {rank}. [{paper.title}]({arxiv_url(paper.paper_id)})"
+    head = f"#### {rank}. [{one_line(paper.title)}]({arxiv_url(paper.paper_id)})"
     st.markdown(f"{head}  `{tag}`" if tag else head)
     if judgement and judgement.get("reason"):
         st.caption(judgement["reason"])
@@ -530,7 +666,7 @@ def render_results(state: dict) -> None:
         if state.get("arxiv_error"):
             st.warning(state["arxiv_error"])
         else:
-            st.info("검색 결과가 없습니다. 검색어를 바꿔 다시 시도해 보세요.")
+            st.info("관련 논문을 찾지 못했습니다. 질문을 바꿔 다시 시도해 보세요.")
         return
 
     rec = state.get("recommendation") or {}
@@ -548,11 +684,7 @@ def render_results(state: dict) -> None:
     nothing_good = bool(judged) and all(j == "low" for j in judged)
 
     if not keep or nothing_good:
-        st.warning("딱 맞는 논문을 찾지 못했습니다. 검색어를 조금 다르게 써 보시면 "
-                   "결과가 달라질 수 있습니다.")
-        with st.expander(f"그래도 가장 가까운 {len(results)}편 보기"):
-            for i, p in enumerate(results, 1):
-                render_paper(i, p, by_index.get(i))
+        st.warning("관련 논문을 찾지 못했습니다. 질문을 바꿔 다시 시도해 보세요.")
         return
 
     if rec.get("summary"):
@@ -563,7 +695,7 @@ def render_results(state: dict) -> None:
         render_paper(shown, p, by_index.get(orig))
 
     if dropped:
-        with st.expander(f"관련성이 낮아 접어 둔 {len(dropped)}편 보기"):
+        with st.expander(f"관련성이 낮아 따로 빼둔 {len(dropped)}편 보기"):
             for shown, (orig, p) in enumerate(dropped, len(keep) + 1):
                 render_paper(shown, p, by_index.get(orig))
 
@@ -583,41 +715,11 @@ def render_recent(state: dict, use_arxiv: bool) -> None:
     fresh = [p for p in hits if normalize_paper_id(p.paper_id) not in shown][:5]
     if not fresh:
         return
-    with st.expander(f"arXiv 에서 방금 찾은 논문 {len(fresh)}편 더 보기 (색인에 없는 최신 논문 포함)"):
-        st.caption("이 목록은 관련도 순서가 아니라 arXiv 가 돌려준 순서입니다.")
+    with st.expander(f"arXiv에서 직접 찾은 논문 {len(fresh)}편 더 보기"):
+        st.caption("이 목록은 관련도 순서가 아니라 arXiv가 전달해준 순서입니다.")
         for p in fresh:
-            st.markdown(f"- [{p.title}]({arxiv_url(p.paper_id)})")
+            st.markdown(f"- [{one_line(p.title)}]({arxiv_url(p.paper_id)})")
 
-
-def render_sources(state: dict, use_local: bool, use_arxiv: bool) -> None:
-    """어디서 몇 편을 가져왔는지. 접어 두고, 궁금한 사람만 펼쳐 봄."""
-    with st.expander("어떻게 찾았는지 보기"):
-        src = []
-        if use_local:
-            src.append(f"뜻으로 찾기 {len(state.get('local_hits') or [])}편")
-            if state.get("hyde_hits"):
-                src.append(f"두 번째 검색어 {len(state['hyde_hits'])}편")
-        st.caption(f"후보: {' + '.join(src)} -> 순위 합치기 {state.get('n_candidates', 0)}편 "
-                   f"-> 재정렬해 상위 {TOP_K}편")
-        if use_arxiv:
-            st.caption(f"arXiv 는 최신 논문 칸으로 따로 {len(state.get('arxiv_hits') or [])}편")
-        if use_local and state.get("search_text") != state["rewrite"].raw_query:
-            st.caption(f"로컬 의미 검색어(영어로 옮김): `{state['search_text']}`")
-        if state.get("hyde_text"):
-            st.caption(f"두 번째 검색어(가상 초록): `{state['hyde_text'][:200]}`")
-        if use_arxiv:
-            st.caption(f"arXiv 검색어: `{state['rewrite'].query_for('arxiv')}`")
-        if state.get("local_error"):
-            st.caption(f"로컬 색인을 쓸 수 없었습니다: {state['local_error']}")
-        if state.get("arxiv_error"):
-            st.caption(state["arxiv_error"])
-        if state.get("recommend_error"):
-            st.caption(f"추천 이유를 만들지 못했습니다: {state['recommend_error']}")
-
-        timing = state.get("timing") or {}
-        if timing:
-            st.caption("단계별 소요 시간 (합계 {:.1f}초)".format(sum(timing.values())))
-            st.caption(" / ".join(f"{k} {v:.1f}초" for k, v in timing.items()))
 
 
 # ==========================================================================
@@ -625,40 +727,32 @@ def render_sources(state: dict, use_local: bool, use_arxiv: bool) -> None:
 # ==========================================================================
 
 st.title("Papers, Please")
-st.caption("한국어나 일상어로 물어보셔도 arXiv 에서 논문을 찾아 드립니다.")
+st.caption("사용자의 질문에 맞춰 arXiv에서 논문을 찾아 드립니다.")
 
 with st.sidebar:
     st.header("설정")
-    st.caption("기본값 그대로 두셔도 됩니다.")
+    st.caption("하나 이상의 검색 옵션을 선택해주세요.")
     use_local = st.checkbox("로컬 의미 검색 사용 (권장)", value=True,
-                            help="논문 71만 편을 뜻으로 검색합니다. 첫 실행에 1분 정도 걸립니다.")
+                            help="코퍼스에서 의미 기반으로 검색합니다. 1분 정도 걸립니다.")
     use_arxiv = st.checkbox("arXiv 최신 논문도 찾기", value=True,
-                            help="색인에 없는 최신 논문을 따로 찾아 아래에 따로 보여줍니다. "
-                                 "추천 목록의 순위에는 영향을 주지 않습니다. "
-                                 "끄면 약 5초 빨라집니다.")
+                            help="코퍼스에 없는 최신 논문을 찾아 아래에 따로 보여줍니다. "
+                                 "추천 목록 순위에는 영향을 주지 않습니다.")
     st.divider()
-    st.caption("arXiv 요청 제한을 지키기 위해 한 검색당 호출을 최소화합니다.")
+    st.caption("arXiv 호출 제한이 있으므로, 짧은 시간 내 과도한 검색 시 속도 저하가 발생할 수 있습니다")
 
 if "query" not in st.session_state:
     st.session_state.query = ""
 
 query = st.text_input(
     "무엇을 찾으시나요?", value=st.session_state.query,
-    placeholder="예: 사진 보고 글로 설명해주는 AI",
+    placeholder="예: 사진을 보고 글로 설명해주는 AI 관련 논문을 찾아줘.",
     label_visibility="collapsed")
-
-st.caption("이런 것도 찾을 수 있습니다:")
-cols = st.columns(len(EXAMPLES))
-for col, ex in zip(cols, EXAMPLES):
-    if col.button(ex, use_container_width=True):
-        st.session_state.query = ex
-        st.rerun()
 
 go = st.button("검색", type="primary", use_container_width=True)
 
 if go and query.strip():
     if not (use_local or use_arxiv):
-        st.error("검색 통로를 하나 이상 켜 주세요.")
+        st.error("검색 옵션을 하나 이상 선택해 주세요.")
         st.stop()
 
     with st.status("논문을 찾는 중입니다...", expanded=True) as status:
@@ -671,7 +765,7 @@ if go and query.strip():
     if state.get("resolved"):
         p = state["resolved"]
         st.success("이 논문을 찾으시는 것 같습니다")
-        st.markdown(f"### [{p.title}]({arxiv_url(p.paper_id)})")
+        st.markdown(f"### [{one_line(p.title)}]({arxiv_url(p.paper_id)})")
         with st.expander("초록 보기"):
             st.write(p.abstract)
         st.divider()
@@ -682,7 +776,10 @@ if go and query.strip():
     st.markdown("#### 찾은 논문")
     render_results(state)
     render_recent(state, use_arxiv)
-    render_sources(state, use_local, use_arxiv)
+
+    timing = state.get("timing") or {}
+    if timing:
+        st.caption("총 소요 시간 ({:.1f}초)".format(sum(timing.values())))
 
 # -- arXiv 이용 약관에 따른 표기 (공개 전 필수) -----------------------------
 # arXiv 이용 약관은 arXiv 가 지원하거나 보증하는 것처럼 표현하는 것을 명시적으로 금지함.
@@ -690,11 +787,19 @@ if go and query.strip():
 # 논문 원문(PDF, 소스)은 우리 서버에서 제공하지 않고 arXiv 초록 페이지로 보냄.
 st.divider()
 st.caption(
-    "논문 메타데이터(제목, 초록, 논문 번호)는 arXiv.org 에서 가져왔습니다. "
-    "arXiv 메타데이터는 CC0 1.0 으로 배포됩니다. "
+    "본 서비스는 논문 검색 시 참고용으로만 사용해주시길 바랍니다."
+)
+st.caption(
+    "arXiv 메타데이터는 arXiv에서 가져왔습니다. "
+    "arXiv 메타데이터는 CC0 1.0으로 배포됩니다. "
     "논문 원문은 arXiv 에서 직접 확인해 주세요."
 )
 st.caption(
-    "이 서비스는 arXiv 와 무관한 개인 프로젝트이며, **arXiv 의 후원이나 보증을 받지 "
-    "않았습니다.** Thank you to arXiv for use of its open access interoperability."
+    "이 서비스는 arXiv와 무관한 프로젝트이며, arXiv의 후원이나 보증을 받지 "
+    "않았습니다."
 )
+st.caption(
+    "Thank you to arXiv for use of its open access interoperability."
+    "This service was not reviewed or approved by, nor does it necessarily express or reflect the policies or opinions of, arXiv."
+)
+

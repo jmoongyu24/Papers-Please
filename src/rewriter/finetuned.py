@@ -25,7 +25,7 @@ INSTRUCTION = (
 )
 
 DEFAULT_BASE = "Qwen/Qwen3-4B-Instruct-2507"
-DEFAULT_ADAPTER = "models/qwen3-4b-query-lora/checkpoint-54"
+DEFAULT_ADAPTER = "models/query-translator-sft/checkpoint-54"
 
 
 class FinetunedRewriter:
