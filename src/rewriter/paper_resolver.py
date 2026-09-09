@@ -1,11 +1,8 @@
-"""특정 논문 지목(known-item) 해결기 - 방안 A.
+"""특정 논문을 설명으로 가리키는 질문 처리.
 
-'트랜스포머를 최초로 소개한 논문' 처럼 사용자가 특정 유명 논문을 '설명'으로 가리킬 때,
-키워드 검색은 그게 어떤 논문인지 못 알아냄. 대신 LLM의 지식으로 그 논문의 실제 제목을
-추정하고, arXiv에서 그 제목의 논문이 실제로 있는지 검증한 뒤에만 제시함.
-
-검증이 핵심이다: LLM이 없는 제목을 그럴싸하게 지어낼 수 있으므로(할루시네이션), arXiv에서
-제목이 실제로 확인될 때만 "이 논문을 찾으시는 것 같습니다"로 내놓음. 확인 안 되면 버림.
+"트랜스포머를 최초로 소개한 논문" 같은 질문은 키워드 검색으로 못 알아냄. 언어 모델의
+지식으로 제목을 추정하고, arXiv 에서 그 제목의 논문이 실제로 있는지 확인한 뒤에만
+사용자에게 보여 줌. 확인이 안 되면 지어낸 제목일 수 있으므로 버림.
 """
 
 from __future__ import annotations
@@ -39,7 +36,7 @@ def _norm_words(s: str) -> set[str]:
 
 
 def title_match(resolved: str, candidate: str, threshold: float = 0.8) -> bool:
-    """추정 제목과 arXiv 결과 제목이 충분히 일치하는지(단어 겹침 비율)."""
+    """추정 제목과 arXiv 결과 제목이 낱말 겹침 비율로 충분히 맞는지."""
     rw, cw = _norm_words(resolved), _norm_words(candidate)
     if not rw:
         return False
@@ -47,7 +44,7 @@ def title_match(resolved: str, candidate: str, threshold: float = 0.8) -> bool:
 
 
 class PaperResolver:
-    """질문이 특정 논문을 가리키면 그 제목을 추정함 (검증 전)."""
+    """질문이 특정 논문을 가리키면 그 제목을 추정함. 확인은 아래 함수가 함."""
 
     def __init__(self, client: OllamaClient | None = None):
         self.client = client or OllamaClient()
@@ -67,18 +64,17 @@ class PaperResolver:
 
 def resolve_and_verify(query: str, resolver: PaperResolver, arxiv_retriever,
                        k: int = 3) -> tuple[ScoredPaper | None, str | None]:
-    """설명->제목 추정 후 arXiv에서 검증함.
+    """제목을 추정한 뒤 arXiv 에서 실제로 있는지 확인함.
 
     Returns:
-        (검증된 논문 or None, 추정 제목 or None)
-        - (논문, 제목): 특정 논문으로 판단 + arXiv에서 제목 확인됨 -> 제시 가능
-        - (None, 제목): 제목은 추정했으나 arXiv에서 확인 안 됨 -> 할루시네이션 의심, 제시 안 함
-        - (None, None): 특정 논문을 가리키는 질문이 아님
+        (논문, 제목)   제목이 arXiv 에서 확인됨. 사용자에게 보여도 됨
+        (None, 제목)   제목을 추정했으나 확인 안 됨. 지어낸 것일 수 있어 안 보여 줌
+        (None, None)   특정 논문을 가리키는 질문이 아님
     """
     title = resolver.resolve(query)
     if not title:
         return None, None
-    # 제목 구문으로 arXiv 검색해 실제 존재를 확인
+    # 제목으로 arXiv 를 찾아 실제로 있는지 확인
     for r in arxiv_retriever.search(f'ti:"{title}"', k=k):
         if title_match(title, r.title):
             return r, title

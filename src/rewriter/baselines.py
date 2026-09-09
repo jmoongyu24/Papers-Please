@@ -1,25 +1,17 @@
-"""언어 모델에게 시켜서 변환하는 변환기 세 개 - 지금은 모두 비교 대상(기준선) 임.
+"""언어 모델에게 시켜서 변환하는 변환기들. 전부 Ollama 로 Qwen3-4B 를 부름.
 
-## 왜 이 셋이 한 파일에 있는가
+| 변환기 | 무엇을 시키나 |
+|---|---|
+| `TranslateRewriter` | 한국어 질문을 영어로 옮김. 서비스가 씀 |
+| `HydeRewriter` | 질문에 답할 법한 가상의 영어 초록을 지어냄. 서비스가 씀 |
+| `ServiceRewriter` | 위 둘을 한 번에. 평가를 서비스와 같은 조건으로 돌리기 위한 것 |
+| `HierarchicalRewriter` | 의도 -> 개념 -> 학술용어 -> 검색어 4단계. 비교군 |
+| `SingleStepRewriter` | "학술 검색어로 바꿔줘" 한 번만. 비교군 |
 
-셋 다 "Ollama 로 Qwen3-4B 를 부르고, JSON 스키마로 출력을 가둔다"는 같은 뼈대를 씀.
-다른 것은 무엇을 시키느냐(프롬프트) 뿐이라, 프롬프트까지 같은 파일에 두면 셋을 나란히
-놓고 비교하며 고칠 수 있음.
+`HierarchicalRewriter` 는 학습 데이터를 만드는 데도 쓰임
+(`training/build_translator_pairs.py`).
 
-| 변환기 | 무엇을 시키나 | 무엇을 가려내는 비교군인가 |
-|---|---|---|
-| `HierarchicalRewriter` | 의도 -> 개념 -> 학술용어 -> 검색어, 4단계를 한 번에 | 계층 구조 자체의 기여 |
-| `SingleStepRewriter` | "학술 검색어로 바꿔줘" 한 번만 | 계층이 없을 때의 값 |
-| `HydeRewriter` | 답이 될 법한 가상 초록을 지어내게 함 | 이미 알려진 다른 방법(HyDE) |
-
-지금 서비스가 쓰는 변환기는 여기 없음. 학습한 모델(`finetuned.py` 의 dpo)이 쓰임.
-`HierarchicalRewriter` 는 그 모델의 학습 데이터를 만드는 데도 쓰임
-(`training/build_translator_pairs.py`). 그래서 지우지 않고 남겨 둠.
-
-## 프롬프트를 고칠 때
-
-프롬프트는 가장 자주 고치는 부분임. 고치면 아래 `PROMPT_VERSION` 을 올려, 어느 프롬프트로
-잰 결과인지 나중에 구분할 수 있게 함.
+프롬프트를 고치면 `PROMPT_VERSION` 을 올려, 어느 프롬프트로 잰 결과인지 구분함.
 """
 
 from __future__ import annotations
@@ -36,8 +28,8 @@ PROMPT_VERSION = "v1"
 # 1. 프롬프트와 출력 형식
 # ==========================================================================
 
-# 모델이 반드시 이 형태로만 답하도록 강제하는 JSON 스키마.
-# 필드 순서(intent -> concepts -> academic_terms -> queries)가 곧 '단계적 사고' 순서임.
+# 모델이 이 형태로만 답하도록 강제하는 JSON 스키마.
+# 필드 순서(intent -> concepts -> academic_terms -> queries)가 곧 생각하는 순서임.
 OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -58,9 +50,8 @@ OUTPUT_SCHEMA = {
     "required": ["intent", "concepts", "academic_terms", "queries"],
 }
 
-# 예시는 few-shot '대화 기록'으로 넣지 않고 시스템 프롬프트 안에 1개만 둠.
-# (대화 기록으로 넣으면 특정 입력이 예시 주제로 붕괴해 그대로 복사되는 문제가 있었음 - ISSUE #1)
-# 예시 주제는 실제 검색 주제와 겹치지 않도록 speech recognition 하나만 씀.
+# 예시는 대화 기록이 아니라 시스템 프롬프트 안에 하나만 둠. 대화 기록으로 넣으면
+# 모델이 예시 주제를 그대로 복사함. 실제 검색 주제와 겹치지 않는 주제로 골랐음.
 _EXAMPLE = (
     '예시 — 입력이 "음성을 텍스트로 바꾸는 기술"이라면 출력은:\n'
     '{"intent":"음성 신호를 텍스트로 변환하는 기술","concepts":["음성 인식","음향 모델",'
@@ -91,14 +82,12 @@ SYSTEM = (
 
 
 def build_messages(raw_query: str) -> list[dict]:
-    """사용자 검색어 하나만 담은 메시지 목록 (예시는 시스템 프롬프트에 있음)."""
+    """사용자 검색어 하나만 담은 메시지 목록. 예시는 시스템 프롬프트에 있음."""
     return [{"role": "user", "content": f"검색어: {raw_query}"}]
 
 
-# 기준선 변환기용 프롬프트 + 스키마.
-# Qwen3는 추론 모델이라 자유 텍스트로 받으면 사고 과정이 답에 새어나옴(ISSUE #3).
-# 계층 변환과 똑같이 JSON 스키마로 출력을 필드에 가둬 이를 막음.
-# 단, 기준선의 성격을 지키려고 필드는 결과 1개만 둠(계층 없음: intent/concepts 등 없음).
+# 비교군 변환기용 스키마. 자유 텍스트로 받으면 모델의 사고 과정이 답에 섞여 나오므로
+# 여기서도 JSON 으로 가둠. 다만 비교군이므로 결과 필드 하나만 둠.
 
 SINGLE_STEP_SCHEMA = {
     "type": "object",
@@ -113,11 +102,7 @@ HYDE_SCHEMA = {
 
 
 def single_step_prompt(raw_query: str) -> str:
-    """한 번에 변환(계층 없이): 그냥 학술 검색어로 바꿔달라고만 시킴.
-
-    계층 변환과 달리 의도, 개념, 용어 단계를 밟지 않음. 오직 최종 영어 검색어 하나만
-    query 필드에 담음. '계층 구조의 유무'만 차이나는 공정한 대조군을 만들기 위함.
-    """
+    """계층 없이 한 번에 변환. 계층 구조가 있고 없고만 차이 나는 대조군을 만듦."""
     return (
         "다음 검색어를, 영어 학술 논문을 찾기 좋은 정확한 영어 검색어로 바꿔라. "
         "결과 검색어만 query 필드에 담아라 (설명·과정 없이).\n\n"
@@ -126,7 +111,7 @@ def single_step_prompt(raw_query: str) -> str:
 
 
 def hyde_prompt(raw_query: str) -> str:
-    """HyDE: 이 질문에 답할 법한 가상의 논문 초록을 짧게 지어내게 함."""
+    """질문에 답할 법한 가상의 논문 초록을 짧게 지어내게 함."""
     return (
         "다음 검색 의도에 딱 맞는 학술 논문이 있다고 상상하고, 그 논문의 초록을 "
         "영어로 3~4문장 써서 abstract 필드에 담아라. 실제 존재 여부는 상관없다.\n\n"
@@ -140,20 +125,14 @@ def hyde_prompt(raw_query: str) -> str:
 
 def build_arxiv_query(raw_query: str, academic_terms: list[str],
                       max_len: int = 300) -> str:
-    """arXiv 실시간 검색용 쿼리를 '코드로' 만듦.
+    """arXiv 실시간 검색용 검색어를 코드로 만듦. 300자를 넘으면 뒤 용어는 버림.
 
-    형태: all:"원본" OR abs:"학술용어1" OR abs:"학술용어2" OR ...  (300자 이내)
+    형태: all:"원본" OR abs:"학술용어1" OR abs:"학술용어2" ...
 
-    왜 이렇게(실측으로 확정):
-    - arXiv는 따옴표 구(句) 검색이라야 정확 매칭이 되고, 따옴표 없이 넓은 단어를 나열하면
-      수천 편에 묻혀 원하는 논문이 사라짐. 그래서 각 용어를 따옴표 구로 만듦.
-    - 원본을 따옴표로 넣으면, 사용자가 정확한 제목, 구절을 쳤을 때 그게 잡힘
-      (예: "Attention is all you need"). 원본이 일상어, 한국어라 안 걸리면 그 절은 무해하게 빔.
-    - 학술 용어는 하나만 쓰면 재현율이 떨어짐(좁은 구는 arXiv에 드물어 0건이 되기도 함).
-      그래서 변환기가 만든 용어를 전부 OR로 넣어, 어느 하나라도 맞으면 나오게 함.
-      각 용어가 따옴표 구라 넓은 단어 나열 같은 희석은 생기지 않음. (특정 논문 콕 집기는
-      paper_resolver가 따로 처리하므로 본 검색은 넓게 잡는 게 맞음.)
-    - arXiv 문법 구성을 불안정한 LLM에 맡기지 않고 코드가 만들어 재현성을 확보함.
+    arXiv 는 따옴표로 묶은 구로 찾아야 정확히 맞고, 따옴표 없이 낱말을 나열하면 수천
+    편에 묻힘. 원본을 따옴표로 넣는 것은 사용자가 정확한 제목을 쳤을 때를 위한 것이고,
+    일상어나 한국어면 그 절은 무해하게 빔. 학술 용어는 하나만 쓰면 0건이 되기도 해서
+    전부 OR 로 이음. 검색어 구성을 언어 모델에 맡기지 않아야 결과가 재현됨.
     """
     def _clean(s: str) -> str:
         return s.replace('"', " ").strip()
@@ -182,9 +161,9 @@ def build_arxiv_query(raw_query: str, academic_terms: list[str],
 # ==========================================================================
 
 def _to_result(raw_query: str, data: dict) -> RewriteResult:
-    """모델이 준 JSON(dict)을 RewriteResult로 바꿈. 필수 항목이 없으면 예외."""
+    """모델이 준 JSON 을 RewriteResult 로 바꿈. 필수 항목이 없으면 예외."""
     queries = data["queries"]
-    # sparse, dense 검색어는 모델이 준 것을 씀(로컬 검색기용). 비었으면 폴백하도록 예외.
+    # 비어 있으면 호출자가 원본 질문으로 되돌아가도록 예외를 냄
     for b in ("sparse", "dense"):
         if not str(queries.get(b, "")).strip():
             raise ValueError(f"queries.{b} 가 비어 있음")
@@ -194,7 +173,7 @@ def _to_result(raw_query: str, data: dict) -> RewriteResult:
         queries={
             "sparse": str(queries["sparse"]).strip(),
             "dense": str(queries["dense"]).strip(),
-            # arXiv 검색어는 LLM 대신 코드로 구성(위 함수) - arXiv 로직에 맞춤
+            # arXiv 검색어는 언어 모델 대신 코드로 만듦
             "arxiv": build_arxiv_query(raw_query, academic_terms),
         },
         intent=str(data.get("intent", "")),
@@ -206,13 +185,10 @@ def _to_result(raw_query: str, data: dict) -> RewriteResult:
 
 
 class HierarchicalRewriter:
-    """Qwen3-4B로 4단계 계층 변환을 수행함.
+    """의도 -> 개념 -> 전문 용어 -> 검색어를 한 번에 생성함. 비교군이자 학습 자료 생성기.
 
-    intent(의도) -> concepts(개념) -> academic_terms(전문 용어) -> queries(검색어) 순서로
-    한 번에 생성하게 함. JSON 스키마를 강제하므로 출력이 항상 파싱 가능함.
-
-    실패 대비: 파싱, 검증이 실패하면 한 번 재시도하고, 그래도 안 되면 원본 검색어를 그대로
-    쓰는 폴백으로 넘어감(parse_ok=False로 기록). 실패율 자체가 모델, 프롬프트 품질 지표임.
+    파싱이나 검증이 실패하면 한 번 다시 시도하고, 그래도 안 되면 원본 검색어를 그대로
+    쓰며 parse_ok=False 로 기록함.
     """
 
     name = "hierarchical"
@@ -230,11 +206,11 @@ class HierarchicalRewriter:
                     messages, OUTPUT_SCHEMA, system=SYSTEM, temperature=0.0
                 )
                 return _to_result(raw_query, data)
-            except Exception as e:  # 파싱/검증/통신 실패 -> 재시도
+            except Exception as e:  # 파싱, 검증, 통신 실패는 다시 시도
                 last_err = e
                 continue
 
-        # 폴백: 원본 검색어를 그대로 씀 (검색이 아예 멈추지 않도록)
+        # 두 번 다 실패하면 원본 검색어를 그대로 씀. 검색이 아예 멈추지 않도록
         return RewriteResult(
             raw_query=raw_query,
             queries={b: raw_query for b in BACKENDS},
@@ -244,7 +220,7 @@ class HierarchicalRewriter:
 
 
 class SingleStepRewriter:
-    """한 번에 변환: 원본 -> 영어 학술 검색어 (계층 없음)."""
+    """원본을 영어 학술 검색어로 한 번에 바꿈. 비교군."""
 
     name = "single_step"
 
@@ -259,7 +235,7 @@ class SingleStepRewriter:
             text = str(data.get("query", "")).strip()
             if not text:
                 raise ValueError("빈 출력")
-            # 세 검색 방식에 같은 결과를 넣음(계층 변환처럼 방식별로 나누지 않음)
+            # 세 검색 방식에 같은 결과를 넣음
             return RewriteResult(
                 raw_query=raw_query,
                 queries={b: text for b in BACKENDS},
@@ -273,70 +249,35 @@ class SingleStepRewriter:
 
 
 class TranslateRewriter:
-    """한국어 질문을 영어로 옮기기만 함. 다른 것은 아무것도 하지 않음.
+    """한국어 질문을 영어로 옮기기만 함. 다른 것은 하지 않음.
 
-    ## 왜 이것이 따로 필요한가
+    arXiv 논문은 제목도 초록도 영어라, 한국어 질문은 영어 질문보다 크게 뒤졌음. 영어로
+    옮겨 넣으니 시험용 342문항에서 한국어 Recall@10 이 0.456 에서 0.567 로 올랐고
+    (p=0.001), 손대지 않은 영어는 그대로였음.
 
-    arXiv 논문은 제목도 초록도 영어임. 그런데 2026-08-14 실측에서 한국어 질문의 Recall@10 이
-    0.503, 영어가 0.637 로 0.134 벌어졌음. 로컬 색인이 다국어 임베딩(bge-m3)을 쓰는데도
-    그렇고, 재정렬 점수도 한국어가 눌림(만족 등급 중앙값 0.07 대 영어 0.17).
-
-    그 격차가 **번역이 안 돼서 생긴 것인지** 확인하려면, 번역만 하고 다른 것은 건드리지 않는
-    변환기가 있어야 함. 학습한 변환기(dpo)는 arXiv 문법 문자열을 만들기 때문에 이 질문에
-    답할 수 없음 - 두 가지(번역, 문법 생성)를 한꺼번에 하므로 원인을 못 가림.
-
-    ## 무엇을 기대하는가
-
-    이 변환기가 한국어를 영어 수준까지 끌어올리면, 변환기의 방향을 'arXiv 문법 생성기' 에서
-    '의미 검색용 영어 검색어 생성기' 로 바꾸는 것이 정당해짐. 안 오르면 다국어 임베딩이 이미
-    언어 격차를 메우고 있다는 뜻이고, 격차의 원인은 다른 데 있음.
-
-    ## 주의
-
-    영어 문장 하나를 세 backend 에 그대로 넣음. **arXiv 채널에는 좋은 입력이 아님** -
-    arXiv 는 따옴표 구와 필드 지정을 요구하는 키워드 검색이기 때문임. 이 변환기는
-    로컬 의미 검색 채널을 위한 것임.
+    영어 문장 하나를 세 검색 방식에 그대로 넣음. arXiv 채널에는 좋은 입력이 아님 -
+    따옴표 구와 필드 지정을 요구하기 때문임. 이 변환기는 로컬 의미 검색용임.
     """
 
     name = "translate"
 
-    # 감사 도구(evaluation/dataset.py) 가 쓰는 것과 같은 지시문. 번역 품질이 아니라
-    # '뜻이 그대로 넘어가는가' 가 목적이라 짧고 곧이곧대로 시킴.
+    # 누수 검사(evaluation/dataset.py)가 쓰는 것과 같은 지시문. 뜻이 그대로 넘어가는지가
+    # 목적이라 짧고 곧이곧대로 시킴. 평가에서 쓴 것과 같아야 하므로 바꾸지 말 것.
     SYSTEM = (
         "You translate Korean academic search queries into English.\n"
         "Translate literally and completely. Keep every technical noun. Do not add, remove, "
         "or generalize any term. Do not explain. Output only the English sentence."
     )
 
-    # 되받이용 지시문 (2026-08-28 신설). 위 지시문이 실패했을 때만 씀.
+    # 다시 시도할 때 쓰는 지시문. 위 지시문이 실패했을 때만 씀.
     #
-    # ## 무엇이 실패하는가
+    # "~논문을 알려줘" 처럼 명령형으로 물으면 모델이 그 문장을 번역할 대상이 아니라
+    # 자기에게 내린 지시로 읽고 "I need to translate the Korean academic search
+    # query..." 같은 글을 뱉음. 그 글이 그대로 검색어가 됨. 명령형 질문의 절반에서 남.
     #
-    # 사용자가 "~논문을 알려줘" 처럼 **명령형**으로 물으면, 모델이 그 문장을 번역할 대상이
-    # 아니라 **자기에게 내린 지시로 읽고** 이렇게 답함:
-    #
-    #   질문   페이즈(phase) 기반으로 모션을 정의하고 학습하는 논문을 알려줘
-    #   출력   "I need to translate the Korean academic search query into English.
-    #           The query is: '페이즈(phase) 기반으로 ...'"
-    #
-    # 그 글이 그대로 검색어가 되어 로컬 색인을 찾음. 2026-08-28 실측:
-    #
-    #   질문 형태                              실패
-    #   명령형 (~알려줘 / 찾아줘 / 추천해줘 / 부탁해)   4/8  (50.0%)
-    #   명사형 (평가셋이 가진 형태)                  0/8
-    #
-    # **평가셋에는 명령형이 거의 없어서 이 고장이 안 잡혔음** - 개발용 한국어 174문항에서
-    # 2건(1.1%)뿐임. 실사용자 질문을 안 모았다는 것이 여기서 대가를 치른 자리임.
-    #
-    # ## 왜 이 지시문으로 갈아치우지 않는가
-    #
-    # 이 지시문을 기본으로 쓰면 **번역 결과가 크게 바뀜.** 개발용 한국어 174문항에서
-    # 저장된 평가 검색어와 같은 것이 51개(29.3%)뿐임. 옛 지시문은 138개(79.3%)이고
-    # 두 번 돌리면 173/174 가 같아 재현됨. 번역은 이 프로젝트에서 확정된 이득이므로
-    # (시험용 한국어 Recall +0.111, p=0.001) 측정한 것과 다른 것을 서비스에 올리면 안 됨.
-    #
-    # **그래서 평소에는 옛 지시문을 쓰고, 결과가 번역이 아닐 때만 이것으로 다시 시도함.**
-    # 명사형 질문은 옛 지시문이 성공하므로 결과가 글자까지 같음 - 측정값이 보존됨.
+    # 이것을 기본으로 쓰지 않는 이유는 번역 결과가 크게 바뀌어서임. 평가에서 잰 것과
+    # 다른 검색어를 서비스에 올리면 측정값이 무의미해짐. 명사형 질문은 위 지시문이
+    # 성공하므로 결과가 글자까지 같음.
     RETRY_SYSTEM = (
         "You translate Korean academic search queries into English.\n"
         "The user message contains ONLY the text to translate, wrapped in <query> tags. "
@@ -352,8 +293,8 @@ class TranslateRewriter:
         "required": ["english"],
     }
 
-    # 번역이 아닌 것을 가려내는 표시. 영어 번역문에 한글이 남아 있으면 번역이 안 된 것이고,
-    # 아래 말로 시작하면 모델이 번역 대신 '무엇을 하겠다' 를 적은 것임.
+    # 번역이 아닌 것을 가려냄. 한글이 남아 있으면 번역이 안 된 것이고, 아래 말로
+    # 시작하면 모델이 번역 대신 무엇을 하겠다고 적은 것임.
     _META_START = re.compile(
         r"^\s*(I need to translate|I will translate|I'll translate|Let me translate"
         r"|The query is|The Korean|Here is the translation|To translate|Sure|Okay)",
@@ -365,7 +306,7 @@ class TranslateRewriter:
         t = (text or "").strip()
         if not t:
             return False
-        if cls.has_hangul(t):          # 영어 번역에 한글이 남아 있으면 번역이 안 된 것
+        if cls.has_hangul(t):
             return False
         return not cls._META_START.match(t)
 
@@ -378,7 +319,7 @@ class TranslateRewriter:
         return any("가" <= ch <= "힣" for ch in text)
 
     def rewrite(self, raw_query: str) -> RewriteResult:
-        # 이미 영어면 손대지 않음. 번역기를 통과시키면 뜻이 미묘하게 바뀌어 손해만 봄.
+        # 이미 영어면 손대지 않음. 번역기를 통과시키면 뜻이 미묘하게 바뀜
         if not self.has_hangul(raw_query):
             return RewriteResult(
                 raw_query=raw_query,
@@ -389,14 +330,12 @@ class TranslateRewriter:
         if raw_query in self._cache:
             english = self._cache[raw_query]
         else:
-            # 1차: 옛 지시문 그대로. 평가에서 쓴 것과 같아야 하므로 절대 안 바꿈.
             english = self._translate_once(raw_query, self.SYSTEM, wrap=False)
-            # 2차: 1차가 번역이 아니면(명령형 질문에서 생김) 되받이 지시문으로 한 번 더.
             if not self.looks_translated(english):
                 english = self._translate_once(raw_query, self.RETRY_SYSTEM, wrap=True)
             if not self.looks_translated(english):
-                # 두 번 다 실패하면 원본을 그대로 씀. 번역이 아닌 글을 검색어로 넣는 것보다
-                # 원본 한국어가 나음 - 다국어 임베딩이 어느 정도는 잡아 줌.
+                # 두 번 다 실패하면 원본을 그대로 씀. 번역이 아닌 글보다 한국어 원본이
+                # 나음 - 다국어 임베딩이 어느 정도는 잡아 줌
                 return RewriteResult(
                     raw_query=raw_query,
                     queries={b: raw_query for b in BACKENDS},
@@ -411,7 +350,7 @@ class TranslateRewriter:
         )
 
     def _translate_once(self, raw_query: str, system: str, wrap: bool) -> str:
-        """한 번 부름. 오류가 나면 빈 문자열을 돌려줌(호출자가 다음 수단으로 넘어감)."""
+        """한 번 부름. 오류가 나면 빈 문자열을 돌려줌."""
         msg = f"<query>{raw_query}</query>" if wrap else raw_query
         try:
             data = self.client.generate_json(msg, self.SCHEMA, system=system,
@@ -422,34 +361,18 @@ class TranslateRewriter:
 
 
 class ServiceRewriter:
-    """서비스(`app.py`)가 실제로 만드는 검색어 두 개를 한 번에 만듦.
-
-    ## 왜 이것이 필요한가 (2026-08-18)
-
-    `app.py` 는 검색어를 두 개 만들어 로컬 색인을 두 번 찾음.
+    """`app.py` 가 실제로 만드는 검색어 두 개를 한 번에 만듦. 평가를 서비스와 맞추는 것.
 
         dense  한국어면 영어로 옮긴 질문 (영어면 원본 그대로)
         hyde   질문에 답할 법한 가상의 영어 초록
 
-    그런데 평가 하네스에는 이 조합을 만드는 변환기가 없었음. 확정 결과
-    `results/test_multiquery_d100.jsonl` 은 `local_hyde` 채널을 쓰는데 그 채널을 만드는
-    코드가 저장소 어디에도 없어서, **보고서에 실은 Recall@10 0.617 을 다시 만들 수
-    없는 상태였음.** 평가 경로와 서비스 경로가 갈라진 것이며 #10 · #13 · #39 와 같은
-    종류로 네 번째임.
+    `app.py` 와 반드시 같아야 하는 것 두 가지.
+    1. 가상 초록은 번역문이 아니라 원본 질문으로 만듦
+    2. 번역기와 가상 초록 생성기가 같은 Ollama 연결을 씀 (모델을 두 번 올리지 않도록)
 
-    ## app.py 와 반드시 같아야 하는 것 두 가지
-
-    1. **가상 초록은 원본 질문으로 만듦** (번역문이 아님). `app.py:358` 이 그러함.
-       번역문을 넣으면 다른 초록이 나와 평가와 서비스가 또 갈라짐.
-    2. **번역기와 가상 초록 생성기가 같은 Ollama 연결을 씀.** 따로 만들면 모델이
-       두 번 올라감.
-
-    ## 가상 초록 생성이 실패하면
-
-    `app.py` 는 그 채널을 통째로 건너뜀. 여기서는 영어 검색어로 되돌리는데, 그러면
-    로컬 색인이 같은 검색어로 두 번 표를 던지는 셈이 되어 서비스와 순위가 달라짐.
-    그래서 실패 횟수를 `n_hyde_failed` 에 세어 둠. **0 이 아니면 이 처리를 다시
-    설계해야 함** - 지금 프롬프트에서는 실패가 나지 않는 것을 확인하고 이렇게 둠.
+    가상 초록이 실패하면 `app.py` 는 그 채널을 건너뛰지만 여기서는 영어 검색어로
+    되돌아감. 그러면 같은 검색어로 두 번 표를 던지는 셈이라 순위가 달라지므로 실패
+    횟수를 `n_hyde_failed` 에 세어 둠. 0 이 아니면 이 처리를 다시 설계해야 함.
     """
 
     name = "service"
@@ -481,10 +404,9 @@ class ServiceRewriter:
 
 
 class HydeRewriter:
-    """HyDE: 가상 초록을 생성해 의미(dense) 검색어로 씀.
+    """가상 초록을 지어내 의미 검색어로 씀.
 
-    단어 일치(sparse), arxiv 검색어에는 가상 초록이 너무 길어 부적합하므로 원본을 씀.
-    HyDE의 효과는 주로 의미 기반 검색에서 나타남.
+    단어 일치와 arXiv 검색어에는 초록이 너무 길어 맞지 않으므로 원본을 그대로 둠.
     """
 
     name = "hyde"
@@ -503,7 +425,7 @@ class HydeRewriter:
             return RewriteResult(
                 raw_query=raw_query,
                 queries={"sparse": raw_query, "dense": abstract, "arxiv": raw_query},
-                intent="(HyDE 가상 초록 생성)", parse_ok=True,
+                intent="(가상 초록 생성)", parse_ok=True,
             )
         except Exception as e:
             return RewriteResult(

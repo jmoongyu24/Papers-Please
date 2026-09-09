@@ -1,18 +1,15 @@
-"""검색 쪽이 조용히 틀리는 자리 두 곳을 못박아 두는 테스트 (모델 없이 돌아감).
+"""검색 쪽이 조용히 틀리는 자리 두 곳을 못박아 두는 테스트. 모델 없이 돌아감.
 
-1부. 채널 합치기(RRF) 와 논문 번호 표기 통일
-arXiv 실시간 결과(`2103.00020v2`)와 로컬 색인 결과(`2103.00020`)가 같은 논문을 다르게
-표기하면, 두 채널이 합의한 논문일수록 점수가 반으로 쪼개짐. 오류를 내지 않고 성능만
-조용히 깎는 종류의 버그라 테스트로 막음.
+1부. 채널 합치기와 논문 번호 표기 통일
+arXiv 결과(`2103.00020v2`)와 로컬 색인 결과(`2103.00020`)가 같은 논문을 다르게 표기하면
+두 채널이 합의한 논문일수록 점수가 반으로 쪼개짐. 오류를 내지 않고 성능만 깎는 종류임.
 
 2부. 색인과 코퍼스의 짝 맞추기
-줄 위치표는 그 코퍼스 파일 전용임. 다른 파일에 갖다 쓰면 `seek` 이 엉뚱한 줄에
-떨어지는데 JSON 파싱은 그대로 성공함. 오류도 안 나고 결과도 그럴듯해 보이는 채로
-다른 논문의 제목과 초록이 나옴. 서비스에서 나면 사용자에게 존재하지 않는 조합의
-논문 정보를 보여주게 되고, 아무도 알아채지 못함. 그래서 "안 걸리는 경우"가 아니라
-"반드시 걸려야 하는 경우" 를 검사함.
+줄 위치 색인을 다른 파일에 갖다 쓰면 `seek` 이 엉뚱한 줄에 떨어지는데 JSON 파싱은 성공함.
+오류도 안 나고 결과도 그럴듯해 보이는 채로 다른 논문의 제목과 초록이 나옴. 그래서
+"안 걸리는 경우" 가 아니라 "반드시 걸려야 하는 경우" 를 검사함.
 
-실행: $PY -m pytest tests/test_retrieval.py -q
+실행: python -m pytest tests/test_retrieval.py -q
 """
 
 import json
@@ -96,7 +93,7 @@ def test_duplicate_inside_one_channel_counts_once():
 
 
 def test_weights_shift_influence_between_channels():
-    """가중치는 점수 눈금을 건드리지 않고 채널의 영향력만 바꿈."""
+    """가중치는 점수 범위을 건드리지 않고 채널의 영향력만 바꿈."""
     channels = {"arxiv": [sp("A", 1), sp("B", 2)],
                 "local_dense": [sp("B", 1), sp("A", 2)]}
     even = rrf_fuse(channels, k=60, top_n=10)
@@ -142,9 +139,9 @@ def test_fuse_ids_matches_full_fusion():
     assert rrf_fuse_ids(channels, k=60, top_n=10) == ["2103.00020", "2222.2222", "1111.1111"]
 
 
-# -- 서비스와 평가가 같은 순위를 내는가 (ISSUE #10 · #13 · #39 가 난 자리) --------
+# -- 서비스와 평가가 같은 순위를 내는가 -------------------------------------
 #
-# `app.py` 는 검색어 2개의 결과를 `fuse_local()` 로 합치고, 평가 하네스는 저장된
+# `app.py` 는 검색어 2개의 결과를 `fuse_local()` 로 합치고, 평가 코드는 저장된
 # 채널별 논문 번호를 `fused_ids_of()` 로 합침. 두 경로가 다른 순위를 내면 평가로 잰
 # 값이 서비스의 값이 아니게 됨. 같은 종류의 어긋남을 세 번 겪었으므로 못박아 둠.
 #
@@ -286,7 +283,7 @@ def test_저장된_검색어를_그대로_다시_쓴다(tmp_path):
 
 
 def test_색인을_만든_모델로_질문을_임베딩한다():
-    """미세조정한 색인을 옛 모델로 찾으면 오류 없이 검색 결과만 무너짐."""
+    """파인튜닝한 색인을 옛 모델로 찾으면 오류 없이 검색 결과만 무너짐."""
     from evaluation import pipeline_eval as pe
 
     받은인자 = {}
@@ -398,20 +395,20 @@ def test_번호와_위치_개수가_다르면_걸린다(corpus):
     assert "수가 다르다" in why
 
 
-def test_위치표가_어긋나면_표본_확인에서_걸린다(tmp_path):
+def test_줄_위치_색인이_어긋나면_표본_확인에서_걸린다(tmp_path):
     """지문이 우연히 같아도(크기 동일) 내용이 밀리면 잡아야 함."""
     path = tmp_path / "corpus.jsonl"
     rows = make_rows(20)
     ids, offsets = write_corpus(path, rows)
 
-    # 줄 길이가 모두 같으므로, 한 칸 민 위치표는 크기 검사를 통과함
+    # 줄 길이가 모두 같으므로, 한 칸 민 줄 위치 색인은 크기 검사를 통과함
     shifted = np.roll(offsets, 1)
     assert li.sample_matches(path, ids, offsets, n=10)
     assert not li.sample_matches(path, ids, shifted, n=10)
 
 
 def test_짝이_안_맞는_색인은_다시_훑는다(tmp_path, capsys):
-    """scan_corpus 가 낡은 위치표를 조용히 재사용하면 안 됨."""
+    """scan_corpus 가 낡은 줄 위치 색인을 조용히 재사용하면 안 됨."""
     path = tmp_path / "corpus.jsonl"
     prefix = tmp_path / "idx"
     write_corpus(path, make_rows(10))
@@ -421,5 +418,5 @@ def test_짝이_안_맞는_색인은_다시_훑는다(tmp_path, capsys):
     write_corpus(path, make_rows(30))                   # 같은 이름으로 코퍼스를 키웠음
     ids2, off2 = li.scan_corpus(path, prefix)
 
-    assert len(ids2) == 30, "낡은 위치표를 그대로 돌려주면 안 된다"
+    assert len(ids2) == 30, "낡은 줄 위치 색인을 그대로 돌려주면 안 된다"
     assert "짝이 맞지 않는다" in capsys.readouterr().out

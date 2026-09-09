@@ -1,11 +1,10 @@
-"""논문 데이터를 다루는 부분 - 코퍼스 적재, 구축과 논문 번호 표기 통일.
+"""논문 코퍼스 만들기와 논문 번호 표기 통일.
 
-코퍼스는 JSON Lines 파일임 (줄마다 논문 하나). 캐글에서 받은 arXiv 스냅샷을
-우리 형식으로 정리해 저장하거나, 데모용 작은 샘플 파일을 불러올 때 씀.
+코퍼스는 JSON Lines 파일임 (줄마다 논문 하나). 캐글 arXiv 스냅샷에서 원하는 분야만
+걸러 만듦.
 
-논문 번호 정규화(`normalize_paper_id`)도 여기 있음. 검색, 평가, 화면 어디서든 "같은 논문인가"를
-판단할 때 반드시 거쳐야 하는 관문이라, 특정 검색 경로가 아니라 논문 데이터를 다루는
-이 파일에 둠.
+`normalize_paper_id` 도 여기 있음. 검색, 평가, 화면 어디서든 "같은 논문인가" 를
+판단할 때 반드시 거쳐야 하는 함수임.
 """
 
 from __future__ import annotations
@@ -28,110 +27,18 @@ def normalize_paper_id(paper_id: str) -> str:
 
     '2103.00020v2' -> '2103.00020',  'solv-int/9611001v1' -> 'solv-int/9611001'
 
-    ## 왜 이 함수가 필요한가
+    arXiv 실시간 결과에는 버전 표기가 붙어 오고 로컬 색인에는 안 붙어 있음. 그대로
+    합치면 같은 논문이 둘로 갈려 점수가 쪼개짐 - 오류 없이 성능만 깎임.
 
-    arXiv 실시간 결과는 `2103.00020v2` 처럼 버전 표기가 붙어 오고, 로컬 색인은
-    `2103.00020` 처럼 붙지 않은 형태로 저장돼 있음. 그대로 합치면 같은 논문이 서로 다른
-    논문으로 취급돼, 두 채널이 합의한 논문일수록 오히려 점수가 반으로 쪼개짐. 오류가
-    아니라 조용히 성능만 깎는 종류의 버그임.
-
-    ## 반드시 정규식으로 떼어낼 것 (ISSUE #27)
-
-    `paper_id.split("v")[0]` 을 쓰면 안 됨. 옛 형식 번호 중에는 `solv-int/9611001v1`
-    처럼 번호 자체에 v가 들어간 것이 있어 `sol` 로 잘려 버림.
+    반드시 정규식으로 뗄 것. `paper_id.split("v")[0]` 은 옛 형식 번호
+    `solv-int/9611001v1` 을 `sol` 로 자름.
     """
     return _VERSION_SUFFIX.sub("", (paper_id or "").strip())
-
-
-def load_corpus(path: str | Path) -> list[Paper]:
-    """JSON Lines 코퍼스 파일을 읽어 Paper 목록으로 돌려줌."""
-    return [Paper.from_dict(row) for row in read_jsonl(path)]
 
 
 def save_corpus(path: str | Path, papers: Iterable[Paper]) -> int:
     """Paper 목록을 JSON Lines 코퍼스 파일로 저장함."""
     return write_jsonl(path, (p.to_dict() for p in papers))
-
-
-def filter_by_category(
-    papers: Iterable[Paper], keep: Iterable[str]
-) -> list[Paper]:
-    """지정한 분야에 속하는 논문만 남김.
-
-    keep 에 들어 있는 분야(cs.CL 등)를 하나라도 가진 논문을 남김.
-    """
-    keep_set = set(keep)
-    out = []
-    for p in papers:
-        if keep_set.intersection(p.categories):
-            out.append(p)
-    return out
-
-
-def primary_bucket(paper: Paper, categories: list[str]) -> str:
-    """논문의 '대표 분야'를 정함.
-
-    categories(우리가 다루는 분야 목록) 중, 그 논문의 categories에 실제로 있는 첫 번째
-    것을 대표 분야로 삼음. 하나도 없으면 "other"로 묶음.
-    """
-    for c in categories:
-        if c in paper.categories:
-            return c
-    return "other"
-
-
-def stratified_sample(
-    papers: list[Paper],
-    n: int,
-    categories: Iterable[str],
-    seed: int = 42,
-    prior_counts: Optional[dict[str, int]] = None,
-) -> list[Paper]:
-    """분야별로 최대한 고르게 논문을 뽑음 ('물 채우기' 방식).
-
-    그냥 무작위로 뽑으면 코퍼스에 원래 많은 분야(예: cs.LG)가 결과에도 많이 뽑히고,
-    적은 분야(예: cs.IR)는 거의 안 뽑힘. 이 함수는 매 순간 "지금까지 가장 적게 뽑힌
-    분야"에서 하나씩 뽑기를 반복해서, 최종적으로 분야별 개수가 최대한 비슷해지게 함.
-    (양동이에 물을 부을 때 가장 낮은 곳부터 채워져 수평을 이루는 것과 같은 원리임.)
-
-    Args:
-        papers: 뽑을 후보 논문들 (이미 사용한 논문은 미리 제외하고 넣음).
-        n: 뽑을 논문 수.
-        categories: 균형을 맞출 분야 목록.
-        prior_counts: 이전에 이미 뽑아 둔 분야별 개수. 배치를 나눠 이어서 뽑을 때,
-            "이 분야는 이미 이만큼 뽑았다"고 알려주면 이번 배치에서 그 분야를
-            상대적으로 덜 뽑아 전체 균형을 맞춤.
-    """
-    cats = list(categories)
-    rng = random.Random(seed)
-
-    pool: dict[str, list[Paper]] = {c: [] for c in cats}
-    pool["other"] = []
-    for p in papers:
-        pool[primary_bucket(p, cats)].append(p)
-    for bucket in pool.values():
-        rng.shuffle(bucket)
-
-    counts: dict[str, int] = {c: 0 for c in pool}
-    if prior_counts:
-        for c, v in prior_counts.items():
-            if c in counts:
-                counts[c] = v
-
-    idx = {c: 0 for c in pool}
-    selected: list[Paper] = []
-    bucket_names = list(pool.keys())
-    while len(selected) < n:
-        # 아직 후보가 남은 분야 중, 지금까지 가장 적게 뽑힌 분야를 고름.
-        available = [c for c in bucket_names if idx[c] < len(pool[c])]
-        if not available:
-            break  # 모든 분야의 후보를 다 썼음
-        available.sort(key=lambda c: counts[c])
-        chosen_bucket = available[0]
-        selected.append(pool[chosen_bucket][idx[chosen_bucket]])
-        idx[chosen_bucket] += 1
-        counts[chosen_bucket] += 1
-    return selected
 
 
 def _iter_kaggle_matches(
@@ -140,16 +47,12 @@ def _iter_kaggle_matches(
     min_year: Optional[int],
     prefixes: Optional[tuple[str, ...]] = None,
 ) -> Iterator[Paper]:
-    """캐글 원본을 한 줄씩 읽어, 분야, 연도 조건에 맞는 논문만 Paper로 내보냄.
+    """캐글 원본을 한 줄씩 읽어 분야, 연도 조건에 맞는 논문만 Paper 로 내보냄.
 
-    캐글 원본 한 줄의 주요 필드: id, title, abstract, categories(공백으로 이은 문자열),
-    update_date("YYYY-MM-DD").
-
-    분야를 고르는 방법 세 가지:
-    - `keep`에 정확한 분야명을 넣으면 그것만 (예: {"cs.CL", "cs.CV"})
-    - `prefixes`에 앞글자를 넣으면 그 계열 전체 (예: ("cs.", "stat.") -> cs 하위 40여 개 전부)
-    - 둘 다 비우면 분야 제한 없이 전부. arXiv 검색은 물리, 수학까지 전 분야를 대상으로
-      하므로, 어떤 표현이 얼마나 흔한지(문서 빈도)를 arXiv와 비슷하게 재려면 전체가 필요함.
+    분야를 고르는 방법 세 가지.
+    - `keep` 에 정확한 분야명 (예: {"cs.CL", "cs.CV"})
+    - `prefixes` 에 앞글자를 주면 그 계열 전체 (예: ("cs.", "stat."))
+    - 둘 다 비우면 분야 제한 없이 전부
     """
     for row in read_jsonl(kaggle_jsonl):
         cats = row.get("categories", "")
@@ -184,24 +87,11 @@ def build_corpus_from_kaggle(
     seed: int = 42,
     prefixes: Optional[tuple[str, ...]] = None,
 ) -> int:
-    """캐글 arXiv 스냅샷(원본)에서 원하는 분야만 걸러 우리 코퍼스 파일로 저장함.
+    """캐글 arXiv 스냅샷에서 조건에 맞는 논문만 걸러 코퍼스 파일로 저장하고 편수를 돌려줌.
 
-    논문을 고르는 방식은 두 가짐.
-    - sample_size 지정 시: 조건에 맞는 논문 전체에서 무작위로 sample_size개를 고르게 뽑음
-      (reservoir sampling). 원본이 오래된 논문부터 정렬돼 있어, 앞에서 자르면 시기가
-      한쪽으로 치우치므로 무작위 추출이 더 대표성 있음. 파일 전체를 한 번 훑음.
-    - max_papers 지정 시(또는 둘 다 없을 때): 조건에 맞는 논문을 앞에서부터 최대 max_papers개
-      취함 (빠르지만 시기 편향 가능).
-
-    Args:
-        categories: 남길 분야 목록 (예: cs.CL, cs.CV ...).
-        max_papers: 앞에서부터 최대 개수 (sample_size가 없을 때만 사용).
-        min_year: 이 연도 이후(갱신일 기준) 논문만.
-        sample_size: 무작위로 뽑을 논문 수.
-        seed: 무작위 추출 재현용 시드.
-
-    Returns:
-        저장한 논문 수.
+    `sample_size` 를 주면 조건에 맞는 논문 전체에서 무작위로 그만큼 뽑음. 원본이 오래된
+    논문부터 정렬돼 있어 앞에서 자르면 시기가 한쪽으로 치우치기 때문임. 안 주면
+    앞에서부터 `max_papers` 편까지 취함.
     """
     keep = set(categories)
     matches = _iter_kaggle_matches(kaggle_jsonl, keep, min_year, prefixes)
@@ -239,7 +129,7 @@ def main() -> None:
     ap.add_argument("--categories", nargs="+", default=list(config.CORPUS_CATEGORIES))
     ap.add_argument("--prefixes", nargs="+", default=None,
                     help="분야 앞글자로 고르기 (예: cs. stat.ML eess.). 주면 --categories 대신 "
-                         "이 조건을 쓴다. 계열 전체를 담을 때 사용")
+                         "이 조건을 쓴다")
     ap.add_argument("--min-year", type=int, default=2021)
     ap.add_argument("--sample", type=int, default=30000,
                     help="무작위로 뽑을 논문 수 (0이면 조건에 맞는 논문 전부)")
@@ -258,7 +148,7 @@ def main() -> None:
         prefixes=tuple(args.prefixes) if args.prefixes else None,
     )
     print(f"코퍼스 {n}편 저장 -> {args.out}")
-    print(f"  분야: {args.categories}")
+    print(f"  분야: {args.prefixes or args.categories}")
     print(f"  {args.min_year}년 이후, "
           f"{'무작위 ' + str(args.sample) + '편' if args.sample else '앞에서부터'}")
 

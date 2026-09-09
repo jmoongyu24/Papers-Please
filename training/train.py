@@ -1,43 +1,39 @@
-"""쿼리 변환기 학습 - 지도 미세조정(SFT) 과 선호 학습(DPO) 을 한 파일에서.
+"""쿼리 변환기 학습 - 지도 파인튜닝과 선호 학습, 그리고 검색 모델, 재정렬기 파인튜닝.
 
-    # 1단계 SFT - "이런 검색어를 만들어라" 를 흉내 내게 함
-    $PY -m training.train sft --data data/training/train_query_translator_sft.jsonl \\
+    # 1단계: "이런 검색어를 만들어라" 를 흉내 내게 함
+    python -m training.train sft --data data/training/train_query_translator_sft.jsonl \\
         --output-dir models/query-translator-sft --epochs 8
 
-    # 2단계 DPO - SFT 어댑터 위에 "좋은 것과 나쁜 것의 차이" 를 얹음
-    $PY -m training.train dpo --data data/training/train_query_translator_dpo.jsonl \\
+    # 2단계: 1단계 어댑터 위에 "좋은 것과 나쁜 것의 차이" 를 얹음
+    python -m training.train dpo --data data/training/train_query_translator_dpo.jsonl \\
         --sft-adapter models/query-translator-sft/checkpoint-54 \\
         --output-dir models/query-translator-dpo
 
-순서가 중요함. SFT -> DPO 가 표준이고, DPO 는 SFT 어댑터 위에 이어서 학습함.
-서비스가 쓰는 것은 2단계까지 끝낸 `models/query-translator-dpo` 다.
+    # 검색 모델 파인튜닝과 그 결과 확인
+    python -m training.train embed --data data/training/train_retriever.jsonl
+    python -m training.train embed-check --model models/retriever-ft
 
-## 무엇을 학습하나
+    # 재정렬기 파인튜닝
+    python -m training.train rerank --data data/training/train_reranker.jsonl
 
-    입력  = 사용자의 일상어 질문
-    출력  = 그 질문의 정답 논문을 arXiv 에서 실제로 찾아낸 검색어
+순서가 중요함. 지도 파인튜닝 다음에 선호 학습이고, 선호 학습은 앞 단계의 어댑터 위에
+이어서 함. 서비스가 쓰는 것은 2단계까지 끝낸 `models/query-translator-dpo` 임.
+
+## 무엇을 학습하나 (쿼리 변환기)
+
+    입력  사용자의 일상어 질문
+    출력  그 질문의 정답 논문을 arXiv 에서 실제로 찾아낸 검색어
 
 라벨은 사람이 고른 것이 아니라 `training/build_translator_pairs.py` 가 검색 성공 여부로
-뽑아 놓은 것임. 즉 "학술적으로 그럴싸한 말" 이 아니라 "실제로 통하는 말" 을 배움.
-
-## SFT 와 DPO 의 차이
-
-- SFT 는 "이게 정답이다" 라는 예시만 보여줌. 무엇이 나쁜지는 안 가르침.
-- DPO 는 좋은 답과 나쁜 답을 쌍으로 보여주고, 좋은 쪽의 확률은 올리고 나쁜 쪽은
-  내림. 즉 "왜 이게 더 나은가" 의 경계를 배움.
-
-우리 데이터가 DPO 에 잘 맞는 이유: 같은 질문에 후보 검색어를 여러 개 만들고 실제 arXiv
-검색으로 채점했으므로, 정답을 찾아낸 검색어(chosen) vs 못 찾은 검색어(rejected) 쌍이
-자연스럽게 생겼음. 둘 다 그럴싸한데 결과가 갈렸으므로, 모델이 배워야 할 것은 정확히
-'실제로 통하는 어휘' 의 미묘한 차이임.
+뽑아 놓은 것임. "학술적으로 그럴싸한 말" 이 아니라 "실제로 통하는 말" 을 배움.
 
 ## 왜 LoRA 인가
 
 Qwen3-4B 는 값이 40억 개라 전부 학습시키려면 메모리가 매우 많이 필요함. LoRA 는 원래
-모델은 얼려두고 작은 보조 행렬(전체의 1% 미만)만 새로 학습해 끼우는 방식이라, 16GB
-그래픽카드로 충분히 돌아감. 결과물도 수십 메가바이트로 작아 관리가 쉬움.
+모델을 고정하고 작은 LoRA 층(전체의 1% 미만)만 새로 학습해 끼우는 방식이라 16GB
+그래픽카드로 돌아가고, 결과물도 수십 메가바이트로 작음.
 
-전제: `pip install transformers peft trl bitsandbytes accelerate datasets`
+전제: pip install transformers peft trl bitsandbytes accelerate datasets
 """
 
 from __future__ import annotations
@@ -47,8 +43,8 @@ import json
 import random
 import time
 
-# 학습에 쓰는 지시문. SFT 와 DPO 가 반드시 같아야 함 - 형식이 다르면 앞서 배운 것이
-# 흐트러짐. 실제 서비스에서 쓰는 프롬프트와도 형식을 맞춰야 학습 효과가 삶.
+# 학습에 쓰는 지시문. 두 단계가 반드시 같아야 하고 서비스가 쓰는 것과도 같아야 함.
+# 형식이 다르면 앞서 배운 것이 흐트러짐
 INSTRUCTION = (
     "사용자의 검색어를 arXiv에서 관련 논문을 잘 찾아내는 검색 쿼리로 변환하라. "
     "결과 쿼리만 출력한다."
@@ -60,7 +56,7 @@ def read_rows(path: str) -> list[dict]:
 
 
 # ==========================================================================
-# 1단계. SFT (지도 미세조정)
+# 1단계. 지도 파인튜닝
 # ==========================================================================
 
 def format_example(row: dict) -> dict:
@@ -135,7 +131,7 @@ def cmd_sft(args) -> None:
         device_map="auto",
     )
 
-    # LoRA: 주의(attention)와 피드포워드 층에만 작은 보조 행렬을 붙여 학습함
+    # LoRA: 주의(attention)와 피드포워드 층에만 작은 LoRA 층을 붙여 학습함
     peft_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_r * 2,
@@ -176,17 +172,17 @@ def cmd_sft(args) -> None:
     )
     trainer.train()
     trainer.save_model(args.output_dir)
-    print(f"\nSFT 학습 완료. LoRA 어댑터 저장: {args.output_dir}")
-    print(f"다음 단계: 검증 손실이 가장 낮은 체크포인트를 골라 DPO 로 넘긴다.\n"
+    print(f"\n지도 파인튜닝 완료. 어댑터 저장: {args.output_dir}")
+    print(f"다음 단계: 검증 손실이 가장 낮은 체크포인트를 골라 선호 학습으로 넘긴다.\n"
           f"  $PY -m training.train dpo --sft-adapter {args.output_dir}/checkpoint-<번호>")
 
 
 # ==========================================================================
-# 2단계. DPO (선호 학습)
+# 2단계. 선호 학습
 # ==========================================================================
 
 def load_preference_dataset(path: str):
-    """DPO 형식으로 불러온다: prompt / chosen / rejected."""
+    """선호 학습 형식으로 불러온다: prompt / chosen / rejected."""
     from datasets import Dataset
 
     return Dataset.from_list([{
@@ -206,14 +202,14 @@ def cmd_dpo(args) -> None:
     from trl import DPOConfig, DPOTrainer
 
     print(f"기본 모델: {args.base_model}")
-    print(f"SFT 어댑터: {args.sft_adapter}")
+    print(f"앞 단계 어댑터: {args.sft_adapter}")
     print("양자화 없음 - bf16 전체 정밀도")
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     base = AutoModelForCausalLM.from_pretrained(
         args.base_model, dtype=torch.bfloat16, device_map="auto"
     )
-    # SFT 어댑터를 얹고, 그 위에서 이어서 학습할 수 있도록 학습 가능 상태로 열어 둠
+    # 앞 단계 어댑터를 얹고, 그 위에서 이어서 학습할 수 있도록 열어 둠
     model = PeftModel.from_pretrained(base, args.sft_adapter, is_trainable=True)
 
     dataset = load_preference_dataset(args.data)
@@ -243,74 +239,32 @@ def cmd_dpo(args) -> None:
     )
     trainer.train()
     trainer.save_model(args.output_dir)
-    print(f"\nDPO 학습 완료. 어댑터 저장: {args.output_dir}")
+    print(f"\n선호 학습 완료. 어댑터 저장: {args.output_dir}")
     print("서비스와 평가에서 쓰려면 변환기 이름을 'dpo' 로 부르면 된다.")
 
 
 
 # ==========================================================================
-# 검색 모델(임베딩) 미세조정
+# 검색 모델(임베딩) 파인튜닝
 # ==========================================================================
 #
-# ## 무엇을 왜 하는가
-#
-# 지금 막힌 곳은 재정렬이 아니라 1차 검색임. 시험용 342문항에서 후보 100편 안에 정답이
-# 아예 없는 문항이 98개(일상어 층 69개)이고, 후보에 있는데 재정렬이 버린 문항은 33개임.
-# 후보 상한이 0.713 이고 회수율이 0.865 라 지금 값이 0.617 인데, 목표 0.700 에 닿으려면
-# 회수율을 0.982 까지 올리거나(사실상 불가능) 후보 상한을 0.809 로 올려야 함.
-#
-# 후보를 깊게 가져오는 길은 이미 막혔음 - 깊이 300 에서 상한은 0.721 로 오르지만 만족도가
-# 확실히 떨어짐(-0.036, p<0.001). 쿼리 변환 쪽으로도 다섯 번 시험해 다섯 번 실패했음.
-# 남은 것이 **검색 모델 자체를 학습시키는 것**임.
-#
-# ## 무엇을 학습하나
+# 무엇을 학습하나:
 #
 #     질문        "조건이 많은 문제를 아주 적은 메모리로 대충 잘 푸는 방법이 있나"
 #     정답 논문    그 질문을 만들어 낸 논문의 제목 + 초록      <- 가깝게
 #     오답 논문 6편  재정렬기가 무관하다고 한 논문             <- 멀게
 #
-# 학습 쌍은 `training/build_retrieval_pairs.py` 가 만듦. 오답을 어떻게 골랐는지와 왜 그렇게
-# 골랐는지는 그 파일 설명글에 실측표와 함께 있음. **오답 고르는 규칙이 이 학습의 성패를
-# 가르므로 반드시 읽을 것.**
+# 학습 쌍은 `training/build_retrieval_pairs.py` 가 만듦. 오답 고르는 규칙이 학습의 성패를
+# 가르므로 그 파일 설명글을 반드시 읽을 것.
 #
-# ## 반드시 지킬 것
-#
-# 1. **바탕 모델은 지금 색인을 만든 것과 같아야 함** (`BAAI/bge-m3`). 다르면 학습한 것과
-#    색인이 어긋남.
-# 2. **최대 길이 512** - `local_index.build_embeddings` 가 512 로 색인을 만들었음.
-#    학습을 다른 길이로 하면 학습할 때 본 글과 색인에 들어간 글이 달라짐.
-# 3. **저장은 합쳐서 함** - `LocalDenseRetriever` 는 `SentenceTransformer(경로)` 로 모델을
-#    올리므로, 보조 행렬만 저장하면 못 읽음. 합친 모델을 통째로 저장함.
-# 4. 학습이 끝나면 **색인을 다른 이름으로 새로 만들 것.** 같은 이름을 주면
-#    `build_embeddings` 가 기존 임베딩 2.93GB 를 덮어씀 (되돌릴 수 없음).
-
-
-def merge_lora_into(model) -> int:
-    """보조 행렬을 본체 가중치에 더하고 껍데기를 벗겨냄. 합친 층 수를 돌려줌.
-
-    ## 왜 손으로 합치는가
-
-    `get_peft_model` 은 보조 행렬을 **본체 안에 직접 끼워 넣고** 껍데기 객체를 따로
-    돌려줌. 그런데 `SentenceTransformer` 의 `auto_model` 자리에는 껍데기가 남지 않아서
-    (본체가 `XLMRobertaModel` 그대로임) 껍데기의 `merge_and_unload` 를 부를 수가 없음.
-
-    학습은 껍데기 없이도 제대로 됨 - 끼워 넣은 층을 그대로 통과하기 때문임. 문제는
-    저장뿐이고, 합치지 않은 채로 저장하면 `LocalDenseRetriever` 가 못 읽어 색인을
-    만들 수 없음. 그래서 층을 직접 찾아 합치고 원래 층으로 되돌려 놓음.
-
-    합친 층 수가 0 이면 학습이 안 된 것이므로 부르는 쪽에서 멈출 것.
-    """
-    from peft.tuners.lora import LoraLayer
-
-    merged = 0
-    for parent in list(model.modules()):
-        for name, child in list(parent.named_children()):
-            if isinstance(child, LoraLayer):
-                child.merge()
-                setattr(parent, name, child.get_base_layer())
-                merged += 1
-    return merged
-
+# 반드시 지킬 것 네 가지.
+# 1. 바탕 모델은 지금 색인을 만든 것과 같아야 함(`BAAI/bge-m3`). 다르면 학습한 것과
+#    색인이 어긋남
+# 2. 최대 길이 512. `local_index.build_embeddings` 가 512 로 색인을 만들었음
+# 3. 저장은 어댑터를 합쳐서 함. `LocalDenseRetriever` 는 `SentenceTransformer(경로)` 로
+#    올리므로 LoRA 만 저장하면 못 읽음
+# 4. 학습이 끝나면 색인을 다른 이름으로 새로 만들 것. 같은 이름을 주면 기존 임베딩
+#    2.93GB 를 덮어씀
 
 def cmd_embed(args) -> None:
     import torch
@@ -340,11 +294,11 @@ def cmd_embed(args) -> None:
     model.max_seq_length = args.max_len
     print(f"최대 길이 {model.max_seq_length} (색인을 만든 값과 같아야 함)")
 
-    # 큰 모델은 얼려 두고 작은 보조 행렬만 학습함. 주의 층과 완전연결 층에 붙임.
+    # 큰 모델은 고정하고 작은 LoRA 층만 학습함. 주의 층과 완전연결 층에 붙임.
     #
     # `SentenceTransformer.add_adapter` 가 아니라 `get_peft_model` 로 감싸는 이유:
     # 앞의 것은 transformers 의 자체 연동을 써서 본체가 `XLMRobertaModel` 그대로 남는데,
-    # 그러면 학습이 끝난 뒤 보조 행렬을 본체에 합칠 방법(`merge_and_unload`)이 없음.
+    # 그러면 학습이 끝난 뒤 LoRA 를 기본 모델에 합칠 방법(`merge_and_unload`)이 없음.
     # 합치지 않은 모델은 `LocalDenseRetriever` 가 못 읽으므로 색인을 만들 수 없음.
     from peft import get_peft_model
     model[0].auto_model = get_peft_model(model[0].auto_model, LoraConfig(
@@ -380,11 +334,11 @@ def cmd_embed(args) -> None:
     trainer.train()
     print(f"\n학습 시간 {(time.time() - t0) / 60:.1f}분")
 
-    # 보조 행렬을 본체에 합쳐서 저장함. 합치지 않으면 LocalDenseRetriever 가 못 읽음.
+    # LoRA 를 기본 모델에 합쳐서 저장함. 합치지 않으면 LocalDenseRetriever 가 못 읽음.
     n_merged = merge_lora_into(model)
     if not n_merged:
-        raise RuntimeError("합칠 보조 행렬 층을 하나도 못 찾았다 - 학습이 안 붙은 것이다")
-    print(f"보조 행렬 {n_merged}개 층을 본체에 합침")
+        raise RuntimeError("합칠 LoRA 층을 하나도 못 찾았다 - 학습이 안 붙은 것이다")
+    print(f"LoRA {n_merged}개 층을 본체에 합침")
     model.save(args.output_dir)
     print(f"모델 저장: {args.output_dir}")
     print("다음 단계 - 색인을 **다른 이름으로** 새로 만들 것:")
@@ -394,81 +348,33 @@ def cmd_embed(args) -> None:
 
 
 # ==========================================================================
-# 재정렬기 미세조정 - 2단계(줄 세우기)를 고치는 것
+# 재정렬기 파인튜닝 - 2단계(줄 세우기)를 고치는 것
 # ==========================================================================
 #
-# ## 무엇을 고치려는 것인가
+# 무엇을 고치려는 것인가: 일상어 질문에서 정답도 10등도 전부 무관 구간에 있음(정답 점수
+# 중앙 0.0035, 10등 0.0152). 정답을 오답보다 낮게 매긴 것이 아니라 쓸 만한 점수 범위
+# 자체를 못 만듦. 고칠 것은 순서가 아니라 점수 범위임.
 #
-# ISSUE #41 이 재정렬 점수를 직접 열어 확인한 것임. 정답이 후보 안에 있었는데 상위 10편에서
-# 밀린 문항의 점수임(개발용 348문항, 미세조정 색인).
+# 이분 라벨(관련 1 / 무관 0)을 안 쓰는 이유: 정답을 밀어낸 논문의 77.1% 가 등급 2 이상,
+# 즉 실제로 쓸모 있는 논문임. "무관" 라벨을 붙이면 좋은 논문을 내리라고 가르치게 됨.
+# 그래서 순서 손실을 씀 - "정답이 이 논문들보다 위" 까지만 가르침.
 #
-#     난이도   밀린 문항   정답 점수(중앙)   10등 점수(중앙)   못 알아봄(0.002 미만)
-#     easy        2         0.5432          0.5865          0.000
-#     medium     12         0.0470          0.1758          0.083
-#     hard       24         0.0035          0.0152          0.250
-#
-# **hard 층은 정답도 10등도 전부 무관 구간에 있음.** 정답을 오답보다 낮게 매긴 것이 아니라
-# 일상어 질문에 대해 쓸 만한 점수 눈금 자체를 못 만듦. 고칠 것은 순서가 아니라 눈금임.
-#
-# 상한: 밀린 문항이 38개임(easy 2 + medium 12 + hard 24). 전부 살리면 개발용 Recall@10 이
-# 0.618 에서 0.727, hard 가 0.267 에서 0.474 가 됨. 후보 상한과 같은 값임.
-#
-# ## 왜 이분 라벨(관련 1 / 무관 0)을 쓰지 않는가
-#
-# 정답을 밀어낸 논문의 **77.1% 가 등급 2 이상, 즉 실제로 쓸모 있는 논문임**(개발용 등급
-# 정답지로 실측, `build_retrieval_pairs.py` 설명글 참고). 그것들에 "무관" 라벨을 붙이면
-# **좋은 논문을 내리라고 가르치게 됨.** ISSUE #49 가 검색 모델에서 막았던 것과 같은 함정임.
-#
-# 그래서 순서 손실(`CachedMultipleNegativesRankingLoss`)을 씀. 이 손실은 "정답이 이
-# 논문들보다 위" 까지만 가르치고 "이 논문들은 무관" 이라고는 말하지 않음. 라벨이 없음.
-#
-# ## 오답 편수가 문항마다 다른 것을 어떻게 다루는가
-#
-# 정답이 이미 1등이면 밀어낸 논문이 없어서 오답이 0편임. 억지로 채우면 재정렬기가 이미
-# 확실히 버리는 논문을 도로 넣게 됨(그것이 검색 모델용 자료였고, 이 자리에서는 신호가 없음).
-#
-# `CrossEncoderTrainer` 는 `DatasetDict` 를 받으므로 **오답 편수로 갈라 담음.**
+# 오답 편수가 문항마다 다른 것: 정답이 이미 1등이면 밀어낸 논문이 없어 오답이 0편임.
+# `CrossEncoderTrainer` 는 `DatasetDict` 를 받으므로 오답 편수로 갈라 담음.
 #
 #     pairs           (질문, 정답)                     오답이 모자란 문항
 #     hard_negatives  (질문, 정답, 오답1, ..., 오답N)    오답이 N편 이상인 문항
 #
-# 양쪽 다 같은 손실을 씀. `pairs` 쪽도 묶음 안 다른 질문의 논문이 자동으로 오답이 되므로
-# 학습이 됨 - 그쪽이 이번 학습의 주된 신호임(점수 눈금 만들기).
+# 양쪽 다 같은 손실을 씀. `pairs` 쪽도 묶음 안 다른 질문의 논문이 자동으로 오답이 됨.
 #
-# ## LoRA 를 붙이는 자리
+# 껍데기를 씌우지 않고 층만 끼워 넣는 이유: `get_peft_model` 로 껍데기를 씌우면 본체의
+# `forward` 인자 이름이 `(*args, **kwargs)` 로 바뀜. `CrossEncoder` 는 인자 이름을 보고
+# 부를 방식을 정하므로, 이름이 사라지면 토큰 묶음을 통째로 첫 자리에 넣어 학습이
+# 시작되자마자 멈춤. `inject_adapter_in_model` 로 층만 제자리에 끼우면 본체가
+# `XLMRobertaForSequenceClassification` 그대로 남음. 대신 원래 값은 직접 고정해야 함.
 #
-# `["query", "key", "value", "dense"]` 로 145개 층에 붙음. 여기에 `classifier.dense` 가
-# 들어가서 점수를 내는 머리의 앞쪽도 함께 학습됨. 마지막 `classifier.out_proj` 는 얼어 있음.
-#
-# ## 껍데기를 씌우지 않고 층만 끼워 넣는 이유 (2026-08-27 실패에서 배운 것)
-#
-# `cmd_embed` 처럼 `get_peft_model` 로 껍데기를 씌우면 **학습이 시작되자마자 멈춤.**
-#
-#     AttributeError  (transformers/models/xlm_roberta/... input_ids.ne(padding_idx))
-#
-# 껍데기의 `forward` 인자가 `(*args, **kwargs)` 로 바뀌기 때문임. 실측함.
-#
-#     본체 forward 인자    ['input_ids', 'attention_mask', 'token_type_ids', 'position_ids']
-#     껍데기 forward 인자   ['args', 'kwargs']
-#
-# `CrossEncoder` 는 모델의 인자 이름을 보고 어떻게 부를지 정하는데, 이름이 사라지면
-# 토큰 묶음을 통째로 첫 번째 자리에 넣어 버림. `SentenceTransformer` 는 부르는 방식이
-# 달라서 `cmd_embed` 에서는 이 문제가 안 났음.
-#
-# 그래서 `inject_adapter_in_model` 로 **층만 제자리에 끼워 넣음.** 본체가
-# `XLMRobertaForSequenceClassification` 그대로 남아 인자 이름이 유지됨.
-# 대신 이 함수는 원래 값을 얼려 주지 않으므로 손으로 얼려야 함.
-#
-# ## 병합해서 저장하는 이유
-#
-# `cmd_embed` 와 같음. 합치지 않은 채로 저장하면 `CrossEncoderReranker` 가 못 읽음.
-#
-# ## 학습이 끝난 뒤 반드시 할 것
-#
-# `app.py` 의 `MIN_RERANK_SCORE = 0.002` 를 **다시 재야 함.** 그 값은 재정렬 모델의 점수
-# 눈금에 딸린 것이고, 이번 학습의 목적이 바로 그 눈금을 바꾸는 것임
-# (`evaluation/README.md` 6절).
-
+# 학습이 끝나면 `app.py` 의 `MIN_RERANK_SCORE` 를 반드시 다시 재야 함. 그 값은 재정렬
+# 모델의 점수 범위에 딸린 것이고, 이번 학습의 목적이 바로 그 점수 범위를 바꾸는 것임.
 
 def cmd_rerank(args) -> None:
     import torch
@@ -525,7 +431,7 @@ def cmd_rerank(args) -> None:
         print(f"  {name:<16}{len(ds):>8,}문항  열 {list(ds.column_names)}")
 
     # 난이도가 고르게 들어갔는지 확인함. 한 층을 빼면 그 층이 그대로 있는 것이 아니라
-    # 나빠짐 - 검색 모델에서 easy 를 빼고 겪었음(ISSUE #51).
+    # 나빠짐 - 검색 모델에서 easy 를 빼고 겪었음
     from collections import Counter
     print(f"  난이도 {dict(Counter(r.get('difficulty') for r in rows))}")
     print(f"  언어   {dict(Counter(r.get('lang') for r in rows))}")
@@ -540,7 +446,7 @@ def cmd_rerank(args) -> None:
     inject_adapter_in_model(LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_r * 2, lora_dropout=0.05,
         target_modules=["query", "key", "value", "dense"], bias="none"), model.model)
-    # inject_adapter_in_model 은 원래 값을 얼려 주지 않음. 손으로 얼림.
+    # inject_adapter_in_model 은 원래 값을 고정해 주지 않음. 직접 고정함.
     for name, prm in model.model.named_parameters():
         prm.requires_grad = "lora_" in name
     trainable = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
@@ -582,8 +488,8 @@ def cmd_rerank(args) -> None:
 
     n_merged = merge_lora_into(model.model)
     if not n_merged:
-        raise RuntimeError("합칠 보조 행렬 층을 하나도 못 찾았다 - 학습이 안 붙은 것이다")
-    print(f"보조 행렬 {n_merged}개 층을 본체에 합침")
+        raise RuntimeError("합칠 LoRA 층을 하나도 못 찾았다 - 학습이 안 붙은 것이다")
+    print(f"LoRA {n_merged}개 층을 본체에 합침")
     model.save_pretrained(args.output_dir)
     print(f"모델 저장: {args.output_dir}")
     print("다음 단계 - 개발용에서 견줄 것 (색인은 다시 안 만들어도 됨):")
@@ -593,40 +499,28 @@ def cmd_rerank(args) -> None:
     print(f"      --index data/embeddings/cs2021-ft \\")
     print(f"      --embed-model models/retriever-ft \\")
     print(f"      --k 100 --rerank cross --rerank-depth 100 --out runs/dev_rr_ft.jsonl")
-    print("그리고 app.py 의 MIN_RERANK_SCORE 를 다시 잴 것 (점수 눈금이 바뀌었음)")
+    print("그리고 app.py 의 MIN_RERANK_SCORE 를 다시 잴 것 (점수 범위가 바뀌었음)")
 
 
 # ==========================================================================
-# 관문 1 - 미세조정이 정답 등수를 끌어올렸는가 (부분집합에서 값싸게 확인)
+# 점검 1 - 파인튜닝이 정답 등수를 끌어올렸는가 (부분집합에서 빠르게 확인)
 # ==========================================================================
 #
-# ## 왜 부분집합인가
+# 71만 편을 다시 임베딩하는 데 3시간이 걸림. 그 전에 "오르긴 하는가" 를 빠르게 걸러냄.
+# 부분집합은 정답 논문과 지금 색인이 데려온 상위 후보로 만듦.
 #
-# 71만 편을 다시 임베딩하는 데 3시간이 걸림. 그 전에 "오르긴 하는가"를 값싸게 걸러냄.
-# 부분집합은 **정답 논문 + 지금 색인이 데려온 상위 후보** 로 만듦. 그 후보들이 정답과
-# 실제로 경쟁하는 논문이므로, 정답이 그것들 위로 올라가는지가 곧 우리가 알고 싶은 것임.
-#
-# ## 이 값을 어떻게 읽어야 하는가 (반드시 지킬 것)
-#
-# **이 관문은 "접는 판정"에만 씀.** 부분집합은 지금 모델이 고른 후보로 만들어졌으므로,
-# 미세조정한 모델이 **새로 끌어올릴 엉뚱한 논문**은 이 안에 없음. 그래서 여기 값은
-# 실제보다 좋게 나옴. 한 방향으로만 믿을 수 있음.
+# 이 점검은 그만둘지 판정할 때만 씀. 부분집합에는 파인튜닝한 모델이 새로 끌어올릴 엉뚱한 논문이
+# 없어서 여기 값은 실제보다 좋게 나옴. 한 방향으로만 믿을 수 있음.
 #
 #     여기서 안 오름  ->  71만 편에서도 안 오름. 재색인하지 말고 접을 것
-#     여기서 오름     ->  아직 모름. 재색인해서 관문 2 에서 판정할 것
+#     여기서 오름     ->  아직 모름. 재색인해서 점검 2 에서 판정할 것
 #
-# ISSUE #26 · #31 이 "상한은 재정렬이 실제로 본 후보로 잰다"고 정한 것과 같은 정신임.
+# 두 무리를 나눠 보는 이유: 학습 자료는 코퍼스 비율대로 뽑아 cs 계열이 45.9% 인데, 개발용
+# 평가셋은 분야를 고르게 뽑아 그 넷이 2.9% 뿐임. 검증용에서는 오르는데 개발용에서만 안
+# 오르면 방법이 안 되는 것이 아니라 분야가 안 맞는 것임.
 #
-# ## 두 무리를 나눠서 보는 이유
-#
-#     검증용   학습에서 뺀 논문 500편의 문항. 학습 자료와 **같은 분야 분포**
-#     개발용   data/eval/dev.jsonl. 평가셋 분포 (분야가 크게 다름)
-#
-# 학습 자료는 코퍼스 비율대로 뽑아 cs.CV·cs.LG·cs.CL·cs.AI 가 45.9% 인데, 개발용
-# 평가셋은 분야를 고르게 뽑아 그 넷이 2.9%(348문항 중 10개) 뿐임. 그래서 검증용에서는
-# 오르는데 개발용에서만 안 오르면 그것은 **방법이 안 되는 것이 아니라 분야가 안 맞는 것**임.
-# 두 무리를 나눠 재야 그 둘을 가를 수 있음.
-
+#     검증용   학습에서 뺀 논문 500편의 문항. 학습 자료와 같은 분야 분포
+#     개발용   data/eval/dev.jsonl. 평가셋 분포
 
 def _rank_of(sub_emb, q_vec, gold_row: int) -> int:
     """부분집합 안에서 정답이 몇 등인지 (1등이 1)."""
@@ -691,7 +585,7 @@ def cmd_embed_check(args) -> None:
     row_of = {p: i for i, p in enumerate(subset)}
     print(f"부분집합 논문 {len(subset):,}편 (71만 편 중 {len(subset) / len(ret.ids):.1%})")
 
-    # -- 미세조정 전 등수: 이미 있는 임베딩을 그대로 쓰므로 정확하고 공짜 ------
+    # -- 파인튜닝 전 등수: 이미 있는 임베딩을 그대로 쓰므로 정확하고 공짜 ------
     sub_before = np.asarray(ret.emb[subset], dtype=np.float32)
     qb = ret.embedder.encode([it["text"] for it in items], normalize_embeddings=True,
                              convert_to_numpy=True, batch_size=64).astype(np.float32)
@@ -708,7 +602,7 @@ def cmd_embed_check(args) -> None:
 
     summary = []
     for model_path in args.model:
-        print(f"\n{'=' * 74}\n미세조정 모델 불러오는 중: {model_path}", flush=True)
+        print(f"\n{'=' * 74}\n파인튜닝 모델 불러오는 중: {model_path}", flush=True)
         kw = {"model_kwargs": {"dtype": torch.float16}} if torch.cuda.is_available() else {}
         ft = SentenceTransformer(model_path, **kw)
         ft.max_seq_length = args.max_len
@@ -753,56 +647,31 @@ def cmd_embed_check(args) -> None:
         line += f"{np.mean([ranks[i] <= 100 for i in sel_all]):>10.3f}"
         print(line)
 
-    _row("(미세조정 전)", ranks_before)
+    _row("(파인튜닝 전)", ranks_before)
     for name, ranks in summary:
         _row(name, ranks)
 
-    print("\n[관문 1 판정] 부분집합 안에서 잰 값이라 접는 판정에만 씀")
+    print("\n[점검 1 판정] 부분집합 안에서 잰 값이라 그만둘지 판정할 때만 씀")
     print("  기준: 검증용 등수 중앙값이 내려가면 재색인으로 넘어가고, "
           "안 내려가면 여기서 접음")
 
 
 
 # ==========================================================================
-# 가중치 섞기 - 학습한 정도를 배율로 조절 (다시 학습하지 않음)
+# 두 모델 섞기 - 원래 모델과 학습한 모델의 중간 지점 만들기
 # ==========================================================================
 #
-# ## 왜 필요한가 (2026-08-25, 관문 1 에서 드러난 문제)
+# 파인튜닝이 일상어 층은 크게 올렸는데 정확한 학술어 층을 떨어뜨렸음(easy 0.836 -> 0.638,
+# hard 0.250 -> 0.776). 원인은 학습 자료에 easy 를 안 넣은 것임.
 #
-# 미세조정이 일상어 층(hard)은 크게 올렸는데 **정확한 학술어 층(easy)을 떨어뜨렸음.**
-# 개발용 348문항 부분집합에서 잰 값임.
-#
-#     무리       100등 안 (전 -> 후)
-#     easy       0.836 -> 0.638      <- 잊어버림
-#     medium     0.655 -> 0.888
-#     hard       0.250 -> 0.776
-#
-# 원인은 학습 자료에 easy 를 안 넣은 것임. 당시 근거는 "후보 상한이 0.931 이라 올릴 자리가
-# 없다" 였는데, **올릴 자리가 없는 것과 잃을 자리가 없는 것은 다른 이야기였음.**
-# 개발용 easy 한국어 문항의 99.1%가 낱말 나열인데, 모델이 문장형 질문만 보고 학습해
-# 낱말 나열을 잊었음.
-#
-# ## 어떻게 고치는가
-#
-# 보조 행렬 학습은 원래 가중치에 변화량을 **더하는** 방식이라, 그 변화량에 배율을 곱하면
-# 원래 모델과 학습한 모델 사이의 중간 지점이 나옴.
+# LoRA 학습은 원래 가중치에 변화량을 더하는 방식이라, 그 변화량에 배율을 곱하면
+# 중간 지점이 나옴. 다시 학습하지 않고 배율마다 점검 1 을 돌려 볼 수 있음.
 #
 #     섞은 모델 = 원래 모델 + 배율 x (학습한 모델 - 원래 모델)
 #
-#     배율 0.0  원래 모델 그대로       easy 안 잃음, hard 안 얻음
-#     배율 1.0  학습한 모델 그대로     easy 많이 잃음, hard 많이 얻음
-#
-# **다시 학습하지 않음.** 두 모델이 디스크에 있으면 가중치를 섞기만 하면 되고, 배율마다
-# 관문 1(`embed-check`)을 돌려 easy 와 hard 가 어떻게 맞바뀌는지 표로 볼 수 있음.
-#
-# ## 2026-08-25 결정: 이 도구는 남기되 쓰지 않음
-#
-# 배율을 관측 결과에 맞춰 고르는 것은 **사후 조정**이라, 개발용에서 좋아 보이는 배율이
-# 시험용에서도 맞을 보장이 없음. 고칠 자리는 배율이 아니라 학습 자료였음 - easy 질문을
-# 같은 방법으로 만들어 넣고 다시 학습하는 쪽을 골랐음(ISSUE #51).
-#
-# 남겨 두는 이유: easy 를 넣어 다시 학습해도 잊어버림이 남으면 그때 마지막 수단이 됨.
-
+# 이 도구는 남기되 쓰지 않기로 했음. 배율을 관측 결과에 맞춰 고르는 것은 사후 조정이라
+# 개발용에서 좋아 보이는 배율이 시험용에서도 맞을 보장이 없음. 고칠 자리는 배율이 아니라
+# 학습 자료였음.
 
 def cmd_blend(args) -> None:
     import torch
@@ -849,7 +718,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="학습 (변환기: sft -> dpo · 검색 모델: embed)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("sft", help="1단계: 지도 미세조정")
+    s = sub.add_parser("sft", help="1단계: 지도 파인튜닝")
     s.add_argument("--data", default="data/training/train_query_translator_sft.jsonl")
     s.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507")
     s.add_argument("--output-dir", default="models/query-translator-sft")
@@ -863,33 +732,33 @@ def main() -> None:
     s.add_argument("--lr", type=float, default=1e-4,
                    help="데이터가 적을 때는 낮게(과적합 억제). LoRA 통상 1e-4~3e-4")
     s.add_argument("--lora-r", type=int, default=32,
-                   help="LoRA 보조 행렬 크기. 메모리 여유가 있으니 32로 표현력 확보")
+                   help="LoRA 크기. 메모리 여유가 있으니 32로 표현력 확보")
     s.add_argument("--max-len", type=int, default=512,
                    help="실제 데이터가 최대 424글자라 512로 충분(길면 메모리만 낭비)")
     s.add_argument("--val-ratio", type=float, default=0.15, help="검증용으로 뗄 비율")
     s.add_argument("--use-4bit", action="store_true",
-                   help="4비트 양자화 켜기. 기본은 끔 - 16GB VRAM 에서 bf16(약 9.7GB)이 "
+                   help="4비트 양자화 켜기. 기본은 끔 - 그래픽 메모리 16GB 에서 약 9.7GB 로 "
                         "충분히 들어가고, 양자화는 성능을 깎기 때문. 메모리가 부족할 때만")
     s.set_defaults(func=cmd_sft)
 
-    d = sub.add_parser("dpo", help="2단계: 선호 학습 (SFT 어댑터 위에)")
+    d = sub.add_parser("dpo", help="2단계: 선호 학습 (앞 단계 어댑터 위에)")
     d.add_argument("--data", default="data/training/train_query_translator_dpo.jsonl")
     d.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507")
     d.add_argument("--sft-adapter", default="models/query-translator-sft/checkpoint-54",
-                   help="SFT로 학습한 LoRA 어댑터. 그 위에 이어서 DPO 학습한다")
+                   help="앞 단계에서 학습한 어댑터. 그 위에 이어서 선호 학습을 한다")
     d.add_argument("--output-dir", default="models/query-translator-dpo")
     d.add_argument("--epochs", type=int, default=2,
-                   help="DPO는 SFT보다 적은 에폭으로도 충분(과하면 성능이 무너짐)")
+                   help="선호 학습은 앞 단계보다 적은 에폭으로 충분. 과하면 성능이 무너짐")
     d.add_argument("--batch-size", type=int, default=2)
     d.add_argument("--lr", type=float, default=5e-6,
-                   help="DPO는 SFT보다 훨씬 낮은 학습률을 쓴다(1e-6~1e-5). 크면 모델이 붕괴")
+                   help="선호 학습은 훨씬 낮은 학습률을 쓴다(1e-6~1e-5). 크면 모델이 무너짐")
     d.add_argument("--beta", type=float, default=0.1,
                    help="원본 모델에서 얼마나 벗어날지 조절. 작을수록 자유롭게 변함")
     d.add_argument("--max-len", type=int, default=512)
     d.add_argument("--val-ratio", type=float, default=0.15)
     d.set_defaults(func=cmd_dpo)
 
-    e = sub.add_parser("embed", help="검색 모델(임베딩) 미세조정 - 1차 검색을 고치는 것")
+    e = sub.add_parser("embed", help="검색 모델(임베딩) 파인튜닝 - 1차 검색을 고치는 것")
     e.add_argument("--data", default="data/training/train_retriever.jsonl")
     e.add_argument("--base-model", default="BAAI/bge-m3",
                    help="지금 색인을 만든 모델과 같아야 한다")
@@ -900,7 +769,7 @@ def main() -> None:
     e.add_argument("--batch-size", type=int, default=8,
                    help="문항 하나가 글 8개(질문+정답+오답 6)를 통과하므로 크게 잡으면 넘침")
     e.add_argument("--grad-accum", type=int, default=1)
-    e.add_argument("--lr", type=float, default=1e-4, help="보조 행렬 학습의 통상값")
+    e.add_argument("--lr", type=float, default=1e-4, help="LoRA 학습률 통상값")
     e.add_argument("--lora-r", type=int, default=32)
     e.add_argument("--negatives", type=int, default=6, help="문항당 쓸 오답 편수")
     e.add_argument("--max-len", type=int, default=512,
@@ -912,18 +781,18 @@ def main() -> None:
     e.add_argument("--seed", type=int, default=42)
     e.set_defaults(func=cmd_embed)
 
-    r = sub.add_parser("rerank", help="재정렬기 미세조정 - 2단계(줄 세우기)를 고치는 것")
+    r = sub.add_parser("rerank", help="재정렬기 파인튜닝 - 2단계(줄 세우기)를 고치는 것")
     r.add_argument("--data", default="data/training/train_reranker.jsonl")
     r.add_argument("--base-model", default="BAAI/bge-reranker-v2-m3",
-                   help="서비스가 쓰는 재정렬기. 모델 교체는 ISSUE #41 에서 반증됐으므로 바꾸지 말 것")
+                   help="서비스가 쓰는 재정렬기. 모델을 바꿔도 나아지지 않는 것을 확인했음")
     r.add_argument("--output-dir", default="models/reranker-ft",
-                   help="기본값은 지금 있는 모델을 덮어씀. ISSUE #55 의 근거 파일이므로 "
-                        "손실을 바꿔 다시 학습할 때는 다른 이름을 줄 것")
+                   help="기본값은 지금 있는 모델을 덮어씀. 손실을 바꿔 다시 학습할 때는 "
+                        "옛 결과를 지우지 않도록 다른 이름을 줄 것")
     r.add_argument("--loss", choices=["mnrl", "ranknet"], default="mnrl",
                    help="mnrl 은 지금까지 쓰던 CachedMultipleNegativesRankingLoss "
                         "(묶음 안 다른 질문의 글도 오답으로 씀). ranknet 은 RankNetLoss "
                         "(그 질문에 딸린 글끼리만 견줌). 두 손실 모두 점수의 절대값은 "
-                        "붙잡지 않음 - 자세한 것은 ISSUE #55 참고")
+                        "붙잡지 않음. 순서는 가르쳐도 '무관한 것은 0 에 가깝게' 는 못 가르침")
     r.add_argument("--negatives", type=int, default=4,
                    help="문항당 쓸 어려운 오답(정답을 뺀 검색 상위) 편수")
     r.add_argument("--in-batch-negatives", type=int, default=4,
@@ -933,25 +802,25 @@ def main() -> None:
                    help="이 손실은 묶음이 클수록 오답이 많아져 학습이 세짐")
     r.add_argument("--mini-batch-size", type=int, default=16,
                    help="한 번에 모델을 통과시킬 쌍의 수. 그래픽카드 메모리를 정하는 값")
-    r.add_argument("--lr", type=float, default=1e-4, help="보조 행렬 학습의 통상값")
+    r.add_argument("--lr", type=float, default=1e-4, help="LoRA 학습률 통상값")
     r.add_argument("--lora-r", type=int, default=32)
     r.add_argument("--max-len", type=int, default=512,
                    help="서비스의 CrossEncoderReranker 와 같은 값이어야 함")
     r.add_argument("--grad-checkpoint", action="store_true",
-                   help="메모리가 모자랄 때. 학습 내용은 그대로이고 느려짐 (ISSUE #52)")
+                   help="메모리가 모자랄 때. 학습 내용은 그대로이고 느려짐")
     r.add_argument("--logging-steps", type=int, default=50)
     r.add_argument("--limit", type=int, default=None, help="앞에서 N문항만 (속도 재기용)")
     r.add_argument("--seed", type=int, default=42)
     r.set_defaults(func=cmd_rerank)
 
-    c = sub.add_parser("embed-check", help="관문 1: 미세조정이 정답 등수를 올렸는지 값싸게 확인")
+    c = sub.add_parser("embed-check", help="점검 1: 파인튜닝이 정답 등수를 올렸는지 빠르게 확인")
     c.add_argument("--model", nargs="+", default=["models/retriever-ft"],
                    help="여러 개를 주면 같은 부분집합에서 나란히 견줌 (배율 고를 때 씀)")
     c.add_argument("--pairs", default="data/training/val_retriever.jsonl",
                    help="학습에서 뺀 검증용 문항")
     c.add_argument("--queries", default="data/eval/dev.jsonl")
     c.add_argument("--corpus", default="data/corpus/corpus-cs2021.jsonl")
-    c.add_argument("--index", default="data/embeddings/cs2021")
+    c.add_argument("--index", default="data/embeddings/cs2021-ft")
     c.add_argument("--depth", type=int, default=100,
                    help="문항마다 후보를 몇 편까지 부분집합에 넣을지")
     c.add_argument("--val-sample", type=int, default=500,

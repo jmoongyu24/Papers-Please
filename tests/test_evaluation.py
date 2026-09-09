@@ -1,15 +1,15 @@
-"""평가가 조용히 틀리는 자리를 못박아 두는 테스트 (검색, 모델 없이 돌아감).
+"""평가가 조용히 틀리는 자리를 못박아 두는 테스트. 검색도 모델도 없이 돌아감.
 
 1부. 집계 규칙 (pipeline_eval)
-1. 오류, 결과 0건 문항을 실패로 세는가. 제외해 버리면 기준선이 부풀려짐(ISSUE #23).
-2. 저장된 채널 결과만으로 융합을 다시 계산할 수 있는가. 이 하네스의 존재 이유임.
-3. 상한을 어느 집합으로 재는가. 합집합과 '재정렬이 실제로 본 후보' 를 헷갈리면
-   융합이 흘린 몫이 재정렬 탓으로 넘어가 처방이 뒤바뀜 (ISSUE #26, #31).
+1. 오류나 결과 0건 문항을 실패로 세는가. 제외해 버리면 기준선이 부풀려짐
+2. 저장된 채널 결과만으로 합치기를 다시 계산할 수 있는가. 이 평가 코드의 존재 이유임
+3. 후보를 어느 집합으로 재는가. 합집합과 '재정렬이 실제로 본 후보' 를 헷갈리면
+   합치기가 놓친 몫이 재정렬 탓으로 넘어가 고칠 곳이 뒤바뀜
 
 2부. 지표 계산 (metrics)
-지표는 평가 전체의 기준이므로, 손으로 계산한 값과 맞는지 못박아 둠.
+지표는 평가 전체의 기준이므로 손으로 계산한 값과 맞는지 못박아 둠.
 
-실행: $PY -m pytest tests/test_evaluation.py -q
+실행: python -m pytest tests/test_evaluation.py -q
 """
 
 import json
@@ -59,10 +59,10 @@ def test_rank_respects_k():
     assert pe.hits_at(ranks, 3) == [1.0, 1.0, 0.0, 0.0, 1.0]
 
 
-# -- 합집합 상한 -----------------------------------------------------------
+# -- 합집합 -----------------------------------------------------------------
 def test_union_is_the_ceiling_and_at_least_as_good_as_each_channel():
     union = pe.hits_at([pe.union_rank(r, 100) for r in ROWS], 1)
-    assert union == [1.0, 1.0, 0.0, 0.0, 1.0]        # q2 는 의미 검색 덕분에 상한에 들어옴
+    assert union == [1.0, 1.0, 0.0, 0.0, 1.0]        # q2 는 의미 검색 덕분에 합집합에 들어옴
 
     for name in ("arxiv", "local_dense"):
         ch = pe.hits_at([pe.rank_in((r["channels"] or {}).get(name) or [], r["gold_id"])
@@ -76,9 +76,9 @@ def test_union_respects_depth():
     assert pe.union_rank(r, 3) == 1
 
 
-# -- 저장된 결과만으로 융합 재계산 ------------------------------------------
+# -- 저장된 결과만으로 순위 합치기 재계산 ------------------------------------
 def test_fusion_recomputed_from_stored_ids():
-    """검색을 다시 하지 않고 채널 결과만으로 융합 순위가 나와야 함."""
+    """검색을 다시 하지 않고 채널 결과만으로 합친 순위가 나와야 함."""
     r = row("q", "B", {"arxiv": ["X", "B"], "local_dense": ["B", "Y"]})
     fused = pe.fused_ids_of(r, rrf_k=60, top_n=10, weights={})
     assert fused[0] == "B"                  # 두 채널이 합의한 논문이 1등
@@ -145,7 +145,7 @@ def test_channel_error_does_not_stop_other_channels():
 
 # -- 채널 조합 갈라 보기 (검색 없이) ----------------------------------------
 def test_채널을_골라내면_그_조합만_보게_된다():
-    """두 채널 결과에서 한 채널만 남기면 융합, 상한이 전부 그 조합만 봄."""
+    """두 채널 결과에서 한 채널만 남기면 그 뒤 단계가 전부 그 조합만 봄."""
     only_b = pe.select_channels(ROWS, ["local_dense"])
 
     # q2 는 arXiv 가 못 찾고 의미 검색만 3등으로 찾은 문항
@@ -190,7 +190,7 @@ def test_text_lookup_falls_back_to_scanning_corpus(tmp_path):
     lookup = pe.TextLookup(index_prefix=None, corpus_path=corpus, arxiv_cache=None)
     got = lookup.fetch({"1111.1111", "3333.3333"})
     assert got["1111.1111"] == ("제목 1111.1111", "초록 1111.1111")
-    assert "3333.3333" not in got          # 못 찾은 것은 조용히 빠짐 -> 하네스가 경고를 찍음
+    assert "3333.3333" not in got          # 못 찾은 것은 조용히 빠짐 -> 평가 코드가 경고를 찍음
 
 
 def test_text_lookup_reads_arxiv_cache(tmp_path):
@@ -209,50 +209,50 @@ def test_text_lookup_reads_arxiv_cache(tmp_path):
 def test_report_runs_on_rows_with_errors(capsys):
     pe.print_report(ROWS, "테스트", k_values=(1, 10), rrf_k=60, weights={})
     text = capsys.readouterr().out
-    assert "합집합(상한)" in text
+    assert "합집합" in text
     assert "재정렬" in text
 
 
 def test_report_runs_when_nothing_is_found(capsys):
     rows = [row("q1", "A", {"arxiv": [], "local_dense": []}, error="x")]
     pe.print_report(rows, "전부 실패", k_values=(10,), rrf_k=60, weights={})
-    assert "상한이 0이라 계산 불가" in capsys.readouterr().out
+    assert "후보에 정답이 없어 계산 불가" in capsys.readouterr().out
 
 
-# -- 상한을 어느 집합으로 재는가 (ISSUE #26 이 재발한 자리) -----------------
+# -- 후보를 어느 집합으로 재는가 -------------------------------------------
 #
-# 합집합과 '재정렬이 실제로 본 후보' 는 다른 집합임. 융합이 후보를 줄이기 때문임.
-# 합집합을 상한이라 부르면 융합이 흘린 몫까지 재정렬 탓으로 넘어가 처방이 뒤바뀜.
+# 합집합과 '재정렬이 실제로 본 후보' 는 다른 집합임. 합치기가 후보를 줄이기 때문임.
+# 합집합을 재정렬이 본 후보라 부르면 합치기가 놓친 몫까지 재정렬 탓으로 넘어감.
 # 실측에서 시험용 300문항 기준 0.823 대 0.797 로 정답 8편이 그렇게 넘어가 있었음.
 
 FUSION_DROPS_GOLD = row(
     "q9", "GOLD",
     # 정답은 의미 검색 3등이라 합집합@3 에는 들어옴.
-    # 그러나 arXiv 가 올린 P, Q 가 RRF 점수에서 앞서, 융합 상위 3편에서는 밀려남.
+    # 그러나 arXiv 가 올린 P, Q 가 점수에서 앞서, 합친 상위 3편에서는 밀려남.
     {"local_dense": ["X", "Y", "GOLD"], "arxiv": ["P", "Q", "R"]},
 )
 
 
-def test_합집합에는_있지만_융합_상위에서는_밀려난다():
+def test_합집합에는_있지만_합친_상위에서는_밀려난다():
     assert pe.union_rank(FUSION_DROPS_GOLD, depth=3) == 1
     assert pe.rerank_pool_rank(FUSION_DROPS_GOLD, rrf_k=60, depth=3, weights={}) is None
 
 
-def test_융합이_흘린_몫과_재정렬이_못_건진_몫을_따로_보고한다(capsys):
+def test_합치기가_놓친_몫과_재정렬이_못_건진_몫을_따로_보고한다(capsys):
     rows = [dict(FUSION_DROPS_GOLD, reranked_ids=["X", "P", "Y"], rerank_depth=3)]
-    pe.print_report(rows, "융합 손실", k_values=(10,), rrf_k=60, weights={}, pool_depth=3)
+    pe.print_report(rows, "합치기 손실", k_values=(10,), rrf_k=60, weights={}, pool_depth=3)
     text = capsys.readouterr().out
 
     assert "채널 합집합" in text
     assert "재정렬이 실제로 본 후보" in text
-    assert "융합이 흘린 몫" in text
-    # 합집합 1.000 -> 융합 후 0.000 이므로 손실 전부가 융합 몫으로 잡혀야 함
-    assert "융합이 흘린 몫  ((1) -> (2))         : -1.000" in text
+    assert "합치기가 놓친 몫" in text
+    # 합집합 1.000 -> 합친 뒤 0.000 이므로 손실 전부가 합치기 몫으로 잡혀야 함
+    assert "합치기가 놓친 몫  ((1) -> (2))       : -1.000" in text
     assert "재정렬이 못 건진 몫 ((2) -> (3))      : +0.000" in text
 
 
 def test_파일에_새겨진_재정렬_깊이를_명령줄보다_우선한다(capsys):
-    """재집계할 때 기본값으로 상한을 재면 ISSUE #26 이 되살아남."""
+    """재집계할 때 명령줄 기본값으로 재면 깊이가 어긋남."""
     rows = [dict(FUSION_DROPS_GOLD, reranked_ids=["GOLD"], rerank_depth=3)]
     pe.print_report(rows, "깊이 새김", k_values=(10,), rrf_k=60, weights={}, pool_depth=200)
     text = capsys.readouterr().out

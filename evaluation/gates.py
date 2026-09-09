@@ -1,20 +1,18 @@
-"""고정된 통과 관문 — 재정렬 모델이 고장났는지 값싸게 잡아내는 것.
+"""고정된 사전 점검 - 재정렬 모델이 고장났는지 빠르게 잡아내는 것.
 
-성능을 재는 것이 아니라 **고장을 잡는 것**임. 통과했다고 좋은 모델이라는 뜻이 아니고,
-떨어지면 Recall 을 볼 필요가 없다는 뜻임. 기준은 `evaluation/README.md` 의
-'고정된 평가 규칙' 에 못박아 두었고 결과를 보고 바꾸지 않음.
+성능을 재는 것이 아님. 통과했다고 좋은 모델이라는 뜻이 아니고, 떨어지면 Recall 을 볼
+필요가 없다는 뜻임. 기준값은 결과를 보고 바꾸지 않음.
 
-왜 필요한가 (ISSUE #55):
-    2026-08-27 에 미세조정한 재정렬기가 개발용 Recall@10 을 0.618 에서 0.629 로 올렸음.
-    그 값만 보면 나쁘지 않아 보이는데, 실제로는 후보 100편의 99.3% 에 0.002 이상을 주고
-    아무 상관 없는 논문에도 0.958 을 주는 상태였음. Recall 로는 안 잡힘.
+    점검 1  무작위 논문 600쌍 - 확실히 무관한 논문에 높은 점수를 주는가
+    점검 2  상위 10편 점수 분포 - 후보 안에서 순서를 만들 신호가 남아 있는가
 
-관문 1  무작위 논문 600쌍 - 확실히 무관한 논문에 높은 점수를 주는가
-관문 2  상위 10편 점수 분포 - 후보 안에서 순서를 만들 신호가 남아 있는가
+Recall 만 보면 이 고장이 안 잡힘. 파인튜닝한 재정렬기가 개발용 Recall@10 을 0.618 에서
+0.629 로 올렸는데, 실제로는 후보 100편의 99.3% 에 0.002 이상을 주고 아무 상관 없는
+논문에도 0.958 을 주는 상태였음.
 
 실행:
-    $PY -m evaluation.gates --model models/reranker-ft
-    $PY -m evaluation.gates --model models/reranker-ft --run runs/dev_rr_new.jsonl
+    python -m evaluation.gates --model models/reranker-ft
+    python -m evaluation.gates --model models/reranker-ft --run runs/dev_rr_new.jsonl
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ import numpy as np
 
 from src import config
 
-# 관문 1 이 쓰는 표본. 값을 바꾸면 옛 결과와 견줄 수 없으므로 고정함.
+# 점검 1 이 쓰는 표본. 값을 바꾸면 옛 결과와 견줄 수 없으므로 고정함.
 N_QUESTIONS = 30            # 난이도별 10개
 N_PAPERS = 20               # 코퍼스를 고르게 훑어 뽑음
 CORPUS_STRIDE = 35000       # 71만 편을 20편으로 나누는 간격
@@ -41,13 +39,13 @@ GATE2_HARD_GAP = 0.05       # 통과선: hard 의 1등-10등 차이 중앙값이
 REFERENCE = {
     "원래 BAAI/bge-reranker-v2-m3": {"median": 0.00006, "above": 0.030,
                                      "distinct": 2304, "hard_gap": 0.1168},
-    "실패한 reranker-ft (#55)":      {"median": 0.00172, "above": 0.477,
+    "실패한 reranker-ft":            {"median": 0.00172, "above": 0.477,
                                      "distinct": 607, "hard_gap": 0.0249},
 }
 
 
 def load_fixed_sample() -> tuple[list[dict], list[str]]:
-    """관문 1 의 질문 30개와 논문 20편. 매번 같은 것이 나와야 함."""
+    """점검 1 의 질문 30개와 논문 20편. 매번 같은 것이 나와야 함."""
     qs = [json.loads(l) for l in open(config.DATA_DIR / "eval" / "dev.jsonl")]
     sel: list[dict] = []
     for d in ("easy", "medium", "hard"):
@@ -92,10 +90,10 @@ def gate2(run_path: str) -> dict:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="재정렬 모델의 고정 통과 관문")
-    ap.add_argument("--model", default=None, help="관문 1 을 돌릴 재정렬 모델")
+    ap = argparse.ArgumentParser(description="재정렬 모델의 고정 사전 점검")
+    ap.add_argument("--model", default=None, help="점검 1 을 돌릴 재정렬 모델")
     ap.add_argument("--run", default=None,
-                    help="관문 2 를 돌릴 실행 결과 파일 (rerank_scores 가 있어야 함)")
+                    help="점검 2 를 돌릴 실행 결과 파일 (rerank_scores 가 있어야 함)")
     ap.add_argument("--batch-size", type=int, default=32)
     args = ap.parse_args()
 
@@ -107,7 +105,7 @@ def main() -> None:
         g = gate1(args.model, args.batch_size)
         ok = g["median"] < GATE1_MEDIAN and g["above"] < GATE1_ABOVE
         passed &= ok
-        print(f"\n[관문 1] 무작위 논문 {g['n']}쌍 · {args.model}")
+        print(f"\n[점검 1] 무작위 논문 {g['n']}쌍 · {args.model}")
         print(f"  점수 중앙값   {g['median']:.5f}   통과선 {GATE1_MEDIAN} 미만"
               f"   {'통과' if g['median'] < GATE1_MEDIAN else '불합격'}")
         print(f"  0.002 이상    {g['above']:.3f}     통과선 {GATE1_ABOVE} 미만"
@@ -120,7 +118,7 @@ def main() -> None:
         g = gate2(args.run)
         ok = g["distinct"] >= GATE2_DISTINCT and g["hard_gap"] >= GATE2_HARD_GAP
         passed &= ok
-        print(f"\n[관문 2] 상위 10편 점수 분포 · {args.run}")
+        print(f"\n[점검 2] 상위 10편 점수 분포 · {args.run}")
         print(f"  서로 다른 값  {g['distinct']:,} / {g['n']:,}   통과선 {GATE2_DISTINCT:,} 이상"
               f"   {'통과' if g['distinct'] >= GATE2_DISTINCT else '불합격'}")
         print(f"  hard 1등-10등 {g['hard_gap']:.4f}      통과선 {GATE2_HARD_GAP} 이상"

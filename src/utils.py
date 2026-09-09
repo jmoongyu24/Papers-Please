@@ -1,7 +1,6 @@
-"""여러 모듈이 공통으로 쓰는 자잘한 도구 함수들.
+"""여러 모듈이 함께 쓰는 JSON Lines 읽기, 쓰기.
 
-지금은 주로 JSON Lines(줄마다 JSON 하나) 파일을 읽고 쓰는 함수를 담음.
-평가셋, 코퍼스, 실험 결과를 전부 이 형식으로 저장하므로 한곳에 모아둠.
+평가셋, 코퍼스, 실험 결과를 전부 이 형식으로 저장함.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ def read_jsonl(path: str | Path) -> Iterator[dict]:
 
 
 def write_jsonl(path: str | Path, rows: Iterable[dict]) -> int:
-    """딕셔너리들을 JSON Lines 파일로 저장함. 저장한 줄 수를 돌려줌."""
+    """딕셔너리들을 JSON Lines 파일로 저장하고 저장한 줄 수를 돌려줌."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     n = 0
@@ -30,15 +29,3 @@ def write_jsonl(path: str | Path, rows: Iterable[dict]) -> int:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             n += 1
     return n
-
-
-def read_json(path: str | Path) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def write_json(path: str | Path, obj: dict) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)

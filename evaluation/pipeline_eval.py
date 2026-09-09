@@ -1,57 +1,40 @@
-"""검색 파이프라인을 실제로 돌려 재는 하네스 - 성능(정확도)과 응답 시간 둘 다.
+"""검색 파이프라인을 실제로 돌려 재는 평가 코드. 정확도와 응답 시간 둘 다.
 
-    # 개발용에서 두 채널로 (이어하기 켜짐)
-    $PY -m evaluation.pipeline_eval --queries data/eval/dev.jsonl \\
+    # 개발용에서 두 채널로 (중단하면 이어서 함)
+    python -m evaluation.pipeline_eval --queries data/eval/dev.jsonl \\
         --channels arxiv local_dense --rewriter dpo --k 100 --out runs/dev_dpo.jsonl
 
-    # 저장된 결과만 다시 집계 (검색 0회). 융합 상수, 가중치를 바꿔 가며 반복 가능
-    $PY -m evaluation.pipeline_eval --report-only runs/dev_dpo.jsonl \\
+    # 저장된 결과만 다시 집계 (검색 0회). 합치기 상수와 가중치를 바꿔 가며 반복 가능
+    python -m evaluation.pipeline_eval --report-only runs/dev_dpo.jsonl \\
         --rrf-k 30 --weights local_dense=2.0
 
     # 저장된 결과에 재정렬만 다시 적용 (검색 0회)
-    $PY -m evaluation.pipeline_eval --report-only runs/dev_dpo.jsonl \\
+    python -m evaluation.pipeline_eval --report-only runs/dev_dpo.jsonl \\
         --rerank cross --rerank-depth 100
 
     # 서비스 응답 시간 실측 (평가셋이 아니라 실제 질문으로)
-    $PY -m evaluation.pipeline_eval --bench-service --n 5
+    python -m evaluation.pipeline_eval --bench-service --n 5
 
 만족도(nDCG)까지 포함한 자세한 보고와 실행 간 비교는 `evaluation/report.py` 가 맡음.
 
 ## 왜 채널별 결과를 따로 저장하는가
 
-검색 경로가 둘 이상(arXiv 키워드 + 로컬 의미 검색)이면 다음 질문에 답할 수 있어야 함.
-
-  - 각 채널은 단독으로 얼마나 찾아내는가?
-  - 두 채널을 합치면 후보 상한이 얼마나 올라가는가? (ISSUE #21: 이 상한을 0.70 위로
-    올리지 못하면 목표 달성이 산술적으로 불가능함)
-  - 그 상한 중 융합, 재정렬이 실제로 얼마나 회수하는가?
-
-그래서 채널별 검색 결과 논문 번호를 전부 따로 저장함.
+채널별 검색 결과 논문 번호를 전부 따로 저장함.
 
     {"channels": {"arxiv": [...100편...], "local_dense": [...100편...]}}
 
-이것이 이 하네스의 핵심 가치임. 융합 상수(k), 채널 가중치, 재정렬 방식을 바꿔 가며 실험할 때
-검색을 다시 하지 않음. arXiv 는 요청당 3초 제한이 있어 300문항 재검색이 15분 이상
-걸리고 429/503 으로 문항이 유실되기도 하는데, 그 비용을 한 번만 치름.
+이렇게 두면 합치기 상수, 채널 가중치, 재정렬 방식을 바꿔 가며 실험할 때 검색을 다시
+하지 않음. arXiv 는 요청당 3초 제한이 있어 300문항 재검색이 15분 넘게 걸리고 오류로
+문항이 유실되기도 하는데, 그 비용을 한 번만 치름.
 
-## 실패를 세는 방식 (ISSUE #23 점검표 3번)
+## 지켜야 할 규칙 세 가지
 
-오류, 결과 0건 문항을 제외하지 않고 실패(0점)로 셈. 제외하면 기준선이 부풀려짐
-(같은 실행을 그렇게 재면 passthrough 가 0.257 대신 0.467 로 보임). 이 하네스의 모든
-비율은 분모가 전체 문항 수임.
-
-## 정답 누수에 대하여 (ISSUE #22)
-
-검색어는 오직 질문 글(`text`) 에서만 만듦. 정답 논문의 제목, 초록은 검색어를 만드는
-어느 단계에서도 읽지 않음. 반대로 로컬 색인이 정답 논문을 검색해 후보로 내놓는 것은
-정상임 - 실제 서비스도 arXiv 전체를 검색 대상으로 삼음. 금지되는 것은 정답 논문의
-글을 보고 검색어를 만드는 것이며, 그 둘은 다른 이야기임.
-
-## 개발용과 시험용을 섞지 않음 (ISSUE #25)
-
-기본값이 `data/eval/dev.jsonl` 인 것은 의도적임. 설정을 이리저리 바꿔 보는 탐색은 전부
-개발용에서 하고, 시험용(`test.jsonl`)으로는 확정 판정만 함. 시험용을 보면서 설정을
-고르면 그 순간 시험지가 타 버림 - 옛 평가셋이 정확히 그렇게 소모됐음.
+1. 오류나 결과 0건 문항을 제외하지 않고 실패(0점)로 셈. 제외하면 기준선이 부풀려짐.
+   모든 비율의 분모는 전체 문항 수임
+2. 검색어는 오직 질문 글(`text`)에서만 만듦. 정답 논문의 제목과 초록은 어느 단계에서도
+   읽지 않음
+3. 기본값이 `data/eval/dev.jsonl` 인 것은 의도한 것임. 설정을 바꿔 보는 탐색은 전부
+   개발용에서 하고, 시험용으로는 확정 판정만 함
 """
 
 from __future__ import annotations
@@ -77,21 +60,15 @@ CACHE_PATH = config.DATA_DIR / "cache" / "arxiv_search_cache.jsonl"
 DEFAULT_K_VALUES = (1, 5, 10, 30, 50, 100)
 
 # 채널이 쓸 검색어 필드 (`RewriteResult.queries` 의 키). 없는 키를 부르면 원본 질문으로
-# 자동 폴백되므로, "raw" 를 적으면 변환기가 무엇을 냈든 원본 질문이 들어감.
+# 되돌아가므로 "raw" 를 적으면 변환기가 무엇을 냈든 원본 질문이 들어감.
 #
-# ## 로컬 의미 검색에 무엇을 넣을지가 왜 선택지인가 (반드시 읽을 것)
+# 로컬 의미 검색에는 원본 질문을 넣는 것이 기본임. 학습한 변환기는 arXiv 문법 문자열을
+# 만드는데 그것은 사람이 쓰는 문장이 아니고, 무엇보다 서비스가 로컬 채널에 원본 질문을
+# 넣기 때문임. 평가가 서비스와 다른 것을 재면 그 숫자는 서비스 성능을 예측하지 못함.
 #
-# 학습한 변환기(dpo)는 arXiv 문법 문자열 하나를 만들어 세 필드에 똑같이 넣음.
-# 예: all:"사진 설명 AI" OR abs:"image captioning" OR abs:"vision-language model"
-#
-# 이것을 로컬 의미 검색에 그대로 넣으면 안 됨. 의미 검색은 문장을 통째로 임베딩해
-# 뜻을 견주는데, 위 문자열은 사람이 쓰는 문장이 아니라 검색 문법임. 게다가 서비스
-# (`app.py`)는 로컬 채널에 원본 질문을 넣음. 평가가 서비스와 다른 것을 재면 그 숫자는
-# 서비스 성능을 예측하지 못함 - 이 프로젝트가 이미 겪은 실패임(ISSUE #10, #13).
-#
-#   raw       (기본) 로컬 채널에 원본 질문을 넣음. 서비스와 같은 조건
-#   rewritten 로컬 채널에도 변환 결과를 넣음. "변환이 의미 검색에도 도움이 되는가"를
-#             따로 물을 때만 씀. 지금 변환기 출력 형태로는 불리한 조건임
+#   raw       (기본) 로컬 채널에 원본 질문. 서비스와 같은 조건
+#   rewritten 로컬 채널에도 변환 결과. "변환이 의미 검색에도 도움이 되는가" 를 따로
+#             물을 때만 씀
 CHANNEL_QUERY_FIELD = {
     "arxiv": "arxiv",              # 키워드 검색용 (필드 지정, 불리언 연산자가 든 문자열)
     "local_dense": "raw",          # 의미 검색용 - 기본은 원본 질문 (서비스와 같게)
@@ -100,13 +77,13 @@ CHANNEL_QUERY_FIELD = {
 
 
 def channel_query_fields(local_query: str) -> dict[str, str]:
-    """채널별로 어느 검색어를 쓸지 정함. 위 설명 참고."""
+    """채널별로 어느 검색어를 쓸지 정함."""
     fields = dict(CHANNEL_QUERY_FIELD)
     fields["local_dense"] = "dense" if local_query == "rewritten" else "raw"
     return fields
 
-# 응답 시간을 잴 때 쓰는 질문. 실제 사용자가 칠 법한 것으로, 한국어, 영어와
-# 일상어, 전문어를 섞었음. 평가셋이 아님 - 정확도가 아니라 시간만 재는 용도임.
+# 응답 시간을 잴 때 쓰는 질문. 실제 사용자가 칠 법한 것으로 한국어와 영어, 일상어와
+# 전문어를 섞었음. 평가셋이 아니고 시간만 재는 용도임
 BENCH_QUERIES = [
     "사진 보고 글로 설명해주는 AI",
     "가짜 뉴스 걸러내는 방법",
@@ -147,9 +124,9 @@ def parse_weights(spec: str | None) -> dict[str, float]:
 def build_channels(names: list[str], args) -> dict[str, object]:
     """이름 목록으로 검색 채널을 만듦. 모두 `search(query, k)` 인터페이스를 따름.
 
-    로컬 색인을 쓰는 채널이 여럿이어도 **색인은 한 벌만 올림.** 임베딩이 2.93GB 라
+    로컬 색인을 쓰는 채널이 여럿이어도 **색인은 하나만 올림.** 임베딩이 2.93GB 라
     채널마다 새로 올리면 시스템 메모리 15GB 에서 바로 터짐. 서비스(`app.py`)도
-    색인 한 벌에 검색어를 두 번 넣는 방식이라 이것이 서비스와도 같은 조건임.
+    색인 하나에 검색어를 두 번 넣는 방식이라 이것이 서비스와도 같은 조건임.
     """
     out: dict[str, object] = {}
     local = None
@@ -162,9 +139,8 @@ def build_channels(names: list[str], args) -> dict[str, object]:
         if name in ("local_dense", "local_hyde"):
             if local is None:
                 from src.retrieval.local_index import LocalDenseRetriever
-                # 색인을 만든 모델과 질문을 임베딩하는 모델은 **반드시 같아야 함.**
-                # 다르면 오류가 안 나고 검색 결과만 조용히 무너짐 - 미세조정한 색인을
-                # 옛 모델로 찾는 사고를 막으려고 인자로 받음.
+                # 색인을 만든 모델과 질문을 임베딩하는 모델은 반드시 같아야 함.
+                # 다르면 오류 없이 검색 결과만 무너지므로 인자로 받음
                 local = LocalDenseRetriever(
                     args.corpus, args.index, mmap=args.mmap,
                     model_name=getattr(args, "embed_model", None) or config.EMBED_MODEL)
@@ -179,10 +155,9 @@ def build_channels(names: list[str], args) -> dict[str, object]:
 class LocalHydeChannel:
     """가상 초록을 검색어로 삼아 로컬 색인을 한 번 더 찾는 채널.
 
-    색인은 `local_dense` 채널과 같은 것을 공유함. 이 껍데기가 하는 일은 하나뿐임 -
-    검색어가 비었으면 검색하지 않고 빈 결과를 돌려줌. 가상 초록 생성이 실패했을 때
-    원본 질문으로 대신 찾으면 로컬 색인이 같은 검색어로 두 번 표를 던지게 되어
-    서비스(`app.py`)와 다른 순위가 나오기 때문임.
+    색인은 `local_dense` 와 같은 것을 공유함. 하는 일은 하나뿐임 - 검색어가 비었으면
+    검색하지 않고 빈 결과를 돌려줌. 원본 질문으로 대신 찾으면 같은 검색어로 두 번 표를
+    던지게 되어 서비스와 다른 순위가 나오기 때문임.
     """
 
     def __init__(self, retriever):
@@ -195,33 +170,13 @@ class LocalHydeChannel:
 
 
 class ReplayRewriter:
-    """이전 실행 결과에 저장된 검색어를 그대로 다시 씀. 변환기를 아예 부르지 않음.
+    """이전 실행 결과에 저장된 검색어를 그대로 다시 씀. 변환기를 부르지 않음.
 
-    ## 왜 필요한가 (색인만 바꿔 견줄 때는 이것을 반드시 쓸 것)
+    색인만 바꿔 견줄 때는 반드시 이것을 쓸 것. 가상 초록은 온도 0.7 로 생성되므로 실행마다
+    달라져서, 새로 생성하면 색인이 만든 차이와 생성이 만든 흔들림(±0.03)이 섞임.
 
-    미세조정한 색인이 좋아졌는지 보려면 **검색어는 같고 색인만 달라야 함.** 그런데
-    서비스 구성의 두 번째 검색어인 가상 초록은 온도 0.7 로 생성되므로 **실행마다 달라짐.**
-    ISSUE #45 에서 같은 구성을 다시 돌렸더니 일상어 층이 0.207 에서 0.181 로 움직였음
-    (116문항이라 실행 간 흔들림이 ±0.03).
-
-    새로 생성하면 색인이 만든 차이와 생성이 만든 흔들림이 섞여서, 우리가 찾는 크기
-    (기준 +0.08)를 잡아낼 수 없음. 저장된 검색어를 그대로 다시 쓰면 그 흔들림이 0 이 됨.
-
-    덤으로 언어 모델 호출이 사라져 실행이 30분 넘게 빨라짐.
-
-    ## 검색어를 질문 글로 찾는 이유
-
-    변환기 규약(`rewrite(raw_query)`)에는 문항 번호가 안 넘어옴. 평가셋은 질문 글이
-    문항마다 다르므로(개발용 348개 · 시험용 342개 전부 고유) 글을 열쇠로 써도 안전함.
-    실행할 때 몇 개가 짝을 못 찾았는지 세어 보고함 - 0 이 아니면 다른 평가셋의 결과
-    파일을 준 것임.
-
-    ## 검색어를 채널 이름으로 담는 이유
-
-    저장된 `search_queries` 는 채널 이름(`local_dense` · `local_hyde`)이 열쇠임.
-    그래서 `--reuse-queries` 를 주면 채널이 자기 이름으로 검색어를 찾도록 `query_fields`
-    도 함께 바꿔 줌(`main()` 참고). 안 그러면 `local_dense` 가 "raw" 를 찾다가 원본
-    질문으로 돌아가 번역문이 통째로 빠짐 - 오류는 안 나고 성능만 조용히 떨어짐.
+    검색어는 문항 번호가 아니라 질문 글로 찾음(변환기 규약에 번호가 안 넘어옴). 짝을 못
+    찾은 개수를 세어 보고함 - 0 이 아니면 다른 평가셋의 결과 파일을 준 것임.
     """
 
     name = "replay"
@@ -290,7 +245,7 @@ def evaluate_one(query_row: dict, rewriter, channels: dict, k: int,
             out["channel_errors"][name] = f"{type(e).__name__}: {e}"
             out["channels"][name] = []
             continue
-        # 순위대로 전부 저장 - 융합, 재정렬을 나중에 재검색 없이 다시 계산하기 위함
+        # 순위대로 전부 저장 - 합치기, 재정렬을 나중에 재검색 없이 다시 계산하기 위함
         out["channels"][name] = [normalize_paper_id(r.paper_id) for r in results]
         out["channel_sec"][name] = round(time.time() - t, 2)
     return out
@@ -315,8 +270,8 @@ def rank_in(ids: list[str], gold: str) -> int | None:
 def union_rank(row: dict, depth: int) -> int | None:
     """합집합 안에 정답이 들어는 왔는가 (등수는 의미가 없으므로 1 또는 None).
 
-    각 채널의 상위 `depth` 편을 모은 집합. 재정렬이 도달할 수 있는 상한임.
-    재정렬은 후보 집합을 바꾸지 않고 순서만 바꾸므로 이 값을 넘을 수 없음.
+    각 채널의 상위 `depth` 편을 모은 집합. 재정렬은 후보를 바꾸지 않고 순서만 바꾸므로
+    최종 성능이 이 값을 넘을 수 없음.
     """
     gold = row["gold_id"]
     for ids in (row.get("channels") or {}).values():
@@ -328,12 +283,10 @@ def union_rank(row: dict, depth: int) -> int | None:
 def select_channels(rows: list[dict], names: list[str]) -> list[dict]:
     """저장된 결과에서 채널 일부만 남김 - 검색을 다시 하지 않고 채널 조합을 비교함.
 
-    "두 채널을 합치는 것이 단독보다 나은가"를 판정하려면 채널 A 단독, 채널 B 단독 , 
-    둘 합침을 같은 검색 결과 위에서 비교해야 함. 조합마다 검색을 다시 하면
-    arXiv 결과가 그 사이에 달라져 비교가 성립하지 않음(그리고 3초 제한 때문에 느림).
-
-    남은 행의 `channels` 만 걸러 내면 융합, 상한, 재정렬, 보고가 전부 자동으로 그 조합만
-    보게 됨. 원본 행은 건드리지 않고 얕은 사본을 돌려줌.
+    "두 채널을 합치는 것이 단독보다 나은가" 를 판정하려면 세 경우를 같은 검색 결과 위에서
+    비교해야 함. 조합마다 검색을 다시 하면 arXiv 결과가 그 사이에 달라져 비교가 성립하지
+    않음. 남은 행의 `channels` 만 걸러 내면 나머지 단계가 전부 그 조합만 보게 됨.
+    원본 행은 건드리지 않고 얕은 사본을 돌려줌.
     """
     keep = set(names)
     have = set(channel_names_of(rows))
@@ -346,7 +299,7 @@ def select_channels(rows: list[dict], names: list[str]) -> list[dict]:
 
 def fused_ids_of(row: dict, rrf_k: int, top_n: int, weights: dict[str, float],
                  depth: int | None = None) -> list[str]:
-    """저장된 채널별 논문 번호를 RRF로 합침 (검색 없음)."""
+    """저장된 채널별 논문 번호를 순위로 합침. 검색을 다시 하지 않음."""
     channels = {name: (ids or [])[:depth] if depth else (ids or [])
                 for name, ids in (row.get("channels") or {}).items()}
     if not channels:
@@ -458,36 +411,26 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
                 rrf_k: int, weights: dict[str, float], batch_size: int = 32,
                 query_mode: str = "raw", channel_depth: int | None = None,
                 model_name: str | None = None, fuse_rerank: float = 0.0) -> None:
-    """저장된 결과를 융합한 뒤 상위 `depth` 편을 재정렬해 `reranked_ids` 로 채움.
+    """저장된 결과를 합친 뒤 상위 `depth` 편을 재정렬해 `reranked_ids` 로 채움.
 
     검색은 한 번도 하지 않음. 후보 본문을 못 찾은 논문은 후보에서 빠지는데, 그 논문이
     정답이면 손해이므로 몇 편이나 빠졌는지 반드시 보고함(조용히 성능이 깎이는 자리임).
 
-    channel_depth: 융합 전에 채널마다 몇 편까지만 볼지. 실행 결과 파일에 서비스보다 깊게
-        저장돼 있을 때 서비스와 조건을 맞추는 자리임. 안 주면 저장된 것을 다 씀.
-        `runs/dev_mq_w1_d100.jsonl` 은 채널당 300편이 저장돼 있는데 서비스는 채널당
-        100편만 가져오므로(app.py 의 DEPTH_LOCAL), 안 맞추면 상한이 0.675 대신 0.684 로
-        부풀려짐. #10, #13, #39, #40 과 같은 종류의 어긋남임.
+    channel_depth: 합치기 전에 채널마다 몇 편까지만 볼지. 결과 파일에 서비스보다 깊게
+        저장돼 있을 때 조건을 맞추는 자리임. 안 주면 저장된 것을 다 씀.
 
-    model_name: 쓸 재정렬 모델. 안 주면 서비스 기본값. 미세조정한 재정렬기를 견줄 때
-        반드시 줄 것 - 색인에서 겪은 것과 같은 자리임(#50). 어느 모델로 잰 값인지는
-        실행 정보(`_meta`)에도 남음(#54).
+    model_name: 쓸 재정렬 모델. 안 주면 서비스 기본값. 파인튜닝한 재정렬기를 견줄 때
+        반드시 줄 것. 어느 모델로 잰 값인지는 실행 정보(`_meta`)에 남음.
 
     fuse_rerank: 0 보다 크면 재정렬 순위를 검색 순위와 한 번 더 합침. 값이 재정렬 쪽
-        가중치임(검색 쪽은 항상 1.0). 0 이면 재정렬 순위만 씀 - 2026-08-28 이전 동작.
+        가중치임(검색 쪽은 항상 1.0). 0 이면 재정렬 순위만 씀.
 
-        왜 이런 것이 필요한가 (ISSUE #41):
-            hard 난이도에서 재정렬기가 후보 100편 전부에 '관련 없음' 에 해당하는 값을 줌
-            (정답 점수 중앙 0.0035, 10등 0.0152). 그 안의 순서는 근거가 없음. 그런데
-            검색 순위는 같은 문항에서 다른 논문을 맞히고 있어서, 둘을 합치면 올라감.
-            개발용 348문항 실측(미세조정 색인, 가중치 3): 전체 0.618 -> 0.635,
-            hard 0.267 -> 0.310. **지금 서비스 색인에서는 효과 없음**(+0.006, p=0.583).
+        일상어 질문에서 재정렬기가 후보 100편 전부에 '관련 없음' 에 해당하는 값을 주는데,
+        검색 순위는 같은 문항에서 다른 논문을 맞히고 있어서 둘을 합치면 올라감. 개발용
+        348문항에서 가중치 3 일 때 0.618 -> 0.635. 파인튜닝 색인에서만 효과가 있음.
 
-    점수를 함께 저장하는 이유:
-        교차 인코더는 후보를 하나씩 독립적으로 채점함. 어떤 논문의 점수는 같은 목록에
-        무엇이 더 들어 있는지와 무관함. 그래서 깊이 200으로 한 번 채점해 두면, 깊이 100의
-        결과는 '융합 상위 100편만 골라 저장된 점수로 다시 줄 세우기' 로 정확히 같은 값이
-        나옴. 재정렬을 깊이마다 다시 돌릴 필요가 없음.
+    점수를 함께 저장하는 이유: 교차 인코더는 후보를 하나씩 독립적으로 채점하므로 깊이
+        200 으로 한 번 채점해 두면 깊이 100 의 결과를 저장된 점수만으로 다시 만들 수 있음.
     """
     cand_ids = [fused_ids_of(r, rrf_k, top_n=depth, weights=weights,
                              depth=channel_depth) for r in rows]
@@ -501,7 +444,8 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
     gold_lost = sum(1 for r, ids in zip(rows, cand_ids)
                     if r["gold_id"] in ids and r["gold_id"] not in texts)
     if gold_lost:
-        print(f"경고: 그중 정답 논문이 {gold_lost}문항에서 빠졌다. 재정렬 상한이 그만큼 낮아진다.")
+        print(f"경고: 그중 정답 논문이 {gold_lost}문항에서 빠졌다. "
+              f"후보에 정답이 있는 비율이 그만큼 낮아진다.")
 
     queries, cand_lists = [], []
     for r, ids in zip(rows, cand_ids):
@@ -509,7 +453,7 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
         cand_lists.append([ScoredPaper(paper_id=pid, score=0.0, rank=i,
                                        title=texts[pid][0], abstract=texts[pid][1])
                            for i, pid in enumerate(kept, start=1)])
-        queries.append(rerank_query_of(r, query_mode))   # 기본은 원본 질문 (위 함수 설명 참고)
+        queries.append(rerank_query_of(r, query_mode))   # 기본은 원본 질문
 
     if method == "cross":
         from src.retrieval.ranking import CrossEncoderReranker, DEFAULT_RERANKER
@@ -518,8 +462,8 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
         reranker = CrossEncoderReranker(name, batch_size=batch_size)
         ranked = reranker.rerank_batch(queries, cand_lists, top_k=depth)
     elif method == "llm":
-        # 언어 모델 재정렬기 (bge-reranker-v2-gemma). 점수 눈금이 교차 인코더와 다름 -
-        # 시그모이드 0~1 이 아니라 로짓이므로 MIN_RERANK_SCORE 를 그대로 쓰면 안 됨.
+        # 언어 모델 재정렬기. 점수 범위가 교차 인코더와 달라(0~1 이 아님)
+        # MIN_RERANK_SCORE 를 그대로 쓰면 안 됨
         from src.retrieval.ranking import DEFAULT_LLM_RERANKER, LLMReranker
         reranker = LLMReranker(model_name or DEFAULT_LLM_RERANKER, batch_size=batch_size)
         ranked = reranker.rerank_batch(queries, cand_lists, top_k=depth)
@@ -537,21 +481,18 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
         ids = [p.paper_id for p in papers]
         if fuse_rerank > 0:
             # 재정렬 순위와 검색 순위를 한 번 더 합침. 점수가 아니라 등수를 더하므로
-            # 두 단계의 점수 눈금이 달라도 됨 (`ranking.py` 의 fuse_local 설명글과 같은 이유).
+            # 두 단계의 점수 범위가 달라도 됨
             from src.retrieval.ranking import rrf_fuse_ids
             ids = rrf_fuse_ids({"rerank": ids, "search": list(fused)}, k=rrf_k,
                                top_n=depth, weights={"rerank": fuse_rerank, "search": 1.0})
             r["fuse_rerank"] = fuse_rerank
         r["reranked_ids"] = ids
-        # 점수를 함께 남김. 이게 없으면 '정답과 오답의 점수가 얼마나 벌어졌는가' 를
-        # 보려고 재정렬을 통째로 다시 돌려야 함. 깊이를 바꿔 가며 재는 것도 이 값으로 함.
-        # 점수는 재정렬기가 매긴 값 그대로 남김. 순위 합치기를 켜면 `reranked_ids` 의
-        # 순서와 짝이 안 맞으므로, 논문 번호를 키로 하는 표로 저장함.
+        # 점수를 함께 남김. 깊이를 바꿔 가며 재는 것도 이 값으로 함. 순위 합치기를 켜면
+        # `reranked_ids` 의 순서와 짝이 안 맞으므로 논문 번호로 짝지어 저장함
         by_id = {p.paper_id: round(float(p.score), 6) for p in papers}
         r["rerank_scores"] = [by_id.get(pid, 0.0) for pid in ids]
-        # 어느 깊이로 재정렬했는지 문항에 새겨 둠. 이게 없으면 나중에 이 파일을 다시
-        # 집계할 때 명령줄 기본값(fuse_top_n)으로 상한을 계산해 버림 - ISSUE #26 과
-        # 똑같은 어긋남이 재집계 단계에서 되살아나는 자리임.
+        # 어느 깊이로 재정렬했는지 문항에 새겨 둠. 없으면 나중에 다시 집계할 때
+        # 명령줄 기본값으로 후보 편수를 계산해 버림
         r["rerank_depth"] = depth
         r["rerank_method"] = method
     print(f"재정렬 완료: {len(rows)}문항, 방식 {method}, 깊이 {depth}")
@@ -559,19 +500,14 @@ def rerank_rows(rows: list[dict], method: str, depth: int, lookup: TextLookup,
 
 # -- 재정렬 진단 (저장된 점수만 씀, 재실행 없음) -----------------------------
 #
-# `print_report` 는 "얼마나 맞혔는가"를 셈. 여기서는 "왜 틀렸는가"를 가름. 재정렬이
-# 정답을 상위 10편에서 버릴 때 원인이 둘인데 처방이 정반대임.
+# `print_report` 는 "얼마나 맞혔는가" 를 셈. 여기서는 "왜 틀렸는가" 를 가름. 재정렬이
+# 정답을 상위 10편에서 버릴 때 원인이 둘인데 고칠 곳이 정반대임.
 #
 #   가) 정답과 오답의 점수가 거의 같아서 밀림 -> 구분력을 보태야 함
-#                                             (1차 검색 순위 함께 쓰기, 동점 처리 고치기)
 #   나) 정답에 확신을 갖고 낮은 점수를 줌      -> 모델을 바꿔야 함
 #
-# 점수를 저장하기 전에는 이 둘을 가를 방법이 없었음 (2026-08-17 부터 저장함).
-#
-# 자르는 위치(RERANK_DEPTH)도 여기서 함께 잼. 교차 인코더는 후보를 하나씩 독립적으로
-# 채점하므로, 어떤 논문의 점수는 같은 목록에 무엇이 더 들어 있는지와 무관함. 그래서
-# 깊이 200 으로 한 번 채점해 두면 깊이 100 의 결과는 '융합 상위 100편만 골라 저장된
-# 점수로 다시 줄 세우기' 로 정확히 같은 값이 나옴. 깊이마다 재정렬을 돌릴 필요가 없음.
+# 자르는 위치도 여기서 함께 잼. 교차 인코더는 후보를 하나씩 독립적으로 채점하므로,
+# 저장된 점수만으로 다른 깊이의 결과를 정확히 다시 만들 수 있음.
 
 TIERS = ("전체", "easy", "medium", "hard")
 
@@ -666,11 +602,11 @@ def diagnose_rerank(rows: list[dict], depths: list[int], rrf_k: int,
         print(f"   {t:<10}{len(lost_gold[t]):>5}{np.median(lost_gold[t]):>17.4f}"
               f"{np.median(lost_top1[t]):>17.4f}{np.median(lost_gap[t]):>21.4f}")
     print("\n   '10등과의 차이' 가 0 에 가까우면 아슬아슬하게 밀린 것이고(구분력 문제),")
-    print("   크면 모델이 확신을 갖고 정답을 낮게 본 것임(모델 문제). 처방이 서로 다름.")
+    print("   크면 모델이 확신을 갖고 정답을 낮게 본 것임(모델 문제). 고칠 곳이 서로 다름.")
 
     # (3) 동점 - np.argsort 가 안정 정렬이 아니라 순서가 정해지지 않는 자리
     print("\n" + "=" * 74)
-    print("## 동점 (fp16 반올림으로 원래 다른 점수가 같아질 수 있음)")
+    print("## 동점 (float16 반올림으로 원래 다른 점수가 같아질 수 있음)")
     per = {t: [0, 0, 0] for t in TIERS}       # [이웃 동점쌍, 후보 총수, 상위 10 안 동점]
     for r in rows:
         s = r.get("rerank_scores") or []
@@ -694,7 +630,7 @@ def diagnose_rerank(rows: list[dict], depths: list[int], rrf_k: int,
 
 # -- 보고 ------------------------------------------------------------------
 def pool_depth_of(args) -> int:
-    """상한을 계산할 후보 깊이. 재정렬을 켰으면 재정렬에 넣은 깊이가 곧 상한의 기준임."""
+    """후보에 정답이 있는 비율을 계산할 깊이. 재정렬을 켰으면 재정렬에 넣은 깊이임."""
     return args.rerank_depth if args.rerank != "none" else args.fuse_top_n
 
 
@@ -703,16 +639,11 @@ def rerank_pool_rank(row: dict, rrf_k: int, depth: int, weights: dict[str, float
 
     `union_rank` 와 헷갈리면 안 됨. 둘은 다른 집합임.
 
-        union_rank      = 채널마다 상위 depth 편을 모은 합집합
-        rerank_pool_rank = 그것을 RRF 로 합쳐 상위 depth 편만 남긴 것  <- 재정렬이 보는 것
+        union_rank       채널마다 상위 depth 편을 모은 합집합
+        rerank_pool_rank 그것을 합쳐 상위 depth 편만 남긴 것  <- 재정렬이 보는 것
 
-    융합은 후보를 줄이므로 두 번째가 더 작음. 첫 번째를 '재정렬의 상한'이라 부르면
-    융합이 흘린 몫까지 재정렬 탓으로 넘어감. 실측에서 시험용 300문항 기준
-    합집합 0.823 대 실제 재정렬 입력 0.797 로 0.026(정답 8편)이 그렇게 넘어가 있었음.
-    회수율이 82.6% 로 보였지만 실제로는 85.4% 였음.
-
-    ISSUE #26 에서 고친 것과 같은 종류의 어긋남임. 그때는 '깊이'를 맞췄고, 이번에는
-    '집합을 만드는 방식'을 맞춤. 두 곳 다 같은 함수를 부르게 해서 다시 어긋나지 않게 함.
+    합치기가 후보를 줄이므로 두 번째가 더 작음. 첫 번째를 재정렬이 도달할 수 있는
+    값이라 부르면, 합치기가 놓친 몫까지 재정렬 탓으로 넘어감.
     """
     return 1 if row["gold_id"] in fused_ids_of(row, rrf_k, top_n=depth,
                                                weights=weights) else None
@@ -720,27 +651,27 @@ def rerank_pool_rank(row: dict, rrf_k: int, depth: int, weights: dict[str, float
 def print_report(rows: list[dict], title: str, k_values=DEFAULT_K_VALUES,
                  rrf_k: int = 60, weights: dict[str, float] | None = None,
                  fuse_top_n: int = 200, pool_depth: int = 100) -> None:
-    """채널별, 합집합(상한), 융합 후, 재정렬 후를 한 표에 놓고 비교함."""
+    """채널별, 합집합, 합친 뒤, 재정렬 뒤를 한 표에 놓고 비교함."""
     weights = weights or {}
     n = len(rows)
     names = channel_names_of(rows)
     ks = list(k_values)
 
-    # 파일에 새겨진 재정렬 깊이가 있으면 그것을 씀. 재집계할 때 명령줄 기본값으로
-    # 상한을 재면 깊이가 어긋나 회수율이 부풀려짐(ISSUE #26).
+    # 파일에 새겨진 재정렬 깊이가 있으면 그것을 씀. 재집계할 때 명령줄 기본값을 쓰면
+    # 깊이가 어긋나 회수율이 부풀려짐
     stamped = {r["rerank_depth"] for r in rows if r.get("rerank_depth")}
     if len(stamped) == 1:
         depth_from_file = stamped.pop()
         if depth_from_file != pool_depth:
             print(f"\n(참고: 이 파일은 깊이 {depth_from_file} 로 재정렬돼 있다. "
-                  f"명령줄 값 {pool_depth} 대신 그 깊이로 상한을 계산한다)")
+                  f"명령줄 값 {pool_depth} 대신 그 깊이로 계산한다)")
         pool_depth = depth_from_file
     elif len(stamped) > 1:
-        print(f"\n경고: 문항마다 재정렬 깊이가 다르다({sorted(stamped)}). 상한 계산을 믿지 말 것.")
+        print(f"\n경고: 문항마다 재정렬 깊이가 다르다({sorted(stamped)}). 후보 계산을 믿지 말 것.")
 
     print("\n" + "=" * 78)
     print(f"## {title}")
-    print(f"   문항 {n}개, 융합 k={rrf_k}, 가중치 {weights or '전부 1.0'}")
+    print(f"   문항 {n}개, 합치기 k={rrf_k}, 가중치 {weights or '전부 1.0'}")
     print("   * 오류, 결과 0건 문항을 실패(0점)로 세고 분모는 전체 문항 수다.")
     print("      (오류 문항을 빼고 잰 옛 숫자와 직접 비교하면 안 된다)")
 
@@ -764,15 +695,15 @@ def print_report(rows: list[dict], title: str, k_values=DEFAULT_K_VALUES,
         print(line)
 
     if len(names) > 1:
-        line = "   " + f"{'합집합(상한)':<17}" + "".join(
+        line = "   " + f"{'합집합':<20}" + "".join(
             f"{fmt(hits_at([union_rank(r, k) for r in rows], 1)):>22}" for k in ks)
         print(line)
-        print("   > 합집합 = 각 채널 상위 @K 를 모두 모은 것. 재정렬이 도달할 수 있는 상한임")
+        print("   > 합집합 = 각 채널 상위 @K 를 모두 모은 것. 최종값이 이보다 클 수 없음")
 
-    # 융합 후
+    # 합치기 후
     fused = [fused_ids_of(r, rrf_k, fuse_top_n, weights) for r in rows]
     fused_ranks = [rank_in(ids, r["gold_id"]) for ids, r in zip(fused, rows)]
-    print(f"\n## 융합(RRF) 후 Recall")
+    print(f"\n## 순위 합치기 후 Recall")
     print("   " + f"{'fused':<20}" + "".join(f"{fmt(hits_at(fused_ranks, k)):>22}" for k in ks))
 
     # 재정렬 후
@@ -785,12 +716,10 @@ def print_report(rows: list[dict], title: str, k_values=DEFAULT_K_VALUES,
     else:
         print("\n## 재정렬 후: 아직 재정렬을 돌리지 않았다 (--rerank cross 로 실행)")
 
-    # 상한과 최종값의 차이 - 손실을 융합 몫과 재정렬 몫으로 나눠서 봄.
-    #
-    # 상한을 하나만 적으면 처방을 잘못 고름. 채널이 후보를 못 물어온 것인지, 융합이
-    # 흘린 것인지, 재정렬이 못 끌어올린 것인지가 전부 다른 문제이기 때문임.
+    # 손실을 합치기 몫과 재정렬 몫으로 나눠서 봄. 채널이 후보를 못 물어온 것인지,
+    # 합치기가 놓친 것인지, 재정렬이 못 끌어올린 것인지가 전부 다른 문제임
     final_ranks = rr_ranks if rr_ranks is not None else fused_ranks
-    final_name = "재정렬 후" if rr_ranks is not None else "융합 후"
+    final_name = "재정렬 후" if rr_ranks is not None else "합친 뒤"
     final = float(np.mean(hits_at(final_ranks, 10))) if rows else 0.0
 
     union_ceiling = float(np.mean(hits_at([union_rank(r, pool_depth) for r in rows], 1))) if rows else 0.0
@@ -798,35 +727,34 @@ def print_report(rows: list[dict], title: str, k_values=DEFAULT_K_VALUES,
         pool_hits = [rerank_pool_rank(r, rrf_k, pool_depth, weights) for r in rows]
         pool_ceiling = float(np.mean(hits_at(pool_hits, 1))) if rows else 0.0
     else:
-        pool_ceiling = union_ceiling      # 재정렬을 안 했으면 융합 결과가 곧 최종 후보임
+        pool_ceiling = union_ceiling      # 재정렬을 안 했으면 합친 결과가 곧 최종 후보임
 
-    recovered = (f"상한의 {final / pool_ceiling:.1%} 회수"
-                 if pool_ceiling > 0 else "상한이 0이라 계산 불가")
-    print(f"\n## 상한과 최종값의 차이")
+    recovered = (f"{final / pool_ceiling:.1%} 회수"
+                 if pool_ceiling > 0 else "후보에 정답이 없어 계산 불가")
+    print(f"\n## 후보에 정답이 있던 비율과 최종값의 차이")
     print(f"   (1) 채널 합집합 @{pool_depth}            : {union_ceiling:.3f}"
-          f"   (융합을 완벽히 하면 도달 가능한 값)")
+          f"   (합치기를 완벽히 하면 도달 가능한 값)")
     print(f"   (2) 재정렬이 실제로 본 후보        : {pool_ceiling:.3f}"
-          f"   ((1)을 RRF로 합쳐 상위 {pool_depth}편만 남긴 것)")
+          f"   ((1)을 합쳐 상위 {pool_depth}편만 남긴 것)")
     print(f"   (3) 최종 Recall@10 ({final_name})    : {final:.3f}")
-    print(f"   융합이 흘린 몫  ((1) -> (2))         : {pool_ceiling - union_ceiling:+.3f}")
+    print(f"   합치기가 놓친 몫  ((1) -> (2))       : {pool_ceiling - union_ceiling:+.3f}")
     print(f"   재정렬이 못 건진 몫 ((2) -> (3))      : {final - pool_ceiling:+.3f}  ({recovered})")
-    print("   해석: (1)이 낮으면 채널을 더 늘린다. (1)->(2) 손실이 크면 융합 방식을 고친다")
-    print("         (재정렬기는 후보의 순서를 안 보므로, 후보를 줄이는 융합은 손해만 된다).")
-    print("         (2)->(3) 손실이 크면 재정렬을 고친다. 세 처방은 전부 다르다.")
+    print("   해석: (1)이 낮으면 채널을 더 늘린다. (1)->(2) 손실이 크면 합치는 방식을 고친다.")
+    print("         (2)->(3) 손실이 크면 재정렬을 고친다. 세 가지는 고칠 곳이 전부 다르다.")
 
     # 언어별, 난이도별 (어디서 실패하는지)
     for field in ("lang", "difficulty"):
         groups: dict[str, list[int]] = {}
         for i, r in enumerate(rows):
             groups.setdefault(str(r.get(field)), []).append(i)
-        print(f"\n## {field}별 Recall@10 (최종={final_name}, 상한=재정렬이 실제로 본 후보)")
+        print(f"\n## {field}별 Recall@10 (최종={final_name}, 후보=재정렬이 실제로 본 후보)")
         for key, idxs in sorted(groups.items()):
             sub_final = float(np.mean([hits_at([final_ranks[i]], 10)[0] for i in idxs]))
             sub_ceiling = float(np.mean([hits_at([pool_hits[i]], 1)[0] for i in idxs])
                                 if has_rr else
                                 np.mean([hits_at([union_rank(rows[i], pool_depth)], 1)[0]
                                          for i in idxs]))
-            print(f"   {key:<10} n={len(idxs):<4} 최종 {sub_final:.3f}, 상한 {sub_ceiling:.3f}")
+            print(f"   {key:<10} n={len(idxs):<4} 최종 {sub_final:.3f}, 후보 {sub_ceiling:.3f}")
 
 
 # -- 결과 파일 입출력 (이어하기) --------------------------------------------
@@ -850,29 +778,10 @@ def load_done(out_path: Path) -> dict[str, dict]:
 def bench_service(args) -> None:
     """질문 하나에 몇 초가 걸리는지 단계별로 잼.
 
-    ## 왜 재야 하는가
+    사람은 30초를 넘으면 떠남. 지금 구조는 한 번의 검색에 언어 모델을 세 번 부르고
+    (논문 지목 확인, 쿼리 변환, 추천 이유 생성) 거기에 arXiv 호출과 재정렬이 끼어 있음.
 
-    성능 숫자는 여러 번 쟀지만 응답 시간은 오래 안 쟀음. 그런데 사람은 30초를 넘으면
-    떠남. 정확도를 아무리 올려도 느리면 아무도 안 씀.
-
-    특히 지금 구조는 한 번의 검색에 언어 모델을 세 번 부름.
-
-      1. 논문 지목 확인 (paper_resolver)
-      2. 쿼리 변환 (dpo)
-      3. 추천 이유 생성 (recommender)
-
-    여기에 arXiv 호출과 교차 인코더 재정렬이 끼어 있음. 재정렬은 후보 수에 비례해 늘어남.
-
-    ## 재기 전에 깊이를 줄이지 않는 이유
-
-    재정렬 깊이를 서비스용으로 줄이고 싶은 유혹이 있지만, 얼마나 느린지 모르는 채로 줄이면
-    얻는 것도 잃는 것도 모른 채 바꾸는 것임. 먼저 평가와 같은 설정으로 재고, 그 숫자를
-    보고 줄일지 정함.
-
-    ## GPU 를 한 장만 쓴다는 점
-
-    재정렬과 임베딩이 같은 GPU 에서 일어나므로, 사용자가 여러 명이면 줄을 섬. 여기서 재는
-    것은 혼자 쓸 때의 시간이라 실제 서비스에서는 더 느릴 수 있음. 그 점을 감안해 읽어야 함.
+    그래픽카드 한 장에서 재는 값이라 사용자가 여러 명이면 줄을 서서 더 느려짐.
     """
     import statistics as st
 
@@ -891,7 +800,7 @@ def bench_service(args) -> None:
     t = time.time(); index = LocalDenseRetriever(args.corpus, args.index)
     load["로컬 색인 71만 편"] = time.time() - t
     t = time.time(); reranker = CrossEncoderReranker(); load["재정렬 모델"] = time.time() - t
-    # 추천은 변환기가 이미 올린 모델을 빌려 씀 (같은 Qwen3-4B 를 두 벌 올리지 않기 위함)
+    # 추천은 변환기가 이미 올린 모델을 빌려 씀 (같은 Qwen3-4B 를 두 개 올리지 않기 위함)
     t = time.time()
     recommender = (PaperRecommender(client=rewriter)
                    if hasattr(rewriter, "generate_json") else PaperRecommender())
@@ -979,29 +888,15 @@ def bench_service(args) -> None:
 
 # -- "못 찾았다"고 말할 기준선 정하기 ---------------------------------------
 def calibrate_threshold(args) -> None:
-    """재정렬 점수 몇 점 아래를 '무관'으로 볼지 실측으로 정함.
+    """재정렬 점수 몇 점 아래를 '무관' 으로 볼지 실측으로 정함.
 
-    ## 왜 필요한가
+    로컬 의미 검색은 어떤 질문에도 상위 10편을 채워서 돌려줌. 그대로 뿌리면 무관한
+    논문을 추천으로 포장하게 됨. 기준선은 감이 아니라 등급 정답지로 정함.
 
-    로컬 의미 검색은 어떤 질문에도 항상 상위 10편을 채워서 돌려줌. 아무리 관련 없는
-    질문이어도 유사도가 가장 높은 10편이 나옴. 그대로 화면에 뿌리면 무관한 논문을
-    추천으로 포장하는 서비스가 됨. 옛 arXiv 키워드 검색은 못 찾으면 0건을 돌려줘서
-    이 문제가 없었는데, 구조를 바꾸면서 새로 생긴 위험임.
-
-    ## 어떻게 정하는가
-
-    기준선을 감으로 정하면 안 됨. 등급 정답지에 관련도 0~3 이 매겨져 있으므로, 그것을
-    정답으로 놓고 재정렬 점수가 등급을 얼마나 갈라내는지 잼.
-
-        만족(등급 2~3)  대  무관(등급 0)  을 가장 잘 가르는 점수는 몇인가?
-
-    임계값 후보마다 '무관을 걸러낸 비율'과 '만족을 잘못 버린 비율'을 함께 찍음.
-    한쪽만 보고 고르면 안 됨 - 무관을 다 걸러내는 높은 값은 좋은 논문도 같이 버림.
-
-    ## 언어별로 따로 봄
-
-    한국어 질문과 영어 초록을 맞대는 점수와, 영어끼리 맞대는 점수가 같은 눈금이라는 보장이
-    없음. 하나의 기준선을 두 언어에 함께 쓰려면 먼저 그래도 되는지 확인해야 함.
+    후보 값마다 '무관을 걸러낸 비율' 과 '만족을 잘못 버린 비율' 을 함께 찍음. 한쪽만
+    보고 고르면 안 됨 - 무관을 다 걸러내는 높은 값은 좋은 논문도 같이 버림. 언어별로
+    따로 보는 이유는 한국어 질문과 영어 초록을 맞댄 점수가 영어끼리 맞댄 점수와 같은
+    같은 점수 범위라는 보장이 없기 때문임.
     """
     queries = [q for q in read_jsonl(args.queries) if not q.get("_meta")]
     grades = {r["pair_id"]: {normalize_paper_id(k): int(v) for k, v in r["grades"].items()}
@@ -1047,7 +942,7 @@ def calibrate_threshold(args) -> None:
             print(f"{labels[g]:<18}{len(s):>6}{np.median(s):>10.2f}"
                   f"{np.percentile(s, 25):>10.2f}{np.percentile(s, 75):>10.2f}")
 
-    print("\n## 언어별로 눈금이 같은가 (하나의 기준선을 함께 써도 되는지 확인)")
+    print("\n## 언어별로 점수 범위가 같은가 (하나의 기준선을 함께 써도 되는지 확인)")
     print(f"\n{'언어':<8}{'만족(2~3) 중앙값':>20}{'무관(0) 중앙값':>20}{'차이':>10}")
     for lang in sorted(set(langs.tolist())):
         good = scores[(langs == lang) & (gs >= 2)]
@@ -1076,7 +971,7 @@ def calibrate_threshold(args) -> None:
         print(f"{thr:>8.3f}{float((bad < thr).mean()):>14.1%}"
               f"{float((good < thr).mean()):>16.1%}{per_lang}{precision:>18.1%}")
 
-    print("\n* 이 값은 재정렬 모델을 바꾸면 반드시 다시 재야 한다. 점수 눈금이 모델마다 다르다.")
+    print("\n* 이 값은 재정렬 모델을 바꾸면 반드시 다시 재야 한다. 점수 범위가 모델마다 다르다.")
     print("   정한 값은 app.py 의 MIN_RERANK_SCORE 에 넣고 그 자리에 이 명령을 적어 둔다.")
 
 
@@ -1084,7 +979,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description="검색 파이프라인 평가 (채널별 결과를 따로 저장해 재계산) + 응답 시간 실측")
     ap.add_argument("--queries", default="data/eval/dev.jsonl",
-                    help="탐색은 dev 로만 한다. test 는 확정 판정 때만 쓴다 (ISSUE #25)")
+                    help="탐색은 dev 로만 한다. test 는 확정 판정 때만 쓴다")
     ap.add_argument("--channels", nargs="+", default=["arxiv", "local_dense"],
                     help="arxiv, local_dense(71만 편 로컬 의미 검색)")
     ap.add_argument("--local-query", default="raw", choices=["raw", "rewritten"],
@@ -1097,7 +992,7 @@ def main() -> None:
                          "생성 흔들림(일상어 층 ±0.03)이 섞인다")
     ap.add_argument("--rewriter", default="passthrough",
                     help="변환기 이름 (passthrough / translate / service / hierarchical / "
-                         "single_step / hyde / finetuned / dpo). service 가 app.py 와 같은 조합임")
+                         "single_step / hyde / dpo). service 가 app.py 와 같은 조합임")
     ap.add_argument("--k", type=int, default=100, help="채널마다 가져올 결과 수")
     ap.add_argument("--k-values", type=int, nargs="+", default=list(DEFAULT_K_VALUES))
     ap.add_argument("--limit", type=int, default=None, help="앞에서 N개만 (빠른 점검용)")
@@ -1115,19 +1010,19 @@ def main() -> None:
     ap.add_argument("--rrf-k", type=int, default=config.RRF_K, help="RRF 완충 상수")
     ap.add_argument("--weights", default=None,
                     help="채널 가중치. 예: 'arxiv=1.0,local_dense=2.0'")
-    ap.add_argument("--fuse-top-n", type=int, default=200, help="융합 결과를 몇 편까지 볼지")
+    ap.add_argument("--fuse-top-n", type=int, default=200, help="합치기 결과를 몇 편까지 볼지")
 
     ap.add_argument("--rerank", default="none",
                     choices=["none", "cross", "embedding", "llm"],
                     help="재정렬 방식. 저장된 결과 위에서 돌아가므로 검색은 다시 하지 않는다")
     ap.add_argument("--rerank-depth", type=int, default=100, help="재정렬에 넣을 후보 수")
     ap.add_argument("--rerank-model", default=None,
-                    help="쓸 재정렬 모델 (미세조정한 것을 견줄 때 지정). 안 주면 서비스 기본값")
+                    help="쓸 재정렬 모델 (파인튜닝한 것을 견줄 때 지정). 안 주면 서비스 기본값")
     ap.add_argument("--fuse-rerank", type=float, default=0.0,
                     help="재정렬 순위를 검색 순위와 한 번 더 합칠 때의 재정렬 쪽 가중치 "
-                         "(검색 쪽은 1.0). 0 이면 안 합침. 서비스는 3.0 을 씀 (ISSUE #41)")
+                         "(검색 쪽은 1.0). 0 이면 안 합침. 서비스는 3.0 을 씀")
     ap.add_argument("--channel-depth", type=int, default=None,
-                    help="융합 전에 채널마다 몇 편까지만 볼지 (서비스와 조건을 맞출 때 씀)")
+                    help="합치기 전에 채널마다 몇 편까지만 볼지 (서비스와 조건을 맞출 때 씀)")
     ap.add_argument("--diagnose", default=None,
                     help="재정렬 진단: 저장된 재정렬 점수로 자르는 위치, 점수 분포, 동점을 봄")
     ap.add_argument("--diagnose-depths", type=int, nargs="+", default=[100, 150, 200],
@@ -1138,12 +1033,12 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=32)
 
     ap.add_argument("--corpus", default=str(config.CORPUS_DIR / "corpus-cs2021.jsonl"))
-    ap.add_argument("--index", default=str(config.DATA_DIR / "embeddings" / "cs2021"))
+    ap.add_argument("--index", default=str(config.DATA_DIR / "embeddings" / "cs2021-ft"))
     ap.add_argument("--mmap", action="store_true",
                     help="임베딩을 메모리에 올리지 않고 디스크에서 읽는다(메모리 절약, 느림)")
     ap.add_argument("--embed-model", default=None,
                     help="질문을 임베딩할 모델. **--index 를 만든 모델과 같아야 한다.** "
-                         "미세조정한 색인을 쓸 때 반드시 함께 준다 (예: models/retriever-ft)")
+                         "파인튜닝한 색인을 쓸 때 반드시 함께 준다 (예: models/retriever-ft)")
 
     ap.add_argument("--bench-service", action="store_true",
                     help="정확도가 아니라 응답 시간을 단계별로 잰다 (평가셋 대신 예시 질문)")
@@ -1206,9 +1101,8 @@ def main() -> None:
             # --out 을 주면 원본을 건드리지 않고 새 파일로 씀 - 같은 검색 결과에서
             # 채널 조합을 여러 가지로 갈라 볼 때 서로 덮어쓰지 않기 위함임.
             #
-            # **여기서 다시 한 것을 _meta 에 덧붙임.** 옛 _meta 를 그대로 두면 새 파일이
-            # 옛 실행 정보를 달고 나감 - 확정 결과 파일이 다른 구성으로 기록된 적이
-            # 두 번 있었음(ISSUE #54). 원본 정보는 `replayed_from` 아래에 보존함.
+            # 여기서 다시 한 것을 _meta 에 덧붙임. 옛 _meta 를 그대로 두면 새 파일이
+            # 옛 실행 정보를 달고 나감. 원본 정보는 `replayed_from` 아래에 보존함
             metas = list(metas)
             redone = {"_meta": True,
                       "replayed_from": str(path),
@@ -1305,7 +1199,7 @@ def main() -> None:
     print_report(results, f"{args.rewriter}, 채널 {'+'.join(args.channels)}",
                  tuple(args.k_values), args.rrf_k, weights, args.fuse_top_n, pool_depth_of(args))
     print(f"\n상세 결과 저장: {out_path}  (커밋 {meta['commit']})")
-    print("융합 방식을 바꿔 재계산: "
+    print("합치기 방식을 바꿔 재계산: "
           f"python -m evaluation.pipeline_eval --report-only {out_path} --rrf-k 30")
 
 

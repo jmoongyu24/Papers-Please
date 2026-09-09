@@ -1,17 +1,12 @@
-"""대규모 논문 색인 - arXiv 컴퓨터, 인공지능 계열 71만 편의 의미 기반 검색.
+"""로컬 의미 검색 색인 - 논문 71만 편을 임베딩해 두고 뜻으로 찾음.
 
-arXiv 키워드 검색은 정확한 문자열 일치를 요구해 후보 확보율이 0.49에서 막혔음(ISSUE #21).
-의미 검색은 그 요구가 없고 bge-m3 가 한국어를 번역 없이 처리하므로, 기존 경로를 대체하지
-않고 두 번째 채널로 나란히 둠.
+대상은 arXiv 의 cs, stat.ML, eess 계열 2021년 이후 논문 716,183편 전부임.
 
-대상은 "cs, stat.ML, eess 계열, 2021년 이후" 716,183편 전부임. 기존 평가용 3만 편이 바로 이
-모집단에서 뽑은 표본이라, 모집단 전체를 색인해야 표본추출 왜곡 없이 실력을 잼.
+메모리를 아끼려고 세 가지를 지킴. 논문 본문은 줄 위치만 기록해 필요한 것만 꺼내 읽고,
+벡터는 numpy 내적으로 훑어 복사본을 만들지 않으며, 임베딩은 조각으로 나눠 계산해 디스크에
+바로 씀(중단하면 이어서 함).
 
-메모리가 15GB뿐이라 세 가지를 지킴. 논문 본문은 줄 위치만 기록해 필요한 것만 꺼내 읽고,
-FAISS 대신 numpy 내적을 써서 벡터 복사본을 만들지 않고, 임베딩은 조각으로 나눠 계산해
-디스크에 바로 씀(중단 시 이어하기 가능).
-
-색인 한 벌은 네 파일이다: `.ids.txt`(논문 번호) `.offsets.npy`(줄 위치)
+색인 하나는 네 파일임: `.ids.txt`(논문 번호) `.offsets.npy`(줄 위치)
 `.emb.npy`(임베딩) `.meta.json`(진행 상황).
 """
 
@@ -40,16 +35,13 @@ def index_paths(out_prefix: str | Path) -> dict[str, Path]:
 
 # -- 색인과 코퍼스가 짝이 맞는지 확인 --------------------------------------
 #
-# 줄 위치표는 그 코퍼스 파일 전용임. 다른 파일(또는 같은 이름으로 다시 만든 파일)에
-# 갖다 쓰면 `seek` 이 엉뚱한 줄에 떨어지는데, 그래도 JSON 파싱은 성공함. 즉 오류가 안 나고
-# 결과도 그럴듯해 보이는 채로 다른 논문의 제목과 초록을 돌려줌. 서비스에서 이게 나면
-# 사용자에게 존재하지 않는 조합의 논문 정보를 보여주게 됨.
-#
-# 파일 이름 비교만으로는 부족함. 실제 사고 시나리오가 "코퍼스를 같은 이름으로 다시 만드는
-# 것"이기 때문임. 그래서 크기, 수정시각까지 지문으로 남기고, 마지막에 표본까지 확인함.
+# 줄 위치 색인은 그 코퍼스 파일 전용임. 다른 파일에 갖다 쓰면 `seek` 이 엉뚱한 줄에
+# 떨어지는데 JSON 파싱은 그대로 성공함. 오류 없이 다른 논문의 제목과 초록이 나옴.
+# 이름만 비교하면 "코퍼스를 같은 이름으로 다시 만든" 경우를 못 잡으므로, 크기와
+# 수정시각까지 표시로 남기고 마지막에 표본을 읽어 확인함.
 
 def corpus_fingerprint(corpus_path: str | Path) -> dict:
-    """코퍼스 파일의 지문. stat() 한 번이라 비용이 없음."""
+    """코퍼스 파일을 식별하는 표시 (경로, 이름, 크기, 수정시각)."""
     p = Path(corpus_path)
     st = p.stat()
     return {"corpus": str(p), "corpus_name": p.name,
@@ -69,7 +61,7 @@ def write_meta(out_prefix: str | Path, meta: dict) -> None:
 
 def sample_matches(corpus_path: str | Path, ids: list[str], offsets: np.ndarray,
                    n: int = 5) -> bool:
-    """위치표대로 몇 편 꺼내 읽어, 정말 그 논문이 나오는지 봄 (디스크 이동 n번)."""
+    """줄 위치 색인대로 n편을 꺼내 읽어 논문 번호가 맞는지 확인함."""
     if not len(ids):
         return False
     picks = np.linspace(0, len(ids) - 1, num=min(n, len(ids)), dtype=int)
@@ -93,25 +85,24 @@ def check_pairing(corpus_path: str | Path, out_prefix: str | Path,
     if len(ids) != len(offsets):
         return False, f"논문 번호 {len(ids):,}개와 줄 위치 {len(offsets):,}개의 수가 다르다"
 
-    if "corpus_size" in meta:                      # 지문이 있으면 그것으로 판정함
+    if "corpus_size" in meta:                      # 표시가 있으면 그것으로 판정함
         if meta["corpus_size"] != fp["corpus_size"]:
             return False, (f"코퍼스 크기가 다르다: 색인을 만들 때 {meta['corpus_size']:,}바이트, "
                            f"지금 {fp['corpus_size']:,}바이트")
         if meta.get("corpus_name") not in (None, fp["corpus_name"]):
             return False, f"색인은 '{meta['corpus_name']}' 용인데 '{fp['corpus_name']}' 를 받았다"
-        return True, "지문 일치"
+        return True, "표시 일치"
 
-    # 지문이 없는 옛 색인. 다시 만들면 세 시간이 걸리므로, 표본을 읽어 확인하고 통과하면
-    # 지문을 채워 넣음(다음부터는 즉시 판정됨).
+    # 표시가 없는 옛 색인. 표본을 읽어 확인하고 통과하면 표시를 채워 넣음.
     if not sample_matches(corpus_path, ids, offsets):
-        return False, "표본 확인 실패 - 위치표가 가리키는 논문이 번호 목록과 다르다"
+        return False, "표본 확인 실패 - 줄 위치 색인이 가리키는 논문이 번호 목록과 다르다"
     write_meta(out_prefix, {**meta, **fp})
-    return True, "표본 확인 통과 (지문을 새로 기록했다)"
+    return True, "표본 확인 통과 (표시를 새로 기록했다)"
 
 
 # -- 1단계: 논문 번호와 줄 위치 기록 ----------------------------------------
 def scan_corpus(corpus_path: str | Path, out_prefix: str | Path) -> tuple[list[str], np.ndarray]:
-    """논문 번호와 각 줄의 시작 위치를 기록함 (seek 한 번으로 특정 논문만 읽기 위함)."""
+    """논문 번호와 각 줄의 시작 위치를 기록함. 특정 논문만 꺼내 읽을 때 씀."""
     paths = index_paths(out_prefix)
     if paths["ids"].exists() and paths["offsets"].exists():
         ids = paths["ids"].read_text(encoding="utf-8").splitlines()
@@ -148,8 +139,8 @@ def build_embeddings(corpus_path: str | Path, out_prefix: str | Path,
                      max_seq_length: int = 512) -> None:
     """코퍼스 전체를 임베딩해 디스크 배열에 써넣음.
 
-    max_seq_length: bge-m3 기본값 8192 는 초록(250~400 토큰)에 과함. 512 로 제한하면
-    품질 손실 없이 몇 배 빨라짐.
+    max_seq_length 를 512 로 제한함. bge-m3 기본값 8192 는 초록(250~400 토큰)에 과하고,
+    줄이면 품질 손실 없이 몇 배 빨라짐.
     """
     from sentence_transformers import SentenceTransformer
 
@@ -199,7 +190,7 @@ def build_embeddings(corpus_path: str | Path, out_prefix: str | Path,
             i += len(texts)
 
             emb.flush()
-            # 지문을 함께 남김. 이게 없으면 나중에 이 색인이 어느 코퍼스 것인지 알 수 없음.
+            # 어느 코퍼스로 만든 색인인지 함께 남김
             write_meta(out_prefix,
                        {"count": n, "dim": int(dim), "model": model_name, "done": i,
                         "max_seq_length": max_seq_length, **corpus_fingerprint(corpus_path)})
@@ -216,7 +207,7 @@ def build_embeddings(corpus_path: str | Path, out_prefix: str | Path,
 
 # -- 검색기 ----------------------------------------------------------------
 class LocalDenseRetriever:
-    """71만 편 위에서 의미 기반 검색. 인터페이스는 다른 검색기와 동일함."""
+    """색인해 둔 논문 위에서 의미 검색. 인터페이스는 다른 검색기와 같음."""
 
     name = "local_dense"
 
@@ -234,8 +225,8 @@ class LocalDenseRetriever:
                 f"임베딩이 아직 다 안 됐다: {meta['done']:,}/{meta['count']:,}편. "
                 f"build_embeddings 를 마저 돌릴 것.")
 
-        # 짝이 안 맞으면 경고가 아니라 여기서 멈춤. 조용히 다른 논문의 제목과 초록을
-        # 사용자에게 보여주는 것보다, 검색이 아예 안 뜨는 편이 나음.
+        # 짝이 안 맞으면 경고가 아니라 여기서 멈춤. 다른 논문의 제목과 초록을 조용히
+        # 보여주는 것보다 검색이 아예 안 뜨는 편이 나음.
         ok, why = check_pairing(self.corpus_path, out_prefix, self.ids, self.offsets)
         if not ok:
             raise RuntimeError(
@@ -245,7 +236,7 @@ class LocalDenseRetriever:
                 f"코퍼스를 원래 파일로 되돌리거나 색인을 다시 만들 것.")
         if not sample_matches(self.corpus_path, self.ids, self.offsets):
             raise RuntimeError(
-                f"지문은 맞는데 표본 확인에 실패했다 - 위치표가 가리키는 논문이 번호 목록과 "
+                f"지문은 맞는데 표본 확인에 실패했다 - 줄 위치 색인이 가리키는 논문이 번호 목록과 "
                 f"다르다. 색인({out_prefix})을 다시 만들 것.")
 
         self.emb = np.load(paths["emb"], mmap_mode="r" if mmap else None)
@@ -257,21 +248,15 @@ class LocalDenseRetriever:
         if embedder is None:
             import torch
             from sentence_transformers import SentenceTransformer
-            # 반정밀도(fp16)로 올림. VRAM 이 2.14GB 에서 절반으로 줄어듦.
-            #
-            # 왜 이게 중요한가: GPU 가 16GB 인데 쿼리 변환기 8.64GB, 임베더 2.14GB,
-            # 재정렬 3.06GB 를 fp32 로 올리면 여유가 1.98GB 뿐이라, 추천 에이전트가
-            # 필요한 3.54GB 를 못 받아 조용히 CPU 로 밀려남. 그러면 추천 한 번이
-            # 10.5초에서 229.6초가 됨(실측). ISSUE 23 점검표 4번이 서비스에서 재현된 것임.
-            #
-            # 품질: 여기서 만드는 것은 질문 벡터 하나뿐이고, 저장된 논문 벡터는 fp32 그대로임.
-            # 내적 계산은 numpy 가 fp32 로 올려서 하므로 정밀도 손실은 질문 벡터 한 벌에만
-            # 생기고 무시할 수준임. bge 계열은 fp16 추론이 표준임.
+            # float16 으로 올려 그래픽 메모리를 2.14GB 에서 절반으로 줄임. 여유가 모자라면
+            # 추천 이유 생성 모델이 오류 없이 CPU 로 밀려나 한 번에 229초가 걸림.
+            # 여기서 만드는 것은 질문 벡터 하나뿐이고 저장된 논문 벡터는 그대로라 정밀도
+            # 손실은 무시할 수준임.
             kw = {"model_kwargs": {"dtype": torch.float16}} if torch.cuda.is_available() else {}
             embedder = SentenceTransformer(model_name, **kw)
             embedder.max_seq_length = max_seq_length
         self.embedder = embedder
-        # 논문 번호 -> 배열 위치 (재정렬 후보의 본문을 꺼낼 때 씀)
+        # 논문 번호 -> 배열 위치. 후보의 본문을 꺼낼 때 씀
         self._pos = {pid: i for i, pid in enumerate(self.ids)}
 
     def encode_query(self, query: str) -> np.ndarray:
@@ -283,12 +268,12 @@ class LocalDenseRetriever:
         q = self.encode_query(query)
         scores = self._scores(q)
         k = min(k, len(scores))
-        top = np.argpartition(-scores, k - 1)[:k]   # 상위 k개만 추린 뒤 그 안에서 정렬
+        top = np.argpartition(-scores, k - 1)[:k]   # 상위 k편만 추린 뒤 그 안에서 정렬
         top = top[np.argsort(-scores[top])]
         return self._to_papers(top, scores)
 
     def _scores(self, q: np.ndarray) -> np.ndarray:
-        """모든 논문과의 유사도(정규화돼 있으므로 내적 = 코사인 유사도)."""
+        """모든 논문과의 유사도. 벡터가 정규화돼 있어 내적이 곧 코사인 유사도임."""
         if isinstance(self.emb, np.memmap):
             out = np.empty(self.emb.shape[0], dtype=np.float32)
             step = 100_000
@@ -324,9 +309,9 @@ class LocalDenseRetriever:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="대규모 의미 검색 색인 구축 (1회성, 이어하기 지원)")
+    ap = argparse.ArgumentParser(description="의미 검색 색인 만들기 (중단하면 이어서 함)")
     ap.add_argument("--corpus", default=str(config.CORPUS_DIR / "corpus-cs2021.jsonl"))
-    ap.add_argument("--out", default=str(config.DATA_DIR / "embeddings" / "cs2021"))
+    ap.add_argument("--out", default=str(config.DATA_DIR / "embeddings" / "cs2021-ft"))
     ap.add_argument("--model", default=config.EMBED_MODEL)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--chunk-size", type=int, default=4096)
