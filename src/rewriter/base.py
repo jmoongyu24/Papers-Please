@@ -67,14 +67,22 @@ def build_rewriter(name: str) -> Rewriter:
         # app.py 가 실제로 쓰는 조합: 번역문과 가상 초록을 한 번에 만듦
         from src.rewriter.baselines import ServiceRewriter
         return ServiceRewriter()
-    if name == "dpo":
-        # 지도 파인튜닝 위에 선호 학습까지 얹은 모델. arXiv 채널이 쓰는 것
+    if name in ("dpo", "dpo-q8", "dpo-f16"):
+        # 지도 파인튜닝 위에 선호 학습까지 얹은 모델. 셋 다 같은 가중치이고 정밀도만 다름.
+        # 서비스는 4비트(dpo)를 씀. 나머지 둘은 정밀도를 견주는 평가용임
+        from src.rewriter.finetuned import OllamaFinetunedRewriter
+        model = {"dpo": config.ARXIV_REWRITER_MODEL,
+                 "dpo-q8": "papers-rewriter-q8",
+                 "dpo-f16": "papers-rewriter-f16"}[name]
+        return OllamaFinetunedRewriter(model=model)
+    if name == "dpo-hf":
+        # 같은 모델을 transformers 로 올림. 4비트 변환 전후를 비교할 때만 씀
         from src.rewriter.finetuned import FinetunedRewriter
         return FinetunedRewriter()
     raise ValueError(
         f"알 수 없는 변환기 이름: {name} "
         f"(쓸 수 있는 것: passthrough, translate, service, hierarchical, single_step, "
-        f"hyde, dpo)")
+        f"hyde, dpo, dpo-q8, dpo-f16, dpo-hf)")
 
 
 # ==========================================================================
@@ -86,17 +94,36 @@ class OllamaClient:
 
     generate_json 은 JSON 스키마를 강제해 모델이 형식을 벗어난 답을 못 내게 하고,
     generate_text 는 자유 형식 텍스트를 받음.
+
+    `keep_alive` 는 호출이 끝난 뒤 모델을 그래픽 메모리에 얼마나 둘지임. Ollama 기본값은
+    5분이고, 0 을 주면 호출이 끝나는 즉시 내림. 언어 모델 하나가 3.25GB 라 재정렬 모델과
+    자리를 나눠 쓰려면 다 쓴 시점에 내려야 함. 다시 올리며 호출하는 데 2.4초 걸림.
     """
 
     def __init__(self, model: str = config.REWRITER_MODEL,
-                 host: Optional[str] = None, think: bool = False):
+                 host: Optional[str] = None, think: bool = False,
+                 keep_alive: Any = None):
         import ollama
 
         self.model = model
         # Qwen3 의 내부 사고 모드를 끔. JSON 필드 순서로 이미 단계를 유도하므로
         # 끄는 편이 빠르고 출력이 깔끔함
         self.think = think
+        self.keep_alive = keep_alive
         self._client = ollama.Client(host=host) if host else ollama.Client()
+
+    def unload(self) -> None:
+        """이 클라이언트가 쓰는 모델을 그래픽 메모리에서 내림.
+
+        내리는 전용 명령이 없어서, 아무것도 생성하지 않는 호출에 keep_alive=0 을 붙여
+        보냄. 모델이 안 올라와 있으면 아무 일도 일어나지 않음. 서버가 죽어 있는 등의
+        오류는 삼킴 - 자리를 비우려던 것뿐이라 검색을 멈출 이유가 없음.
+        """
+        try:
+            self._client.chat(model=self.model, messages=[{"role": "user", "content": ""}],
+                              think=False, options={"num_predict": 1}, keep_alive=0)
+        except Exception:
+            pass
 
     @staticmethod
     def _as_messages(prompt_or_messages) -> list[dict]:
@@ -111,12 +138,14 @@ class OllamaClient:
         if system:
             messages.append({"role": "system", "content": system})
         messages.extend(self._as_messages(prompt_or_messages))
+        kw = {} if self.keep_alive is None else {"keep_alive": self.keep_alive}
         resp = self._client.chat(
             model=self.model,
             messages=messages,
             format=fmt,                       # JSON 스키마를 주면 그 형식을 강제함
             think=self.think,
             options={"temperature": temperature, "num_predict": max_tokens},
+            **kw,
         )
         return resp["message"]["content"]
 

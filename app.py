@@ -40,6 +40,7 @@ import time
 import streamlit as st
 
 from src import config
+from src.gpu_pool import GpuPool
 from src.recommend_agent.recommender import PaperRecommender
 from src.retrieval.arxiv_live import ArxivLiveRetriever
 from src.rewriter.base import build_rewriter
@@ -108,18 +109,62 @@ st.set_page_config(page_title="Papers, Please", layout="wide")
 
 
 # ==========================================================================
-# 무거운 부품 (한 번만 올림)
+# 무거운 부품
 # ==========================================================================
+#
+# 그래픽 메모리를 쓰는 것은 `GpuPool` 에 맡겨 검색이 도는 동안에만 올림. 언어 모델
+# 하나가 3.25GB 라 재정렬 모델(1.24GB)과 같은 시각에 올라가면 4.76GB 가 됨. 검색 한
+# 번을 세 구간으로 나누고 구간이 바뀔 때 반대편을 내려 최대 3.52GB 로 맞춤.
+#
+# 그래픽 메모리를 안 쓰는 것(arXiv 검색기, 색인 본체)은 `st.cache_resource` 로 그대로
+# 둠. 색인은 임베딩 2.8GB 를 시스템 메모리에 들고 있고 다시 올리는 데 1분 걸림.
+
+
+@st.cache_resource
+def pool() -> GpuPool:
+    """앱당 하나. 이 안에 든 모델만 올렸다 내림."""
+    return GpuPool()
+
+
+class _Qwen3Bundle:
+    """qwen3:4b 를 쓰는 네 가지를 한 덩어리로 묶음.
+
+    번역, 가상 초록, 논문 지목, 추천 이유가 전부 같은 모델을 부름. `OllamaClient` 하나를
+    나눠 쓰면 pool 이 내릴 때 그 하나만 내리면 되고, 같은 모델이 여러 벌 올라갈 일도 없음.
+    """
+
+    def __init__(self):
+        from src.rewriter.base import OllamaClient
+        from src.rewriter.baselines import HydeRewriter, TranslateRewriter
+
+        self.client = OllamaClient()
+        self.translator = TranslateRewriter(client=self.client)
+        self.hyde = HydeRewriter(client=self.client)
+        self.resolver = PaperResolver(client=self.client)
+        self.recommender = PaperRecommender(client=self.client)
+
+    def unload(self) -> None:
+        """`GpuPool.release` 가 부름. Ollama 는 이 프로세스 밖이라 따로 내려야 함."""
+        self.client.unload()
+
+
+def _qwen3_bundle() -> _Qwen3Bundle:
+    return _Qwen3Bundle()
+
 
 @st.cache_resource(show_spinner="arXiv 검색기 준비 중...")
 def load_arxiv() -> ArxivLiveRetriever:
     return ArxivLiveRetriever()
 
 
-@st.cache_resource(show_spinner="쿼리 변환기(Qwen3-4B) 연결 중...")
 def load_rewriter():
-    """검색 성공을 보상으로 학습한 변환기. arXiv 채널 검색어를 만듦."""
-    return build_rewriter("dpo")
+    """검색 성공을 보상으로 학습한 변환기. arXiv 채널 검색어를 만듦.
+
+    Ollama 4비트로 부름. transformers 로 올리면 8.27GB 인데 이쪽은 3.25GB 이고, 검색이
+    끝나면 내려감. 이 변환기가 만든 문자열은 arXiv API 에만 들어감 - 로컬 의미 검색은
+    번역기와 가상 초록 생성기가 만든 검색어를 씀.
+    """
+    return pool().get("ollama:rewriter", lambda: build_rewriter("dpo"))
 
 
 @st.cache_resource(show_spinner="논문 71만 편 색인 불러오는 중... (첫 실행은 1분 정도 걸립니다)")
@@ -128,6 +173,9 @@ def load_local_index():
 
     Streamlit 은 사용자가 무언가 누를 때마다 스크립트를 처음부터 다시 실행함.
     캐시하지 않으면 검색할 때마다 임베딩 2.93GB 를 새로 올려 메모리가 모자람.
+
+    이 안에서 그래픽 메모리를 쓰던 것은 질문 임베딩 모델뿐인데 CPU 로 옮겼음
+    (`config.EMBED_DEVICE`). 나머지는 시스템 메모리라 계속 들고 있어도 됨.
     """
     from src.retrieval.local_index import LocalDenseRetriever, read_meta
 
@@ -142,37 +190,28 @@ def load_local_index():
     )
 
 
-@st.cache_resource
 def load_resolver() -> PaperResolver:
-    return PaperResolver()
+    return pool().get("ollama:qwen3", _qwen3_bundle).resolver
 
 
-@st.cache_resource
-def load_recommender(borrow_dpo: bool = False) -> PaperRecommender:
-    """추천 이유 생성기. 이미 올라와 있는 모델을 빌려 씀.
-
-    arXiv 를 켜면 변환기(8.64GB)가 이미 올라와 있으므로 그것을 빌림. 안 빌리면 같은
-    모델이 두 개가 되어 그래픽 메모리를 넘기고, 그러면 추천 모델이 오류 없이 CPU 로
-    밀려나 한 번에 229초가 걸림. arXiv 를 끄면 변환기를 안 올리므로 Ollama 의
-    qwen3:4b 를 씀 - 번역기와 가상 초록 생성기가 이미 쓰는 모델이라 더 안 듦.
-
-    `borrow_dpo` 를 인자로 받는 이유는 두 경우의 캐시를 갈라 두기 위함임.
-    """
-    if borrow_dpo:
-        rewriter = load_rewriter()
-        if hasattr(rewriter, "generate_json"):
-            return PaperRecommender(client=rewriter)
-    return PaperRecommender()
+def load_recommender() -> PaperRecommender:
+    """추천 이유 생성기. 번역기, 가상 초록 생성기와 같은 qwen3:4b 를 씀."""
+    return pool().get("ollama:qwen3", _qwen3_bundle).recommender
 
 
-@st.cache_resource(show_spinner="재정렬 모델 준비 중...")
 def load_reranker():
-    """교차 인코더 재정렬기. 질문과 논문을 함께 읽고 관련도를 매김."""
-    from src.retrieval.ranking import CrossEncoderReranker
-    return CrossEncoderReranker()
+    """교차 인코더 재정렬기. 질문과 논문을 함께 읽고 관련도를 매김.
+
+    미리 저장해 둔 float16 사본이 있으면 적재가 5.4~5.8초에서 1.8초로 줄어듦
+    (`config.RERANKER_FP16_DIR`, `training/export.py fp16` 으로 만듦). 검색마다 올렸다
+    내리므로 이 차이가 그대로 응답 시간이 됨.
+    """
+    def make():
+        from src.retrieval.ranking import CrossEncoderReranker
+        return CrossEncoderReranker()
+    return pool().get("reranker", make)
 
 
-@st.cache_resource
 def load_translator():
     """한국어 질문을 영어로 옮기는 변환기.
 
@@ -183,11 +222,9 @@ def load_translator():
     Ollama 를 쓰는 이유는 앱이 이미 qwen3:4b 를 올려 두어 메모리가 더 안 들고, 평가도
     같은 경로로 쟀기 때문임.
     """
-    from src.rewriter.baselines import TranslateRewriter
-    return TranslateRewriter()
+    return pool().get("ollama:qwen3", _qwen3_bundle).translator
 
 
-@st.cache_resource
 def load_hyde():
     """질문에 답할 법한 가상의 영어 초록을 지어내는 변환기. 두 번째 검색어를 만듦.
 
@@ -202,8 +239,7 @@ def load_hyde():
 
     모델은 앱이 이미 올려 둔 qwen3:4b 라 메모리가 더 안 듦.
     """
-    from src.rewriter.baselines import HydeRewriter
-    return HydeRewriter()
+    return pool().get("ollama:qwen3", _qwen3_bundle).hyde
 
 
 # ==========================================================================
@@ -318,10 +354,13 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
         out["timing"]["두 번째 검색어 만들기"] = time.time() - t0
 
     # 학습한 변환기는 arXiv 문법 문자열만 만들므로 arXiv 채널을 쓸 때만 부름.
-    # 켜 두면 검색마다 8.64GB 와 3.5초를 쓰는데 로컬 검색에는 쓸 곳이 없음
+    # 로컬 검색에는 쓸 곳이 없음
     if use_arxiv:
-        status.write("arXiv 검색어를 학술 용어로 바꾸는 중...")
+        status.write("검색어를 학술 용어로 바꾸는 중...")
         t0 = time.time()
+        # 같은 크기의 언어 모델 두 개가 함께 올라가면 6.5GB 가 됨. 앞 단계에서 쓴
+        # qwen3:4b 는 여기서 할 일이 끝났으므로 자리를 넘김
+        pool().release("ollama:qwen3")
         out["rewrite"] = load_rewriter().rewrite(query)
         out["timing"]["쿼리 변환"] = time.time() - t0
     else:
@@ -329,6 +368,10 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
             raw_query=query,
             queries={"dense": out["search_text"], "arxiv": query},
             intent="", parse_ok=True)
+
+    # 여기부터 검색 모델 차례임. 언어 모델은 할 일이 끝났으므로 전부 내려 재정렬 모델
+    # (1.24GB)이 쓸 자리를 비움. 다시 올리는 데 2.4초 걸리지만, 함께 두면 4.76GB 가 됨
+    pool().release("ollama:qwen3", "ollama:rewriter")
 
     if use_local:
         status.write(f"코퍼스에서 찾는 중...")
@@ -346,7 +389,7 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
     # 만족도가 떨어짐(전부 p<0.001). 그래도 호출은 남김 - arXiv 채널의 가치는 정확도가
     # 아니라 색인에 없는 최신 논문이고, 그 가치는 평가셋으로 잴 수 없기 때문임
     if use_arxiv:
-        status.write(f"arXiv 에서 최신 논문을 찾는 중...")
+        status.write(f"arXiv에서 논문을 찾는 중...")
         t0 = time.time()
         try:
             out["arxiv_hits"] = load_arxiv().search(
@@ -371,8 +414,10 @@ def run_search(query: str, use_local: bool, use_arxiv: bool, status) -> dict:
     if out["results"]:
         status.write("각 논문을 왜 추천하는지 정리하는 중...")
         t0 = time.time()
+        # 재정렬은 끝났음. 자리를 비워야 추천 이유 생성 모델(3.25GB)이 들어감
+        pool().release("reranker")
         try:
-            out["recommendation"] = load_recommender(use_arxiv).recommend(query, out["results"])
+            out["recommendation"] = load_recommender().recommend(query, out["results"])
         except Exception as e:
             out["recommend_error"] = str(e)
         out["timing"]["추천 이유 생성"] = time.time() - t0
@@ -420,7 +465,7 @@ def render_understanding(query: str, state: dict) -> None:
     hyde = (state.get("hyde_text") or "").strip()
 
     if not (has_translation or hyde or has_intent or terms):
-        st.caption("입력하신 말을 그대로 뜻으로 검색했습니다.")
+        st.caption("입력하신 검색어를 그대로 뜻으로 검색했습니다.")
         return
 
     st.markdown("#### 이렇게 검색했습니다")
@@ -463,14 +508,74 @@ def render_understanding(query: str, state: dict) -> None:
         st.caption("변환에 실패해 원본 질문으로 검색했습니다.")
 
 
+# 요약문에 남은 논문 번호를 잡아내는 자리.
+#
+# 추천 에이전트에게 제목을 쓰라고 지시하지만 4B 모델이 늘 지키지는 않음. 그리고 번호를
+# 적는 꼴이 매번 다름 - "index 3", "3번 논문", "1, 3, 5번 논문", "1번, 4번입니다".
+#
+# 번호를 지우지 않고 **제목으로 바꿈.** 못 잡은 꼴이 남아도 번호만 보일 뿐 틀린 제목을
+# 붙이지 않음. 나열 꼴을 맨 앞에 둬야 앞 번호까지 함께 잡음.
+_SUMMARY_INDEX = re.compile(
+    r"(?<![\d.])(\d{1,2}(?:\s*,\s*\d{1,2})+)\s*번(?!째)"   # 1, 3, 5번
+    r"|(?<![\d.])(\d{1,2})\s*번(?!째)"                       # 3번
+    r"|index\s*(\d{1,2})"                                    # index 3
+)
+
+
+def retitle_summary(summary: str, results: list) -> str:
+    """요약문의 논문 번호를 제목으로 바꿈.
+
+    추천 에이전트가 붙이는 번호는 재정렬 직후 순서인데, 화면은 관련도 순으로 다시
+    정렬하고 점수가 낮은 것을 걸러낸 뒤 번호를 새로 매김. 그대로 두면 "3번 논문을
+    추천합니다" 가 화면의 3번이 아닌 논문을 가리킴.
+
+    화면 번호로 바꾸지 않고 제목으로 바꾸는 이유는, 걸러내서 화면에 없는 논문을 요약문이
+    가리킬 수도 있기 때문임. 제목은 그런 경우에도 뜻이 통함.
+    """
+    if not summary:
+        return summary
+
+    def title_of(num: str) -> str | None:
+        i = int(num)
+        return one_line(results[i - 1].title) if 1 <= i <= len(results) else None
+
+    def swap(m: re.Match) -> str:
+        listed, one, indexed = m.groups()
+        if listed:
+            titles = [title_of(n.strip()) for n in listed.split(",")]
+            if any(t is None for t in titles):
+                return m.group(0)      # 목록 밖 번호가 섞이면 손대지 않음
+            return ", ".join(f"'{t}'" for t in titles)
+        title = title_of(one or indexed)
+        return f"'{title}'" if title else m.group(0)
+
+    return _SUMMARY_INDEX.sub(swap, summary)
+
+
+# 관련도 세 단계의 표시 방법. 색은 Streamlit 이 정해 둔 것을 씀 -
+# success 는 초록, warning 은 노랑, error 는 주황임.
+RELEVANCE = {
+    "high":   ("관련성 높음", st.success),
+    "medium": ("관련성 있음", st.warning),
+    "low":    ("관련성 낮음", st.error),
+}
+RELEVANCE_ORDER = ("high", "medium", "low")
+
+
 def render_paper(rank: int, paper, judgement: dict | None) -> None:
-    """결과 한 편. 추천 에이전트의 판단을 이 칸 안에 함께 보여 줌."""
-    label = {"high": "관련성 높음", "medium": "관련성 있음", "low": "관련성 낮음"}
-    tag = label.get((judgement or {}).get("relevance", ""), "")
+    """결과 한 편. 추천 에이전트의 판단을 이 칸 안에 함께 보여 줌.
+
+    관련도를 글자로만 적으면 목록을 훑을 때 눈에 안 들어옴. 이유 문장을 관련도 색
+    블록에 담아 세 단계가 한눈에 갈리게 함. 판단이 없으면 블록 없이 제목만 보여 줌.
+    """
+    grade = (judgement or {}).get("relevance", "")
     head = f"#### {rank}. [{one_line(paper.title)}]({arxiv_url(paper.paper_id)})"
-    st.markdown(f"{head}  `{tag}`" if tag else head)
-    if judgement and judgement.get("reason"):
-        st.caption(judgement["reason"])
+    if grade in RELEVANCE:
+        label, block = RELEVANCE[grade]
+        st.markdown(f"{head}  `{label}`")
+        block(judgement.get("reason") or label)
+    else:
+        st.markdown(head)
     with st.expander("초록 보기"):
         st.write(paper.abstract or "(초록 없음)")
 
@@ -501,17 +606,20 @@ def render_results(state: dict) -> None:
         return
 
     if rec.get("summary"):
-        st.info(rec["summary"])
+        st.info(retitle_summary(rec["summary"], results))
+
+    # 관련도 높음 -> 있음 -> 낮음 순으로 보여 줌. 같은 등급 안에서는 재정렬 순위를
+    # 그대로 둠. 판단이 없는 것은 맨 뒤로 보냄 - 추천 에이전트가 빠뜨린 것이라
+    # 관련이 없다는 뜻은 아니므로 '낮음' 과 섞지 않음
+    def relevance_rank(item) -> int:
+        grade = by_index.get(item[0], {}).get("relevance", "")
+        return RELEVANCE_ORDER.index(grade) if grade in RELEVANCE_ORDER else len(RELEVANCE_ORDER)
+
+    keep = sorted(keep, key=relevance_rank)
 
     # 화면에 보이는 번호는 1부터 다시 매기되, 추천 판단은 원래 순번으로 찾음
     for shown, (orig, p) in enumerate(keep, 1):
         render_paper(shown, p, by_index.get(orig))
-
-    if dropped:
-        with st.expander(f"관련성이 낮아 따로 빼둔 {len(dropped)}편 보기"):
-            for shown, (orig, p) in enumerate(dropped, len(keep) + 1):
-                render_paper(shown, p, by_index.get(orig))
-
 
 def render_recent(state: dict, use_arxiv: bool) -> None:
     """arXiv 실시간 검색 결과를 '최신 논문' 으로 따로 보여 줌.
@@ -527,10 +635,14 @@ def render_recent(state: dict, use_arxiv: bool) -> None:
     fresh = [p for p in hits if normalize_paper_id(p.paper_id) not in shown][:5]
     if not fresh:
         return
-    with st.expander(f"arXiv에서 직접 찾은 논문 {len(fresh)}편 더 보기"):
-        st.caption("이 목록은 관련도 순서가 아니라 arXiv가 전달해준 순서입니다.")
-        for p in fresh:
-            st.markdown(f"- [{one_line(p.title)}]({arxiv_url(p.paper_id)})")
+    # 추천 목록과 같은 모양으로 보여 줌. 논문마다 초록을 펼칠 수 있어야 하는데
+    # Streamlit 은 expander 안에 expander 를 못 넣으므로 바깥을 절 제목으로 둠
+    st.divider()
+    st.markdown(f"#### arXiv에서 직접 찾은 논문 {len(fresh)}편")
+    st.caption("코퍼스에 없는 논문입니다. 관련 정도가 아닌 arXiv가 전달해준 순서이고, 추천 논문과 달리 "
+               "관련도를 매기지 않았습니다.")
+    for i, p in enumerate(fresh, 1):
+        render_paper(i, p, None)
 
 
 
@@ -544,11 +656,12 @@ st.caption("사용자의 질문에 맞춰 arXiv에서 논문을 찾아 드립니
 with st.sidebar:
     st.header("설정")
     st.caption("하나 이상의 검색 옵션을 선택해주세요.")
-    use_local = st.checkbox("로컬 의미 검색 사용 (권장)", value=True,
-                            help="코퍼스에서 의미 기반으로 검색합니다. 1분 정도 걸립니다.")
-    use_arxiv = st.checkbox("arXiv 최신 논문도 찾기", value=True,
-                            help="코퍼스에 없는 최신 논문을 찾아 아래에 따로 보여줍니다. "
+    use_local = st.checkbox("코퍼스에서 의미 검색 (권장)", value=True,
+                            help="코퍼스에서 의미 기반으로 검색합니다.")
+    use_arxiv = st.checkbox("코퍼스에 없는 arXiv 논문도 검색", value=True,
+                            help="코퍼스에 없는 논문을 찾아 아래에 따로 보여줍니다. "
                                  "추천 목록 순위에는 영향을 주지 않습니다.")
+
     st.divider()
     st.caption("arXiv 호출 제한이 있으므로, 짧은 시간 내 과도한 검색 시 속도 저하가 발생할 수 있습니다")
 
@@ -568,7 +681,10 @@ if go and query.strip():
         st.stop()
 
     with st.status("논문을 찾는 중입니다...", expanded=True) as status:
-        state = run_search(query, use_local, use_arxiv, status)
+        # session 을 빠져나올 때 올려 둔 모델을 전부 내림. 오류가 나도 반드시 내려서,
+        # 실패한 검색이 그래픽 메모리를 붙잡은 채 남지 않게 함
+        with pool().session():
+            state = run_search(query, use_local, use_arxiv, status)
         status.update(label="검색을 마쳤습니다.", state="complete", expanded=False)
 
     st.divider()

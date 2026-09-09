@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from src.retrieval.corpus import normalize_paper_id
+from src import config
 from src.schemas import ScoredPaper
 
 DEFAULT_RERANKER = "BAAI/bge-reranker-v2-m3"
@@ -122,11 +123,19 @@ class CrossEncoderReranker:
 
     name = "cross_encoder"
 
-    def __init__(self, model_name: str = DEFAULT_RERANKER,
+    def __init__(self, model_name: str | None = None,
                  device: str | None = None, max_length: int = 512,
                  batch_size: int = 32, fp16: bool | None = None):
         import torch
         from sentence_transformers import CrossEncoder
+
+        # 미리 저장해 둔 float16 사본이 있으면 그것을 읽음. 검색마다 올렸다 내리므로
+        # 적재 시간이 그대로 응답 시간이 됨. 원본 float32 파일 2.2GB 는 매번 5.4~5.8초,
+        # 사본은 첫 검색 4.9초 뒤로 1.8초임. 점수는 128쌍을 대조해 차이가 정확히 0 이고
+        # 순위도 같음. 사본은 `training/export.py fp16` 으로 만듦.
+        if model_name is None:
+            fp16_dir = config.RERANKER_FP16_DIR
+            model_name = str(fp16_dir) if fp16_dir.exists() else DEFAULT_RERANKER
 
         # float16 으로 올려 그래픽 메모리를 3.06GB 에서 절반으로 줄임. 상대 순서만 쓰므로
         # float16 이어도 결과가 사실상 같음.
@@ -135,6 +144,19 @@ class CrossEncoderReranker:
         kw = {"model_kwargs": {"dtype": torch.float16}} if fp16 else {}
         self.model = CrossEncoder(model_name, max_length=max_length, device=device, **kw)
         self.batch_size = batch_size
+
+    def unload(self) -> None:
+        """그래픽 메모리를 비움. `GpuPool.release` 가 부름.
+
+        참조를 끊는 것만으로는 부족함. 부르는 쪽이 이 객체를 변수에 담아 두면 파이썬이
+        객체를 안 없애서 자리가 그대로 남음. 가중치를 CPU 로 옮기면 참조가 남아 있어도
+        확실히 돌아감.
+        """
+        import torch
+
+        self.model.model.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def rerank(self, query: str, candidates: list[ScoredPaper],
                top_k: int = 10) -> list[ScoredPaper]:

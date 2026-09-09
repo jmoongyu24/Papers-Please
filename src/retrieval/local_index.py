@@ -213,8 +213,14 @@ class LocalDenseRetriever:
 
     def __init__(self, corpus_path: str | Path, out_prefix: str | Path,
                  model_name: str = config.EMBED_MODEL, embedder=None,
-                 mmap: bool = False, max_seq_length: int = 512):
-        """mmap=True 면 임베딩을 디스크에 둔 채 읽음(메모리 절약, 느림)."""
+                 mmap: bool = False, max_seq_length: int = 512,
+                 device: str | None = None):
+        """mmap=True 면 임베딩을 디스크에 둔 채 읽음(메모리 절약, 느림).
+
+        device 는 질문을 임베딩할 장치임. 기본값 `config.EMBED_DEVICE` 는 "cpu" 로,
+        재정렬 모델에 그래픽 메모리를 넘겨주기 위함임.
+        """
+        device = config.EMBED_DEVICE if device is None else device
         paths = index_paths(out_prefix)
         self.corpus_path = Path(corpus_path)
         self.ids = paths["ids"].read_text(encoding="utf-8").splitlines()
@@ -246,14 +252,12 @@ class LocalDenseRetriever:
                 f"색인({out_prefix})을 다시 만들 것.")
 
         if embedder is None:
-            import torch
             from sentence_transformers import SentenceTransformer
-            # float16 으로 올려 그래픽 메모리를 2.14GB 에서 절반으로 줄임. 여유가 모자라면
-            # 추천 이유 생성 모델이 오류 없이 CPU 로 밀려나 한 번에 229초가 걸림.
-            # 여기서 만드는 것은 질문 벡터 하나뿐이고 저장된 논문 벡터는 그대로라 정밀도
-            # 손실은 무시할 수준임.
-            kw = {"model_kwargs": {"dtype": torch.float16}} if torch.cuda.is_available() else {}
-            embedder = SentenceTransformer(model_name, **kw)
+            # 질문 벡터 하나를 만드는 데 GPU 를 쓰지 않음. 상위 100편의 구성이 GPU
+            # float16 과 100% 같았고(질문 벡터 차이 2.39e-04), 색인을 float32 로 만들었으니
+            # CPU float32 가 오히려 맞음. 대신 질문 2개에 0.021초 -> 0.208초가 됨.
+            # 그 대가로 재정렬 모델이 쓸 1.07GB 를 비움.
+            embedder = SentenceTransformer(model_name, device=device)
             embedder.max_seq_length = max_seq_length
         self.embedder = embedder
         # 논문 번호 -> 배열 위치. 후보의 본문을 꺼낼 때 씀

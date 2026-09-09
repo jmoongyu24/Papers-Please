@@ -782,12 +782,18 @@ def bench_service(args) -> None:
     (논문 지목 확인, 쿼리 변환, 추천 이유 생성) 거기에 arXiv 호출과 재정렬이 끼어 있음.
 
     그래픽카드 한 장에서 재는 값이라 사용자가 여러 명이면 줄을 서서 더 느려짐.
+
+    `app.py` 와 같은 구간 나누기를 그대로 함. 서비스는 검색이 도는 동안에만 모델을 올리고
+    구간이 바뀔 때 반대편을 내림(최대 3.51GB). 모델을 다 올려 두고 재면 실제보다 빠르게
+    나오므로, 여기서도 `GpuPool` 을 써서 올리고 내리는 시간을 시간에 포함시킴.
     """
     import statistics as st
 
+    from src.gpu_pool import GpuPool
+
     queries = BENCH_QUERIES[: args.n]
 
-    print("부품 불러오는 중... (이 시간은 서비스 시작 시 한 번만 든다)")
+    print("색인 불러오는 중... (이 시간은 서비스 시작 시 한 번만 든다)")
     t0 = time.time()
     from src.recommend_agent.recommender import PaperRecommender
     from src.retrieval.arxiv_live import ArxivLiveRetriever
@@ -795,23 +801,25 @@ def bench_service(args) -> None:
     from src.retrieval.ranking import CrossEncoderReranker
     from src.rewriter.paper_resolver import PaperResolver, resolve_and_verify
 
-    load: dict[str, float] = {}
-    t = time.time(); rewriter = build_rewriter(args.rewriter); load["쿼리 변환기"] = time.time() - t
-    t = time.time(); index = LocalDenseRetriever(args.corpus, args.index)
-    load["로컬 색인 71만 편"] = time.time() - t
-    t = time.time(); reranker = CrossEncoderReranker(); load["재정렬 모델"] = time.time() - t
-    # 추천은 변환기가 이미 올린 모델을 빌려 씀 (같은 Qwen3-4B 를 두 개 올리지 않기 위함)
-    t = time.time()
-    recommender = (PaperRecommender(client=rewriter)
-                   if hasattr(rewriter, "generate_json") else PaperRecommender())
-    load["추천 에이전트"] = time.time() - t
+    # 색인만 한 번 올리고 계속 씀. 임베딩 2.8GB 는 시스템 메모리이고 질문 임베딩은
+    # CPU 라 그래픽 메모리를 안 씀. 나머지는 질문마다 올렸다 내림
+    index = LocalDenseRetriever(args.corpus, args.index)
     arxiv = None if args.skip_arxiv else ArxivLiveRetriever()
-    resolver = None if args.skip_resolver else PaperResolver()
+    print(f"   로컬 색인 71만 편 {time.time()-t0:6.1f}초")
 
-    print("\n## 시작 시 준비 시간 (한 번만)")
-    for k, v in load.items():
-        print(f"   {k:<20} {v:6.1f}초")
-    print(f"   {'합계':<20} {time.time()-t0:6.1f}초")
+    pool = GpuPool()
+
+    class _Qwen3:
+        """qwen3:4b 를 쓰는 것들. app.py 의 _Qwen3Bundle 과 같은 묶음."""
+
+        def __init__(self):
+            from src.rewriter.base import OllamaClient
+            self.client = OllamaClient()
+            self.resolver = PaperResolver(client=self.client)
+            self.recommender = PaperRecommender(client=self.client)
+
+        def unload(self):
+            self.client.unload()
 
     stages = ["논문 지목 확인", "쿼리 변환", "로컬 의미 검색", "arXiv 검색", "재정렬", "추천"]
     times: dict[str, list[float]] = {s: [] for s in stages}
@@ -824,16 +832,24 @@ def bench_service(args) -> None:
         one: dict[str, float] = {}
         q0 = time.time()
 
-        if resolver and arxiv:
+        # 구간 1. 언어 모델 (qwen3:4b)
+        if not args.skip_resolver and arxiv:
             t = time.time()
             try:
-                resolve_and_verify(q, resolver, arxiv)
+                resolve_and_verify(q, pool.get("ollama:qwen3", _Qwen3).resolver, arxiv)
             except Exception:
                 pass
             one["논문 지목 확인"] = time.time() - t
 
-        t = time.time(); rw = rewriter.rewrite(q); one["쿼리 변환"] = time.time() - t
+        # 구간 1-2. arXiv 검색어 변환기로 교체. 같은 크기의 언어 모델 두 개가 함께
+        # 올라가면 6.5GB 가 되므로 앞 것을 내림
+        t = time.time()
+        pool.release("ollama:qwen3")
+        rw = pool.get("ollama:rewriter", lambda: build_rewriter(args.rewriter)).rewrite(q)
+        one["쿼리 변환"] = time.time() - t
 
+        # 구간 2. 검색 모델. 언어 모델은 할 일이 끝났으므로 전부 내림
+        pool.release("ollama:qwen3", "ollama:rewriter")
         t = time.time()
         local_hits = index.search(q, k=args.k)
         one["로컬 의미 검색"] = time.time() - t
@@ -853,10 +869,16 @@ def bench_service(args) -> None:
         cands = list(seen.values())[: args.rerank_depth]
 
         t = time.time()
-        results = reranker.rerank(q, cands, top_k=10)
+        results = pool.get("reranker", CrossEncoderReranker).rerank(q, cands, top_k=10)
         one["재정렬"] = time.time() - t
 
-        t = time.time(); recommender.recommend(q, results); one["추천"] = time.time() - t
+        # 구간 3. 재정렬 자리를 비워야 추천 이유 생성 모델이 들어감
+        t = time.time()
+        pool.release("reranker")
+        pool.get("ollama:qwen3", _Qwen3).recommender.recommend(q, results)
+        one["추천"] = time.time() - t
+
+        pool.release_all()
 
         totals.append(time.time() - q0)
         for k, v in one.items():

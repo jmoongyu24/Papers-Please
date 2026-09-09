@@ -36,3 +36,6 @@ data/training/val_reranker.jsonl
 .idea/
 .vscode/
 .pytest_cache/
+
+# 등급 판정용 후보 풀 (실행 결과로 다시 만들 수 있고, 초록이 들어 있어 큼)
+data/eval/pool_*.jsonl
