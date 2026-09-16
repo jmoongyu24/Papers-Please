@@ -1,12 +1,13 @@
-"""쿼리 변환기 학습 자료 만들기 - 실제로 논문을 찾아내는 검색어를 정답 라벨로 삼음.
+"""
+쿼리 변환기 학습 데이터셋 만들기 - 실제로 논문을 찾아내는 검색어를 정답 라벨로
 
-변환기의 문제는 지식 부족이 아니라 어떤 표현이 arXiv 에서 실제로 통하는지 모른다는 것임.
-그래서 사람이 좋아 보인다고 고른 라벨을 쓰지 않고 arXiv 검색 결과를 정답 신호로 씀.
+변환기의 문제는 지식 부족이 아니라 어떤 표현이 arXiv에서 실제로 통하는지 모른다는 것
+그래서 사람이 좋아 보인다고 고른 라벨을 쓰지 않고 arXiv 검색 결과를 정답 신호로 씀
 
-    질문 Q (정답 논문 P 가 정해져 있음)
+    질문 Q (정답 논문 P가 정해져 있음)
       -> 변환기가 후보 검색어를 N개 생성 (온도를 높여 서로 다르게)
       -> 각 후보로 실제 arXiv 검색
-      -> 정답 논문 P 를 가장 높은 순위로 찾아낸 후보 = 그 질문의 정답 라벨
+      -> 정답 논문 P를 가장 높은 순위로 찾아낸 후보 = 그 질문의 정답 라벨
       -> 하나도 못 찾으면 그 질문은 학습에서 제외
 
 실패한 후보도 버리지 않고 선호 학습용 쌍으로 함께 저장함.
@@ -15,16 +16,11 @@
   train_query_translator_sft.jsonl   {"input": 질문, "output": 가장 잘 찾은 검색어}
   train_query_translator_dpo.jsonl   {"input": 질문, "chosen": ..., "rejected": ...}
   candidates.jsonl                   모든 후보와 점수
-
-실행 예:
-  python -m training.build_translator_pairs --queries data/eval/dev.jsonl \\
-      --n-candidates 5 --limit 50
 """
 
 from __future__ import annotations
 
 import argparse
-import time
 from pathlib import Path
 
 from src import config
@@ -32,27 +28,19 @@ from src.retrieval.arxiv_live import ArxivLiveRetriever
 from src.retrieval.corpus import normalize_paper_id as normalize_id
 from src.rewriter.base import OllamaClient
 from src.rewriter.baselines import (
-    OUTPUT_SCHEMA, SYSTEM, HierarchicalRewriter, build_arxiv_query, build_messages,
+    OUTPUT_SCHEMA, SYSTEM, HierarchicalRewriter, build_arxiv_query, build_messages
 )
 from src.utils import read_jsonl, write_jsonl
 
 OUT_DIR = config.DATA_DIR / "training"
 CACHE_PATH = config.DATA_DIR / "cache" / "arxiv_search_cache.jsonl"
 
-# 논문 번호 표기 통일은 corpus.normalize_paper_id 한 곳에서만 함. 직접 자르면 옛 형식
-# 번호가 잘못 잘려서, 실제로 정답을 찾은 검색어가 오류 없이 0점을 받음
-
-
 def score_query(query: str, gold_id: str, retriever, k: int = 30) -> tuple[float, int | None]:
-    """후보 쿼리로 검색해 '정답 논문이 몇 등인가'로 점수를 매김.
-
-    점수 = 1 / 순위 (1등이면 1.0, 2등이면 0.5 ...). 못 찾으면 0.
-    단순히 찾았나/못 찾았나보다 세밀해서 후보 간 우열을 잘 가름.
-    """
+    """후보 쿼리로 검색해 '정답 논문이 몇 등인가'로 점수를 측정함"""
     try:
         results = retriever.search(query, k=k)
     except Exception:
-        return -1.0, None          # 오류는 '점수 없음'(-1)으로 표시해 라벨 선정에서 제외
+        return -1.0, None
     ids = [normalize_id(r.paper_id) for r in results]
     gold = normalize_id(gold_id)
     if gold in ids:
@@ -63,18 +51,13 @@ def score_query(query: str, gold_id: str, retriever, k: int = 30) -> tuple[float
 
 def generate_candidates(rewriter: HierarchicalRewriter, question: str,
                         n: int, temperature: float) -> list[str]:
-    """같은 질문에 대해 서로 다른 변환 후보를 n개 만듦.
-
-    온도를 높여 매번 다른 학술 용어가 나오게 함. 어떤 표현이 arXiv에서 통할지 모르므로
-    여러 개를 만들어 실제로 시험해 보기 위함임.
-    """
+    """같은 질문에 대해 서로 다른 변환 후보를 n개 만듦"""
     seen, candidates = set(), []
     for i in range(n):
-        # 첫 후보는 서비스와 동일하게 온도 0(결정적), 나머지는 다양성을 위해 온도를 올림
         temp = 0.0 if i == 0 else temperature
         try:
             data = rewriter.client.generate_json(
-                build_messages(question), OUTPUT_SCHEMA, system=SYSTEM, temperature=temp,
+                build_messages(question), OUTPUT_SCHEMA, system=SYSTEM, temperature=temp
             )
             terms = list(data.get("academic_terms", []))
             q = build_arxiv_query(question, terms)
@@ -87,11 +70,11 @@ def generate_candidates(rewriter: HierarchicalRewriter, question: str,
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="검색 성공을 정답 신호로 쓰는 학습 데이터 생성")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--queries", default="data/eval/dev.jsonl")
-    ap.add_argument("--n-candidates", type=int, default=5, help="질문당 후보 쿼리 수")
-    ap.add_argument("--temperature", type=float, default=0.9, help="후보 다양성 온도")
-    ap.add_argument("--k", type=int, default=30, help="채점 시 볼 검색 결과 수")
+    ap.add_argument("--n-candidates", type=int, default=5)
+    ap.add_argument("--temperature", type=float, default=0.9)
+    ap.add_argument("--k", type=int, default=30)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--out-dir", default=str(OUT_DIR))
     args = ap.parse_args()
@@ -101,11 +84,10 @@ def main() -> None:
         rows = rows[: args.limit]
 
     rewriter = HierarchicalRewriter(OllamaClient())
-    retriever = ArxivLiveRetriever(cache_path=CACHE_PATH)   # 디스크 캐시로 중단, 재개 가능
+    retriever = ArxivLiveRetriever(cache_path=CACHE_PATH)
 
     sft, dpo, cand_log = [], [], []
     n_used = n_skipped = 0
-    t0 = time.time()
 
     for i, row in enumerate(rows, 1):
         question, gold = row["text"], row["gold_id"]
@@ -119,38 +101,23 @@ def main() -> None:
         cand_log.append({"query_id": row["query_id"], "question": question,
                          "gold_id": gold, "candidates": scored})
 
-        valid = [c for c in scored if c["score"] >= 0]          # 오류 후보 제외
+        valid = [c for c in scored if c["score"] >= 0]
         best = max(valid, key=lambda c: c["score"], default=None)
 
         if best and best["score"] > 0:
-            # 정답 논문을 실제로 찾아낸 쿼리만 학습 라벨로 씀
             sft.append({"input": question, "output": best["query"],
                         "gold_rank": best["gold_rank"]})
-            # 못 찾은 후보가 있으면 선호쌍(잘 찾음 > 못 찾음)으로 저장
             for c in valid:
                 if c["score"] == 0:
                     dpo.append({"input": question, "chosen": best["query"],
                                 "rejected": c["query"]})
             n_used += 1
         else:
-            n_skipped += 1     # 어떤 후보도 못 찾음 -> 잘못된 패턴 학습 방지를 위해 제외
-
-        if i % 10 == 0:
-            print(f"  {i}/{len(rows)}, 라벨 확보 {n_used}, 제외 {n_skipped} "
-                  f"({time.time()-t0:.0f}초)", flush=True)
-
+            n_skipped += 1
     out = Path(args.out_dir)
     write_jsonl(out / "train_query_translator_sft.jsonl", sft)
     write_jsonl(out / "train_query_translator_dpo.jsonl", dpo)
     write_jsonl(out / "candidates.jsonl", cand_log)
-
-    print("\n" + "=" * 60)
-    print(f"질문 {len(rows)}개 처리")
-    print(f"  학습 라벨 확보: {n_used}개 ({n_used/len(rows):.1%})")
-    print(f"  제외(정답 못 찾음): {n_skipped}개")
-    print(f"  지도 파인튜닝 쌍: {len(sft)}개 -> {out/'train_query_translator_sft.jsonl'}")
-    print(f"  선호 학습 쌍: {len(dpo)}개 -> {out/'train_query_translator_dpo.jsonl'}")
-
 
 if __name__ == "__main__":
     main()

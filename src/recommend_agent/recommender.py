@@ -1,15 +1,15 @@
 """논문 추천 에이전트 - 검색된 논문을 사용자 의도와 대조해 추천 이유를 붙임.
 
-로컬 Qwen3-4B 를 한 번 불러서 처리함.
+로컬 Qwen3-4B를 한 번 불러서 처리함.
 
     입력  사용자 원본 질문 + 논문 목록(제목 + 전체 초록)
     판단  각 논문이 의도에 얼마나 맞는지(high/medium/low)와 그 이유
-    출력  [{index, relevance, reason}, ...] 와 전체 요약
+    출력  [{index, relevance, reason}, ...]와 전체 요약
 
 JSON 스키마를 강제해 형식을 고정하고, 주어진 초록 내용에만 근거하도록 프롬프트로
 지시한 뒤 목록 밖 번호는 코드로 걸러 냄.
 
-summary 에는 번호를 쓰지 말고 제목을 쓰라고 지시함. 화면은 관련도 순으로 다시 정렬하고
+summary에는 번호를 쓰지 말고 제목을 쓰라고 지시함. 화면은 관련도 순으로 다시 정렬하고
 점수가 낮은 것을 걸러낸 뒤 번호를 새로 매기므로, 여기서 붙인 번호가 화면 번호와 어긋남.
 `index` 필드는 그대로 번호를 쓰는데, 그쪽은 부르는 쪽이 원래 순번으로 짝지어 처리함.
 """
@@ -75,9 +75,9 @@ class PaperRecommender:
         self.client = client or OllamaClient()
 
     def recommend(self, query: str, papers: list[ScoredPaper]) -> dict:
-        """{"recommendations": [{index, relevance, reason}...], "summary": str} 를 돌려줌.
+        """{"recommendations": [{index, relevance, reason}...], "summary": str}를 돌려줌.
 
-        관련도가 높은 순으로 정렬되고, index 는 papers 의 1부터 시작하는 번호임.
+        관련도가 높은 순으로 정렬되고, index는 papers의 1부터 시작하는 번호임.
         """
         if not papers:
             return {"recommendations": [], "summary": "검색 결과가 없습니다."}
