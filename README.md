@@ -1,35 +1,27 @@
 # Papers, Please
 
-**한국어나 일상어로 물어도 arXiv 논문을 찾아 주는 검색 서비스.**
+한국어나 일상어로 물어도 arXiv 논문을 찾아 주는 검색 서비스입니다. 비전문가를 위한
+논문 검색 시스템입니다.
 
-논문을 찾을 때 가장 큰 걸림돌은 자기가 읽고 싶은 논문이 실제로 어떤 말로 쓰여 있는지
-모른다는 것이다. "사진 보고 글로 설명해주는 AI"라고 쳐도 논문은 `image captioning`
-이라고 쓴다. 한국어로 물으면 arXiv는 아예 못 찾는다 — 시험용 342문항에서 한국어 질문
-171개 중 128개(74.9%)가 결과 0건이었다.
+논문을 찾을 때 걸림돌이 되는 것은 읽고 싶은 논문이 어떤 제목으로 쓰여 있는지 모른다는
+점입니다. "사진 보고 글로 설명해주는 AI"라고 검색창에 입력해도 논문에는 `image captioning`이라고
+쓰여 있습니다. 두 표현에는 겹치는 단어가 없어서 키워드 검색으로는 찾을 수 없습니다.
+한국어로 검색하면 결과가 아예 나오지 않기도 합니다.
 
-Papers, Please는 질문을 그대로 키워드 검색에 넣는 대신 **영어로 옮기고, 그 질문에 답할
-법한 초록을 지어내고, 논문 71만 편을 뜻으로 찾은 뒤, 사용자 의도와 맞는지 다시 줄
-세운다.** 같은 342문항에서 arXiv 키워드 검색의 Recall@10이 0.190인데 이 시스템은
-**0.658**이다.
+Papers, Please는 질문을 그대로 키워드 검색에 넣는 대신 다음 순서로 처리합니다.
 
-비전문가를 위한 논문 검색 시스템 (졸업작품).
-
----
-
-## 화면
-
-![Papers, Please 화면](assets/screenshot.png)
-
-*(화면 사진을 `assets/screenshot.png`에 넣으면 여기 나옵니다. 자세한 것은
-[assets/README.md](assets/README.md) 참고)*
-
-### 어떻게 동작하는가
+1. 질문을 영어 학술 문장으로 옮깁니다
+2. 그 질문에 답할 법한 가상의 논문 초록을 생성합니다
+3. 두 검색어로 논문 716,183편을 의미 기반으로 검색합니다
+4. 두 결과를 하나의 후보 목록으로 합칩니다
+5. 교차 인코더가 사용자의 원본 질문과 대조해 순위를 다시 매깁니다
+6. 논문마다 추천 이유를 생성해 10편을 제시합니다
 
 ```mermaid
 flowchart TD
     Q["질문<br/>사진 보고 글로 설명해주는 AI"]
     T["검색어 1 · 영어로 옮김<br/>Qwen3-4B"]
-    H["검색어 2 · 가상 초록 지어내기<br/>Qwen3-4B"]
+    H["검색어 2 · 가상 초록 생성<br/>Qwen3-4B"]
     I1["논문 71만 편 의미 검색<br/>bge-m3 파인튜닝"]
     I2["논문 71만 편 의미 검색<br/>bge-m3 파인튜닝"]
     F["순위 합치기 → 후보 100편"]
@@ -46,44 +38,125 @@ flowchart TD
     Q -.-> X -.-> N
 ```
 
-**arXiv 실시간 검색 결과는 추천 목록에 섞지 않고 '최신 논문' 칸으로 따로 보여 준다.**
-섞으면 비율을 어떻게 잡아도 만족도가 떨어졌다(전부 p<0.001). arXiv 채널의 가치는
-정확도가 아니라 색인에 없는 최신 논문이다.
+arXiv 실시간 검색 결과는 추천 목록에서 같이 보여주지 않고 '최신 논문' 칸에서 따로 보여 줍니다.
+이 채널의 쓰임은 정확도가 아니라 색인에 없는 최신 논문을 가져오는 데 있습니다.
 
 ---
 
 ## 설치
 
-### 1. 저장소와 파이썬 환경
+### 1. 필요한 사양
+
+| 항목 | 값 |
+|---|---|
+| 운영체제 | 리눅스 · WSL · macOS · 윈도우 |
+| 파이썬 | 3.11 이상 |
+| 디스크 | 약 8GB |
+| 시스템 메모리 | 16GB 이상 |
+| 그래픽 카드 | 4GB 이상. 없으면 CPU로 동작 |
+| 인터넷 | 모델과 색인 내려받기, arXiv 실시간 검색에 필요 |
+
+시스템 메모리 16GB는 색인 2.9GB를 통째로 올리기 때문에 필요합니다. 그래픽 카드는
+검색 중 최대 3.3GB를 사용합니다.
+
+### 2. Ollama 설치
+
+번역, 가상 초록 생성, 추천 이유 생성에 사용합니다. 파이썬 패키지와 별개로 데몬을
+설치합니다.
 
 ```bash
-git clone https://github.com/jmoongyu/Papers-Please.git
-cd Papers-Please
+# 리눅스 · WSL
+curl -fsSL https://ollama.com/install.sh | sh
 
-python3 -m venv .venv
-source .venv/bin/activate          # 윈도우는 .venv\Scripts\activate
-pip install -r requirements.txt
+# macOS
+brew install ollama
+
+# 윈도우는 https://ollama.com/download 에서 설치 파일을 받습니다
 ```
 
-GPU를 쓰려면 torch를 먼저 CUDA 빌드로 설치한다.
+데몬을 띄웁니다. 터미널 하나를 이 명령에 쓰고 켜 둔 채로 둡니다.
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu126
-```
-
-### 2. 로컬 언어 모델 (Ollama)
-
-번역, 가상 초록, 추천 이유 생성에 쓴다. [ollama.com](https://ollama.com)에서 받은 뒤:
-
-```bash
-ollama pull qwen3:4b
 ollama serve
 ```
 
-### 3. 논문 코퍼스 만들기
+### 3. 실행 준비
 
-[Kaggle arXiv 데이터셋](https://www.kaggle.com/datasets/Cornell-University/arxiv)
-(`arxiv-metadata-oai-snapshot.json`)을 받아 `data/corpus/`에 두고:
+파이썬 패키지를 설치합니다. GPU를 쓰는 경우 torch를 먼저 CUDA 빌드로 설치합니다.
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu126
+pip install -r requirements.txt
+```
+
+나머지는 명령 한 줄로 끝납니다. 언어 모델을 받고, 논문 코퍼스와 의미 검색 색인을
+내려받은 뒤, 조건이 모두 갖춰졌는지 확인까지 합니다.
+
+```bash
+python run.py init
+```
+
+```
+  준비를 시작합니다
+
+  ✓ 파이썬 3.11 이상  3.13.9
+  ✓ 파이썬 패키지  7개 확인
+  ✓ 디스크 여유 8GB  885.6GB 남음
+
+  [1/3] Ollama 모델
+    $ ollama pull qwen3:4b
+
+  [2/3] 논문 코퍼스
+    GreenBed4725/arxiv-cs2021-corpus -> data/corpus
+
+  [3/3] 의미 검색 색인
+    GreenBed4725/arxiv-cs2021-embeddings-bge-m3 -> data/embeddings
+```
+
+약 6.5GB를 다운 받습니다. 시간이 다소 걸립니다. 중간에 끊겨도 같은 명령을
+다시 실행하면 중단된 부분부터 이어서 받을 수 있습니다.
+
+질문 임베딩 모델
+([GreenBed4725/bge-m3-arxiv-cs-retriever](https://huggingface.co/GreenBed4725/bge-m3-arxiv-cs-retriever))은
+앱을 처음 실행할 때 자동으로 내려받습니다.
+
+일부만 다시 다운 받으려면 아래 항목을 붙입니다.
+
+| 항목 | 내용 |
+|---|---|
+| `--skip-ollama` | 언어 모델 내려받기를 건너뜁니다 |
+| `--skip-download` | 코퍼스와 색인 내려받기를 건너뜁니다 |
+
+### 4. 준비 상태 확인
+
+실행 전, 실행에 필요한 조건이 갖춰졌는지 확인할 수 있습니다.
+
+```bash
+python run.py checklist
+```
+
+```
+  실행 조건 확인
+  ------------------------------------------------------------------
+  ✓  파이썬 3.11 이상    3.13.9
+  ✓  파이썬 패키지       7개 확인
+  ✓  디스크 여유 8GB     885.6GB 남음
+  ✓  Ollama 데몬         모델 4개 등록됨
+  ✓  Ollama qwen3:4b     등록됨
+  ✓  논문 코퍼스         1.03GB
+  ✓  의미 검색 색인      716,183편, 2.93GB
+  ✓  색인과 코퍼스의 짝  식별자 일치
+  ✓  질문 임베딩 모델    GreenBed4725/bge-m3-arxiv-cs-retriever
+  ------------------------------------------------------------------
+
+  모두 준비되었습니다. streamlit run app.py로 실행하십시오.
+```
+
+### 5. 코퍼스와 색인을 직접 만들기
+
+`python run.py init`이 내려받는 것을 직접 만들 수도 있습니다.
+[Kaggle arXiv 데이터셋](https://www.kaggle.com/datasets/Cornell-University/arxiv)에서
+`arxiv-metadata-oai-snapshot.json`(약 4GB)을 받아 `data/corpus/`에 둡니다.
 
 ```bash
 python -m src.retrieval.corpus \
@@ -92,69 +165,73 @@ python -m src.retrieval.corpus \
     --prefixes cs. stat.ML eess. --min-year 2021 --sample 0
 ```
 
-결과는 716,183편, 약 1GB다.
+716,183편, 약 1GB가 나옵니다. 10분쯤 걸립니다.
 
-### 4. 의미 검색 색인 만들기
-
-서비스는 파인튜닝한 검색 모델로 만든 `cs2021-ft` 색인을 쓴다. 아래
-[학습](#학습-선택)으로 `models/retriever-ft`를 먼저 만든 뒤 색인을 만든다.
+이어서 색인을 만듭니다. GPU로 약 3시간, 결과는 2.9GB입니다.
 
 ```bash
 python -m src.retrieval.local_index \
     --corpus data/corpus/corpus-cs2021.jsonl \
-    --model models/retriever-ft \
+    --model GreenBed4725/bge-m3-arxiv-cs-retriever \
     --out data/embeddings/cs2021-ft
 ```
 
-GPU로 약 3시간, 결과는 2.9GB다.
+파인튜닝 모델 대신 원본 `BAAI/bge-m3`로 만드는 경우 `--model`을 빼고
+`--out data/embeddings/cs2021`로 지정한 뒤, `app.py` 맨 위의 두 값을 함께 바꿉니다.
 
-> 학습을 건너뛰고 원본 `BAAI/bge-m3`로만 색인을 만들려면 `--model`을 빼고
-> `--out data/embeddings/cs2021`로 만든 뒤, `app.py`의 `LOCAL_INDEX`를 `"cs2021"`로
-> `FUSE_RERANK_WEIGHT`를 `0`으로 바꾼다. 둘은 한 묶음이다.
-> 시험용 342문항 Recall@10이 0.658에서 0.617로 내려간다.
+```python
+LOCAL_INDEX = "cs2021"
+FUSE_RERANK_WEIGHT: float = 0.0
+```
 
 ---
 
-## 사용법
+## 실행 방법
 
 ### 웹 화면
 
 ```bash
-streamlit run app.py          # → http://localhost:8501
+ollama serve                       # 아직 띄우지 않았으면
+streamlit run app.py
 ```
 
-첫 실행은 색인을 올리는 데 1분쯤 걸린다. 왼쪽 설정에서 로컬 의미 검색과 arXiv 실시간
-검색을 각각 켜고 끌 수 있다.
+브라우저에서 `http://localhost:8501`이 열립니다.
 
 ### 성능 평가
 
 ```bash
-# 파이프라인을 돌려 결과를 저장
-python -m evaluation.pipeline_eval --queries data/eval/dev.jsonl \
+# 파이프라인을 돌려 결과를 저장합니다
+python -m evaluation.pipeline_eval --queries data/eval/test.jsonl \
     --channels local_dense local_hyde --rewriter service \
-    --k 100 --rerank cross --rerank-depth 100 --out runs/dev_run.jsonl
+    --k 100 --rerank cross --rerank-depth 100 --out runs/test_run.jsonl
 
-# 저장된 결과를 보고 (검색 0회)
-python -m evaluation.report --run runs/dev_run.jsonl \
-    --queries data/eval/dev.jsonl --grades data/eval/grades_dev.jsonl
+# 저장된 결과를 보고합니다
+python -m evaluation.report --run runs/test_run.jsonl \
+    --queries data/eval/test.jsonl --grades data/eval/grades_test.jsonl
 
-# 두 실행을 짝지어 비교 (통계 검정 포함). 기준선을 맨 앞에 둔다
+# 두 실행을 짝지어 비교합니다. 기준선을 맨 앞에 둡니다
 python -m evaluation.report --run results/test_arxiv_only_raw.jsonl \
     results/test_ft_fused.jsonl --queries data/eval/test.jsonl
 
-# 응답 시간 재기
+# 응답 시간을 잽니다
 python -m evaluation.pipeline_eval --bench-service --n 5
 ```
 
-저장된 검색 결과에 설정만 바꿔 다시 집계할 수 있다. 검색을 다시 하지 않으므로 빠르고
-arXiv도 다시 부르지 않는다.
+저장된 검색 결과에 설정만 바꿔 다시 집계할 수 있습니다. 검색을 다시 하지 않으므로
+빠르고 arXiv도 다시 호출하지 않습니다.
 
 ```bash
-python -m evaluation.pipeline_eval --report-only runs/dev_run.jsonl \
-    --rerank cross --rerank-depth 100 --fuse-rerank 3.0
+# 설정만 바꿔 재집계합니다
+python -m evaluation.pipeline_eval --report-only runs/test_run.jsonl --rrf-k 30
+
+# 채널 조합만 갈라 봅니다
+python -m evaluation.pipeline_eval --report-only runs/test_run.jsonl \
+    --use-channels local_dense --rerank cross
 ```
 
-### 학습 (선택)
+자세한 평가 방법은 [evaluation/README.md](evaluation/README.md)에 있습니다.
+
+### 학습
 
 ```bash
 # 쿼리 변환기 - 지도 파인튜닝 다음에 선호 학습
@@ -162,65 +239,145 @@ python -m training.train sft --output-dir models/query-translator-sft
 python -m training.train dpo --sft-adapter models/query-translator-sft/checkpoint-54 \
     --output-dir models/query-translator-dpo
 
-# 검색 모델 파인튜닝 (서비스가 쓰는 것)
+# 검색 모델 파인튜닝
 python -m training.build_retrieval_pairs --out data/training/train_retriever.jsonl
 python -m training.train embed --output-dir models/retriever-ft
 ```
 
-### 주요 설정값
+학습한 쿼리 변환기를 서비스에서 쓰려면 Ollama에 등록합니다. llama.cpp의 변환
+스크립트가 필요합니다.
 
-전부 `app.py` 맨 위에 있고, 값마다 어떻게 정했는지 주석에 적혀 있다.
+```bash
+python -m training.export ollama --llama-cpp ~/llama.cpp --grades basic
+```
 
-| 값 | 기본 | 무엇 |
+등록하지 않아도 앱은 동작합니다. arXiv 채널이 변환 없이 원본 질문으로 검색하고 화면에
+그렇게 표시합니다. 추천 논문 10편은 이 모델을 사용하지 않습니다.
+
+재정렬 모델의 float16 사본을 미리 만들어 두면 적재가 5.4초에서 1.8초로 줄어듭니다.
+
+```bash
+python -m training.export fp16
+```
+
+---
+
+## 폴더 구조
+
+| 위치 | 내용 |
+|---|---|
+| `app.py` | 웹 화면 (Streamlit) |
+| `src/rewriter/` | 쿼리 변환 — 번역 · 가상 초록 · 학습한 모델 · 특정 논문 지목 |
+| `src/retrieval/` | 검색 — 코퍼스 · 로컬 색인 · arXiv · 순위 합치기와 재정렬 |
+| `src/recommend_agent/` | 추천 이유 생성 |
+| `src/config.py` | 경로와 모델 이름 등 전역 설정값 |
+| `evaluation/` | 평가셋 제작 · 파이프라인 실행 · 지표 · 보고 |
+| `training/` | 학습 — 쿼리 변환기 · 검색 모델 · 재정렬기 |
+| `data/eval/` | 평가셋 4개 (`dev` · `test` · `grades_dev` · `grades_test`) |
+| `data/corpus/` | 논문 코퍼스 (저장소에 포함되지 않습니다) |
+| `data/embeddings/` | 의미 검색 색인 (저장소에 포함되지 않습니다) |
+| `results/` | 확정된 측정 결과. [설명](results/README.md) |
+
+서비스 동작에 관여하는 주요 설정값은 `app.py` 맨 위에 모여 있습니다.
+
+| 값 | 기본 | 내용 |
 |---|---|---|
-| `LOCAL_INDEX` | `cs2021-ft` | 쓸 색인. 질문 임베딩 모델은 색인 파일에서 읽는다 |
+| `LOCAL_INDEX` | `cs2021-ft` | 사용할 색인. 질문 임베딩 모델은 색인 파일에서 읽습니다 |
 | `DEPTH_LOCAL` | 100 | 검색어마다 가져올 후보 편수 |
 | `RERANK_DEPTH` | 100 | 재정렬에 넣을 최대 후보 편수 |
 | `FUSE_RERANK_WEIGHT` | 3.0 | 재정렬 순위와 검색 순위를 합칠 때 재정렬 쪽 가중치 |
-| `MIN_RERANK_SCORE` | 0.002 | 이 아래는 "관련성이 낮아 접어 둔" 자리로 내린다 |
+| `MIN_RERANK_SCORE` | 0.002 | 이 아래는 "관련성이 낮아 접어 둔" 자리로 내립니다 |
 | `TOP_K` | 10 | 보여 줄 논문 편수 |
+
+---
+
+## 사용된 모델
+
+| 자리 | 모델 | 실행 방식 | 그래픽 메모리 |
+|---|---|---|---|
+| 번역 · 가상 초록 · 추천 이유 | `qwen3:4b` | Ollama 4비트 | 3.25GB |
+| arXiv 검색어 생성 | `Qwen3-4B-Instruct-2507` + LoRA 병합 4비트 | Ollama `papers-rewriter` | 3.2GB |
+| 재정렬 | `BAAI/bge-reranker-v2-m3` | float16 사본 | 1.24GB |
+| 질문 임베딩 | [`GreenBed4725/bge-m3-arxiv-cs-retriever`](https://huggingface.co/GreenBed4725/bge-m3-arxiv-cs-retriever) | CPU float32 | 0 |
+
+질문 임베딩 모델은 `BAAI/bge-m3`를 이 코퍼스에 맞춰 LoRA로 파인튜닝한 것입니다. 정답
+논문 한 편과 검색 상위에 함께 올라온 관련도 낮은 논문 여섯 편을 묶은 학습쌍을 사용했고,
+손실 함수는 MultipleNegativesRankingLoss입니다.
+
+### 그래픽 메모리
+
+검색 한 번은 서로 겹치지 않는 구간으로 나뉘고, 구간이 바뀔 때 반대편 모델을 내립니다.
+언어 모델 하나가 3.25GB라서 재정렬 모델과 같은 시각에 올라가면 4.76GB가 되기 때문입니다.
+
+| 구간 | 올라가는 모델 | 사용량 |
+|---|---|---|
+| 1 · 논문 지목 · 번역 · 가상 초록 | Ollama `qwen3:4b` | 3.26GB |
+| 1-2 · arXiv 검색어 변환 | Ollama `papers-rewriter` (교체) | 3.23GB |
+| 2 · 로컬 의미 검색 · 재정렬 | 재정렬 모델만 | 1.49GB |
+| 3 · 추천 이유 | Ollama `qwen3:4b` (교체) | 3.51GB |
+| 검색이 끝난 뒤 | CUDA 컨텍스트만 | 0.27GB |
+
+기본 설정에서 최대 3.3GB를 사용합니다. 검색하지 않을 때는 거의 쓰지 않습니다.
+
+### 공개한 자료
+
+| 저장소 | 종류 | 내용 |
+|---|---|---|
+| [GreenBed4725/bge-m3-arxiv-cs-retriever](https://huggingface.co/GreenBed4725/bge-m3-arxiv-cs-retriever) | 모델 | 파인튜닝한 검색 모델 |
+| [GreenBed4725/arxiv-cs2021-corpus](https://huggingface.co/datasets/GreenBed4725/arxiv-cs2021-corpus) | 데이터셋 | 논문 코퍼스 716,183편 |
+| [GreenBed4725/arxiv-cs2021-embeddings-bge-m3](https://huggingface.co/datasets/GreenBed4725/arxiv-cs2021-embeddings-bge-m3) | 데이터셋 | 의미 검색 색인 |
+
+---
+
+## 실행 화면
+
+![Papers, Please 화면](assets/screenshot.png)
+
+화면 사진을 `assets/screenshot.png`에 넣으면 여기에 표시됩니다. 찍는 방법은
+[assets/README.md](assets/README.md)에 있습니다.
 
 ---
 
 ## 검색 성능
 
-### 어떻게 쟀는가
+### 평가 방법
 
-**평가셋.** 논문에서 질문을 거꾸로 만들었다. 모델에게 **제목을 주지 않고 초록만 주어**,
-"이 논문을 아직 못 찾은 사람"의 자리에서 질문을 쓰게 했다. 제목을 주고 어순만 바꾸게
-했더니 정확한 용어를 쓰는 층의 Recall@10이 1.000이 나왔는데, 원인은 희귀 용어가 아니라
-제목의 낱말 조합을 그대로 재현한 것이었다.
+평가셋은 논문에서 질문을 거꾸로 생성해 만들었습니다. 모델에게 제목을 주지 않고 초록만
+주어, 그 논문을 아직 찾지 못한 사람의 자리에서 질문을 쓰게 했습니다. 제목을 함께 주면
+모델이 제목의 낱말 조합을 재현해 성능이 실제보다 높게 측정됩니다.
 
-- **시험용 342문항** (`data/eval/test.jsonl`) — 확정 판정에만 쓴다
-- **개발용 348문항** (`data/eval/dev.jsonl`) — 설정을 바꿔 보는 탐색은 전부 여기서 한다
-- **같은 논문, 같은 난이도를 한국어와 영어로 짝지어** 만들었다. 그래서 언어별 차이가
-  논문 차이와 섞이지 않는다
-- 난이도 3층 — `easy` 대학원생의 학술어 / `medium` 학부연구생 / `hard` 1~2학년의 일상어
+- 시험용 342문항 (`data/eval/test.jsonl`) — 확정 판정에만 사용합니다
+- 개발용 348문항 (`data/eval/dev.jsonl`) — 설정을 바꿔 보는 탐색에 사용합니다
+- 같은 논문에 한국어와 영어 질문을 짝지어 만들어, 언어별 차이가 논문 차이와 섞이지
+  않도록 했습니다
+- 난이도 세 단계 — `easy` 대학원생의 학술어, `medium` 학부연구생, `hard` 1~2학년의 일상어
 
-**지표.** 주 지표는 **Recall@10** — 상위 10편 안에 그 질문을 만든 논문이 들어왔는가.
-등급 정답지가 필요 없어서 구성을 바꿔도 절대값이 움직이지 않는다.
-
-**판정.** 같은 문항끼리 짝지은 부트스트랩 검정. **p가 0.05보다 크면 "차이가 없다"가
-아니라 "있는지 없는지 모른다"**로 적는다.
+주 지표는 Recall@10입니다. 상위 10편 안에 그 질문을 만든 논문이 들어왔는지를 봅니다.
+성능 차이가 우연인지는 같은 문항끼리 짝지은 부트스트랩 검정으로 확인했습니다. p가
+0.05보다 크면 "차이가 없다"가 아니라 "있는지 없는지 모른다"로 적었습니다.
 
 ### 적용 전후 (시험용 342문항, Recall@10)
 
-| 무리 | 단순 arXiv API 키워드 검색 | **이 프로젝트** | 차이 |
+| 무리 | 단순 arXiv API 키워드 검색 | 이 프로젝트 | 차이 |
 |---|---|---|---|
-| **전체** | 0.190 | **0.658** | **+0.468** |
+| 전체 | 0.190 | 0.658 | +0.468 |
 | easy | 0.500 | 0.904 | +0.404 |
 | medium | 0.061 | 0.737 | +0.675 |
 | hard | 0.009 | 0.333 | +0.325 |
-| **한국어** | 0.076 | **0.661** | **+0.585** |
+| 한국어 | 0.076 | 0.661 | +0.585 |
 | 영어 | 0.304 | 0.655 | +0.351 |
 
-여섯 무리 전부 **p < 0.001**. 전체 신뢰구간 [+0.415, +0.520].
+여섯 무리 모두 p < 0.001이고, 전체 신뢰구간은 [+0.415, +0.520]입니다. 상위 10편 안에
+정답 논문이 들어온 문항은 65개에서 225개로 늘었습니다.
 
-- 전: `results/test_arxiv_only_raw.jsonl` — 사용자 질문을 그대로 arXiv API에 넣음
-- 후: `results/test_ft_fused.jsonl` — 지금 서비스 구성
-- **한국어 질문 171개 중 128개(74.9%)가 arXiv에서 결과 0건.** 영어는 0건이 없었다
+기준선에서 한국어 질문 171개 중 128개(74.9%)는 검색 결과가 한 편도 반환되지 않았습니다.
+영어는 0건인 문항이 없었습니다. 이 프로젝트는 사전 색인된 논문 전체와 유사도를 계산하므로
+결과가 없는 문항이 발생하지 않습니다.
 
-두 파일 다 저장돼 있으므로 직접 다시 계산할 수 있다.
+- 전: `results/test_arxiv_only_raw.jsonl` — 사용자 질문을 그대로 arXiv API에 입력
+- 후: `results/test_ft_fused.jsonl` — 현재 서비스 구성
+
+두 파일이 저장되어 있으므로 직접 다시 계산할 수 있습니다.
 
 ```bash
 python -m evaluation.report --run results/test_arxiv_only_raw.jsonl \
@@ -229,7 +386,7 @@ python -m evaluation.report --run results/test_arxiv_only_raw.jsonl \
 
 ### 무엇이 성능을 만들었는가
 
-개발용 348문항. 단계마다 하나씩만 더했다.
+개발용 348문항에서 단계마다 하나씩 더해 가며 측정했습니다.
 
 | 구성 | 전체 | easy | medium | hard | 한국어 | 영어 |
 |---|---|---|---|---|---|---|
@@ -240,12 +397,12 @@ python -m evaluation.report --run results/test_arxiv_only_raw.jsonl \
 | ⑤ ④ + 가상 초록 검색어 추가 | 0.457 | 0.784 | 0.457 | 0.129 | 0.443 | 0.471 |
 | ⑥ ⑤ + 교차 인코더 재정렬 | 0.575 | 0.914 | 0.629 | 0.181 | 0.575 | 0.575 |
 | ⑦ ⑥ + 파인튜닝 검색 모델 | 0.618 | 0.914 | 0.672 | 0.267 | 0.615 | 0.621 |
-| **⑧ ⑦ + 순위 합치기 3:1** | **0.635** | 0.914 | 0.681 | **0.310** | 0.632 | 0.638 |
+| ⑧ ⑦ + 순위 합치기 3:1 | 0.635 | 0.914 | 0.681 | 0.310 | 0.632 | 0.638 |
 
-**가장 큰 두 몫은 arXiv 키워드 검색을 로컬 의미 검색으로 바꾼 것(+0.144, p<0.001)과
-교차 인코더 재정렬(+0.118, p<0.001)이다.** 둘이 전체 상승분의 절반이다.
+가장 큰 두 몫은 arXiv 키워드 검색을 로컬 의미 검색으로 바꾼 것(+0.144, p<0.001)과
+교차 인코더 재정렬(+0.118, p<0.001)입니다. 둘이 전체 상승분의 절반가량을 차지합니다.
 
-**한국어와 영어의 격차가 닫혔다.**
+한국어와 영어의 격차가 좁혀지는 과정은 다음과 같습니다.
 
 ```
 ①  한국어 0.017  영어 0.155   차이 0.138
@@ -262,126 +419,33 @@ python -m evaluation.report --run results/test_arxiv_only_raw.jsonl \
 | 한국어를 영어로 옮기기 | 2.1초 | 2.9초 | 11% |
 | 가상 초록 만들기 | 1.0초 | 2.6초 | 5% |
 | 로컬 의미 검색 | 0.8초 | 1.1초 | 4% |
-| **합계** | **18.3초** | **19.9초** | |
+| 합계 | 18.3초 | 19.9초 | |
 
-기준 30초를 넘은 질문 0/5개. 시작할 때 색인을 올리는 12.3초는 한 번만 든다.
-**응답 시간의 59%가 추천 이유 생성이다.**
+기준으로 삼은 30초를 넘은 질문은 없었습니다. 시작할 때 색인을 올리는 12.3초는 한 번만
+듭니다. 응답 시간의 59%가 추천 이유 생성에 쓰입니다.
 
-앞의 값(13.35초)보다 5초쯤 늘었다. 늘어난 것은 계산이 아니라 **모델을 올리는 시간**이다.
-그래픽 메모리를 4GB 안에 맞추려고 검색이 도는 동안에만 모델을 올리기 때문이다
-([그래픽 메모리](#그래픽-메모리) 참고). "한국어를 영어로 옮기기" 2.1초와 "재정렬" 2.2초에
-각각 모델 적재가 들어 있다. 대신 검색을 안 할 때는 그래픽 메모리를 거의 쓰지 않는다.
+### 함께 적어 두는 것
 
-### 함께 적어야 할 것
-
-- **일상어 층(hard)은 0.333으로 여전히 낮다.** 다만 이 층의 질문 중 상당수에는 정답
-  논문이 아니어도 쓸모 있는 논문을 상위 10편에 보여 준다
-- **지금 구성을 채택한 근거는 전체 성능이 아니다.** 옛 구성 대비 전체 +0.041인데
-  **p=0.085로 유의성을 확보하지 못했다**(신뢰구간 [−0.003, +0.085]). 개발용에서는
-  +0.060(p=0.003)이었고 시험용에서 방향과 크기가 재현됐으나 342문항으로는 이 크기를
-  잡아낼 힘이 모자란다. 채택 근거는 ⓐ 유의미하게 나빠진 무리가 하나도 없고
-  ⓑ **한국어가 유의미하게 좋아졌다**는 것이다(+0.070, p=0.045)
-- **반증된 것도 그대로 남겼다.** 의도→개념→용어로 단계를 밟는 계층 변환은 세 번 측정해
-  세 번 반증됐고, 재정렬기를 우리 자료로 파인튜닝하는 것은 세 번 시도해 세 번 실패했다.
-  두 손실 함수 모두 점수의 절대값을 고정하는 항이 없어서, 순서는 가르쳐도 "무관한 것은
-  0에 가깝게"는 못 가르친다. 대신 **재정렬 순위와 검색 순위를 합치는 것**이 같은
-  목표를 학습 0시간으로 달성했다
-
----
-
-## 폴더 구조
-
-| 위치 | 무엇 |
-|---|---|
-| `app.py` | 웹 화면 (Streamlit) |
-| `src/rewriter/` | 쿼리 변환 — 번역 · 가상 초록 · 학습한 모델 · 특정 논문 지목 |
-| `src/retrieval/` | 검색 — 코퍼스 · 로컬 색인 · arXiv · 순위 합치기와 재정렬 |
-| `src/recommend_agent/` | 추천 이유 생성 |
-| `evaluation/` | 평가셋 제작 · 파이프라인 실행 · 지표 · 보고 |
-| `training/` | 학습 — 쿼리 변환기 · 검색 모델 · 재정렬기 |
-| `data/eval/` | 평가셋 4개 (`dev` · `test` · `grades_dev` · `grades_test`) |
-| `results/` | 보고서가 인용하는 확정 결과. [설명](results/README.md) |
-
-**디렉터리마다 코드 파일은 4개를 넘지 않는다.** 새 기능은 되도록 기존 파일에 넣는다.
-
-평가 실행 방법은 [evaluation/README.md](evaluation/README.md)에 자세히 있다.
-
----
-
-## 쓴 모델
-
-| 자리 | 모델 | 어디서 | 그래픽 메모리 |
-|---|---|---|---|
-| 번역 · 가상 초록 · 추천 이유 | `qwen3:4b` | Ollama 4비트 | 3.25GB |
-| arXiv 검색어 생성 | `Qwen3-4B-Instruct-2507` + LoRA를 합쳐 4비트로 | Ollama `papers-rewriter` | 3.2GB |
-| 재정렬 | `BAAI/bge-reranker-v2-m3` | float16 사본 | 1.24GB |
-| 질문 임베딩 | `BAAI/bge-m3`를 파인튜닝한 `models/retriever-ft` | CPU float32 | 0 |
-
-두 언어 모델은 같은 시각에 올라가지 않는다. 자세한 것은 [그래픽 메모리](#그래픽-메모리) 참고.
-
-**서비스가 도는 동안 유료 인공지능 서비스를 부르지 않는다.** OpenAI는 평가셋을 미리
-만들 때만 쓴다.
-
-### 그래픽 메모리
-
-검색 한 번은 서로 겹치지 않는 세 구간으로 나뉘고, 구간이 바뀔 때 반대편 모델을 내린다.
-언어 모델 하나가 3.25GB라 재정렬 모델과 같은 시각에 올라가면 4.76GB가 되기 때문이다.
-
-| 구간 | 올라가는 것 | 카드 사용량 |
-|---|---|---|
-| 1 · 논문 지목 · 번역 · 가상 초록 | Ollama `qwen3:4b` | 3.26GB |
-| 1-2 · arXiv 검색어 변환 | Ollama `papers-rewriter` (교체) | 3.23GB |
-| 2 · 로컬 의미 검색 · 재정렬 | 재정렬 모델만 | 1.49GB |
-| 3 · 추천 이유 | Ollama `qwen3:4b` (교체) | 3.51GB |
-| 검색이 끝난 뒤 | CUDA 컨텍스트만 | 0.27GB |
-
-**기본 설정에서 최대 3.3GB.** 검색을 안 할 때는 거의 쓰지 않는다.
-
-### 왜 4비트인가
-
-변환기를 4비트로 줄이면 검색 최대치가 3.3GB로 내려간다. 정밀도를 올린 판도 만들어
-재봤다. 시험용 342문항, arXiv 채널만 잰 값이다.
-
-| 정밀도 | 검색 최대치 | Recall@10 | MRR@10 | nDCG@10 |
-|---|---|---|---|---|
-| **q4_K_M (쓰는 것)** | **3.3GB** | 0.360 | 0.312 | 0.385 |
-| q8_0 | 5.0GB | 0.380 | 0.330 | 0.400 |
-| f16 (양자화 없음) | 8.7GB | 0.386 | 0.336 | 0.405 |
-
-f16 기준으로 q8_0은 세 지표 모두 판정 불가이고(차이 0.006 이하), q4_K_M은
-MRR(p=0.034)과 nDCG(p=0.002)가 유의미하게 낮다. Recall은 셋 다 구분되지 않는다.
-
-**q8_0이 품질 대비 이득이 크지만 4비트를 쓴다.** 4GB 목표를 지키려는 것이고,
-**이 변환기가 바꾸는 것은 arXiv '최신 논문' 칸뿐이기 때문이다.** 추천 논문 10편은
-번역기와 가상 초록 생성기(둘 다 `qwen3:4b`)가 만든 검색어로 찾으므로 이 변환기와
-무관하다. 자세한 것은 [results/README.md](results/README.md) 참고.
-
-서비스를 돌리기 전에 두 가지를 미리 만들어야 한다.
-
-```bash
-# arXiv 검색어 변환기를 Ollama에 등록 (llama.cpp 변환 스크립트 필요)
-python -m training.export ollama --llama-cpp ~/llama.cpp --grades basic
-
-# 재정렬 모델 float16 사본 (적재가 5.4초에서 1.8초로 줄어든다)
-python -m training.export fp16
-```
-
-둘 다 없어도 앱은 뜬다. `papers-rewriter`가 없으면 arXiv 채널이 변환 없이 원본 질문으로
-검색하고 화면에 그렇게 알린다. `--grades`를 빼면 q8_0과 f16 판까지 만든다 (성능을
-견주려고 재본 것이고 서비스는 쓰지 않는다). float16 사본이 없으면 원본을 읽어 검색마다 3.6초를 더 쓴다.
-로컬 검색과 추천은 둘 다 영향받지 않는다.
-
-모델 가중치와 색인은 크기 때문에 저장소에 없다. 위 [설치](#설치)와
-[학습](#학습-선택) 절차로 다시 만들 수 있다.
+- 일상어 층(hard)은 0.333으로 여전히 낮습니다. 다만 이 층의 질문 중 상당수에는 정답
+  논문이 아니어도 쓸모 있는 논문을 상위 10편에 보여 줍니다
+- 현재 구성을 채택한 근거는 전체 성능이 아닙니다. 옛 구성 대비 전체 +0.041이지만
+  p=0.085로 유의성을 확보하지 못했습니다(신뢰구간 [−0.003, +0.085]). 채택 근거는
+  유의미하게 나빠진 무리가 하나도 없다는 점과, 한국어가 유의미하게 좋아졌다는
+  점입니다(+0.070, p=0.045)
+- 반증된 것도 그대로 남겨 두었습니다. 의도에서 개념, 용어로 단계를 밟는 계층 변환은
+  세 번 측정해 세 번 반증되었고, 재정렬 모델을 이 자료로 파인튜닝하는 것은 세 번 시도해
+  세 번 실패했습니다. 두 손실 함수 모두 점수의 절대값을 고정하는 항이 없어서, 순서는
+  가르쳐도 "무관한 것은 0에 가깝게"는 가르치지 못합니다. 대신 재정렬 순위와 검색 순위를
+  합치는 방법이 같은 목표를 학습 없이 달성했습니다
 
 ---
 
 ## arXiv 이용 정책
 
-- 제목, 초록, 논문 번호 같은 메타데이터는 CC0 1.0으로 배포되어 저장과 재사용이 된다.
-  **논문 원문은 이 서비스가 제공하지 않고 arXiv 초록 페이지로 보낸다.**
-- arXiv API는 요청 간 3초 간격, 단일 연결을 지켜야 한다. 코드가 지킨다.
--이 서비스는 arXiv와 무관한 프로젝트이며 arXiv의 후원이나 보증을 받지 않았다.
+- 제목, 초록, 논문 번호 같은 메타데이터는 CC0 1.0으로 배포되어 저장과 재사용이
+  가능합니다. 논문 원문은 이 서비스가 제공하지 않고 arXiv 초록 페이지로 연결합니다.
+- arXiv API는 요청 간 3초 간격과 단일 연결을 지켜야 합니다. 코드가 이를 지킵니다.
+- 이 서비스는 arXiv와 무관한 프로젝트이며 arXiv의 후원이나 보증을 받지 않았습니다.
 
 > Thank you to arXiv for use of its open access interoperability.
 > This service was not reviewed or approved by, nor does it necessarily express

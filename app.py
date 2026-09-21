@@ -46,7 +46,7 @@ RERANK_DEPTH = 100      # 재정렬에 넣을 최대 후보 수
 FUSE_RERANK_WEIGHT: float = 3.0
 
 # 쓸 색인
-# `cs2021-ft` 파인튜닝한 `models/retriever-ft`로 만든 색인
+# `cs2021-ft` bge-m3 를 파인튜닝한 모델로 만든 색인
 LOCAL_INDEX = "cs2021-ft"
 
 # "관련 논문을 못 찾았다"고 말할 기준 점수
