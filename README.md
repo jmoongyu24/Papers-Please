@@ -54,7 +54,7 @@ arXiv 실시간 검색 결과는 추천 목록에서 같이 보여주지 않고 
 | 디스크 | 약 8GB |
 | 시스템 메모리 | 16GB 이상 |
 | 그래픽 카드 | 4GB 이상. 없으면 CPU로 동작 |
-| 인터넷 | 모델과 색인 내려받기, arXiv 실시간 검색에 필요 |
+| 인터넷 | 모델과 색인 다운로드, arXiv 실시간 검색에 필요 |
 
 시스템 메모리 16GB는 색인 2.9GB를 통째로 올리기 때문에 필요합니다. 그래픽 카드는
 검색 중 최대 3.3GB를 사용합니다.
@@ -89,8 +89,8 @@ pip install torch --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 ```
 
-나머지는 명령 한 줄로 끝납니다. 언어 모델을 받고, 논문 코퍼스와 의미 검색 색인을
-내려받은 뒤, 조건이 모두 갖춰졌는지 확인까지 합니다.
+나머지 과정은 명령 하나로 진행할 수 있습니다. 언어 모델을 다운로드 하고, 논문 코퍼스와 의미 검색 색인을
+다운로드 한 뒤, 조건이 모두 갖춰졌는지 확인까지 합니다.
 
 ```bash
 python run.py init
@@ -118,14 +118,14 @@ python run.py init
 
 질문 임베딩 모델
 ([GreenBed4725/bge-m3-arxiv-cs-retriever](https://huggingface.co/GreenBed4725/bge-m3-arxiv-cs-retriever))은
-앱을 처음 실행할 때 자동으로 내려받습니다.
+앱을 처음 실행할 때 자동으로 다운로드 받습니다.
 
 일부만 다시 다운 받으려면 아래 항목을 붙입니다.
 
 | 항목 | 내용 |
 |---|---|
-| `--skip-ollama` | 언어 모델 내려받기를 건너뜁니다 |
-| `--skip-download` | 코퍼스와 색인 내려받기를 건너뜁니다 |
+| `--skip-ollama` | 언어 모델 다운로드를 건너뜁니다 |
+| `--skip-download` | 코퍼스와 색인 다운로드를 건너뜁니다 |
 
 ### 4. 준비 상태 확인
 
@@ -154,7 +154,7 @@ python run.py checklist
 
 ### 5. 코퍼스와 색인을 직접 만들기
 
-`python run.py init`이 내려받는 것을 직접 만들 수도 있습니다.
+`python run.py init`이 다운로드 받는 것을 직접 만들 수도 있습니다.
 [Kaggle arXiv 데이터셋](https://www.kaggle.com/datasets/Cornell-University/arxiv)에서
 `arxiv-metadata-oai-snapshot.json`(약 4GB)을 받아 `data/corpus/`에 둡니다.
 
@@ -333,16 +333,13 @@ python -m training.export fp16
 
 ![Papers, Please 화면](assets/screenshot.png)
 
-화면 사진을 `assets/screenshot.png`에 넣으면 여기에 표시됩니다. 찍는 방법은
-[assets/README.md](assets/README.md)에 있습니다.
-
 ---
 
 ## 검색 성능
 
 ### 평가 방법
 
-평가셋은 논문에서 질문을 거꾸로 생성해 만들었습니다. 모델에게 제목을 주지 않고 초록만
+평가셋은 논문에서 질문을 역으로 생성해 만들었습니다. 모델에게 제목을 주지 않고 초록만
 주어, 그 논문을 아직 찾지 못한 사람의 자리에서 질문을 쓰게 했습니다. 제목을 함께 주면
 모델이 제목의 낱말 조합을 재현해 성능이 실제보다 높게 측정됩니다.
 

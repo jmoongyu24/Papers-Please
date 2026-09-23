@@ -50,15 +50,13 @@ FUSE_RERANK_WEIGHT: float = 3.0
 LOCAL_INDEX = "cs2021-ft"
 
 # "관련 논문을 못 찾았다"고 말할 기준 점수
-# 로컬 의미 검색은 어떤 질문에도 후보를 채워서 돌려줌. 그대로 뿌리면 무관한 논문을 추천하게 됨.
-# 이 값 아래의 논문은 '관련성이 낮아 접어 둔' 자리로 보냄.
 MIN_RERANK_SCORE: float | None = 0.002
 
 st.set_page_config(page_title="Papers, Please", layout="wide")
 
 @st.cache_resource
 def pool() -> GpuPool:
-    """앱당 하나. 이 안에 든 모델만 올렸다 내림"""
+    """이 안에 든 모델만 올렸다 내림"""
     return GpuPool()
 
 
