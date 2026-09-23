@@ -19,7 +19,7 @@ Papers, Please는 질문을 그대로 키워드 검색에 넣는 대신 다음 �
 
 ```mermaid
 flowchart TD
-    Q["질문<br/>사진 보고 글로 설명해주는 AI"]
+    Q["사용자 질문<br/>사진 보고 글로 설명해주는 AI"]
     T["검색어 1 · 영어로 옮김<br/>Qwen3-4B"]
     H["검색어 2 · 가상 초록 생성<br/>Qwen3-4B"]
     I1["논문 71만 편 의미 검색<br/>bge-m3 파인튜닝"]
@@ -52,12 +52,9 @@ arXiv 실시간 검색 결과는 추천 목록에서 같이 보여주지 않고 
 | 운영체제 | 리눅스 · WSL · macOS · 윈도우 |
 | 파이썬 | 3.11 이상 |
 | 디스크 | 약 8GB |
-| 시스템 메모리 | 16GB 이상 |
+| 시스템 메모리 | 12GB 이상 / GPU 사용 시 8GB 이상 |
 | 그래픽 카드 | 4GB 이상. 없으면 CPU로 동작 |
 | 인터넷 | 모델과 색인 다운로드, arXiv 실시간 검색에 필요 |
-
-시스템 메모리 16GB는 색인 2.9GB를 통째로 올리기 때문에 필요합니다. 그래픽 카드는
-검색 중 최대 3.3GB를 사용합니다.
 
 ### 2. Ollama 설치
 
@@ -78,19 +75,64 @@ brew install ollama
 
 ```bash
 ollama serve
+
+# 맥은 백그라운드 서비스로 등록
+brew services start ollama
 ```
 
 ### 3. 실행 준비
 
-파이썬 패키지를 설치합니다. GPU를 쓰는 경우 torch를 먼저 CUDA 빌드로 설치합니다.
+파이썬 3.11 이상이 필요합니다. 프로젝트 폴더에서 가상 환경을 만들고 그 안에 설치합니다.
 
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu126
+#### 3.1 윈도우
+
+```powershell
+# 파이썬 3.11 이상: https://www.python.org/downloads/
+py -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+
+pip install torch --index-url https://download.pytorch.org/whl/cu126   # NVIDIA GPU를 쓸 때만
 pip install -r requirements.txt
 ```
 
-나머지 과정은 명령 하나로 진행할 수 있습니다. 언어 모델을 다운로드 하고, 논문 코퍼스와 의미 검색 색인을
-다운로드 한 뒤, 조건이 모두 갖춰졌는지 확인까지 합니다.
+#### 3.2 macOS
+
+```bash
+brew install python@3.13
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+
+pip install -r requirements.txt
+```
+
+#### 3.3 리눅스 · WSL
+
+```bash
+sudo apt install python3-venv
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+
+pip install torch --index-url https://download.pytorch.org/whl/cu126   # NVIDIA GPU를 쓸 때만
+pip install -r requirements.txt
+```
+
+터미널을 새로 열면 `source .venv/bin/activate`를 다시 실행합니다.
+
+| 오류 | 해결 |
+|---|---|
+| `pip: command not found` · `command not found: streamlit` | `source .venv/bin/activate` |
+| `error: externally-managed-environment` | 가상 환경 안에서 설치 |
+| `No matching distribution found for torch` | 맥은 `--index-url`을 빼고 설치 |
+| `ModuleNotFoundError` | `pip install -r requirements.txt` |
+
+### 4. 코퍼스와 임베딩 색인 다운로드
+
+가상 환경을 터미널에서 실행합니다. 나머지 설치 과정은 명령어 하나로 진행할 수
+있습니다. 언어 모델을 다운로드하고, 논문 코퍼스와 의미 검색 색인을 다운로드한 뒤,
+조건이 모두 갖춰졌는지 확인까지 합니다.
 
 ```bash
 python run.py init
@@ -113,7 +155,7 @@ python run.py init
     GreenBed4725/arxiv-cs2021-embeddings-bge-m3 -> data/embeddings
 ```
 
-약 6.5GB를 다운 받습니다. 시간이 다소 걸립니다. 중간에 끊겨도 같은 명령을
+코퍼스와 임베딩 색인을 다운로드 받습니다. 시간이 다소 걸립니다. 중간에 끊겨도 같은 명령을
 다시 실행하면 중단된 부분부터 이어서 받을 수 있습니다.
 
 질문 임베딩 모델
@@ -127,7 +169,7 @@ python run.py init
 | `--skip-ollama` | 언어 모델 다운로드를 건너뜁니다 |
 | `--skip-download` | 코퍼스와 색인 다운로드를 건너뜁니다 |
 
-### 4. 준비 상태 확인
+### 5. 준비 상태 확인
 
 실행 전, 실행에 필요한 조건이 갖춰졌는지 확인할 수 있습니다.
 
@@ -152,7 +194,7 @@ python run.py checklist
   모두 준비되었습니다. streamlit run app.py로 실행하십시오.
 ```
 
-### 5. 코퍼스와 색인을 직접 만들기
+### 6. 코퍼스와 색인을 직접 만들기
 
 `python run.py init`이 다운로드 받는 것을 직접 만들 수도 있습니다.
 [Kaggle arXiv 데이터셋](https://www.kaggle.com/datasets/Cornell-University/arxiv)에서
@@ -191,11 +233,14 @@ FUSE_RERANK_WEIGHT: float = 0.0
 ### 웹 화면
 
 ```bash
-ollama serve                       # 아직 띄우지 않았으면
+source .venv/bin/activate          # 새 터미널이면 (윈도우는 .venv\Scripts\activate)
+ollama serve                       # 아직 띄우지 않았으면, 별도 터미널에서
 streamlit run app.py
 ```
 
 브라우저에서 `http://localhost:8501`이 열립니다.
+
+아래 평가와 학습 명령도 모두 가상 환경을 활성화한 상태에서 실행합니다.
 
 ### 성능 평가
 
